@@ -34,6 +34,12 @@ def load_module_from_path(module_name, path):
 ROOT_DIR = Path(__file__).parent
 logger = logging.getLogger(__name__)
 
+# Keep source installations from a commit hash and release-wheel builds on the
+# same public version.  The QuantTrio repository is published as a source
+# snapshot, so its intentionally truncated Git history cannot provide a useful
+# version through setuptools-scm on its own.
+CUBIC_RELEASE_VERSION = "0.26.1+cubic.20260805"
+
 PRECOMPILED_RUST_FRONTEND_PATH = ROOT_DIR / "vllm" / "vllm-rs"
 # setuptools-rust installs PyO3 artifacts as `<module>.<ext-suffix>`, where the
 # suffix ends with `.so` on Linux and macOS alike (e.g. `_rust_foo.abi3.so`).
@@ -1023,6 +1029,7 @@ def get_vllm_version() -> str:
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
         return get_version(write_to="vllm/_version.py")
 
+    os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = CUBIC_RELEASE_VERSION
     version = get_version(write_to="vllm/_version.py")
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
