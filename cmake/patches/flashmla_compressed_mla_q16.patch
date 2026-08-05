@@ -1,0 +1,559 @@
+diff --git a/csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu b/csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu
+index b87902c..906617a 100644
+--- a/csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu
++++ b/csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu
+@@ -7,4 +7,12 @@
+
+ #ifndef FLASH_MLA_DISABLE_FP8
+ template void run_mha_fwd_splitkv_mla<cutlass::float_e4m3_t, cutlass::bfloat16_t, 576>(DecodingParams_fp8 &params, cudaStream_t stream);
+-#endif
+\ No newline at end of file
++#endif
++
++template void run_mha_fwd_splitkv_mla<cutlass::bfloat16_t,
++                                       cutlass::bfloat16_t, 576, true>(
++    DecodingParams_fp8 &params, cudaStream_t stream);
++
++template void run_mha_fwd_splitkv_mla<cutlass::bfloat16_t,
++                                       cutlass::bfloat16_t, 576, false, true>(
++    DecodingParams_fp8 &params, cudaStream_t stream);
+diff --git a/csrc/extension/sm90/dense_fp8/flash_fwd_mla_kernel.h b/csrc/extension/sm90/dense_fp8/flash_fwd_mla_kernel.h
+index 7aefe62..3cb9cc1 100644
+--- a/csrc/extension/sm90/dense_fp8/flash_fwd_mla_kernel.h
++++ b/csrc/extension/sm90/dense_fp8/flash_fwd_mla_kernel.h
+@@ -5,6 +5,9 @@
+
+ #pragma once
+
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
+ #include <cute/tensor.hpp>
+ #include <cutlass/cutlass.h>
+ #include <cutlass/array.h>
+@@ -163,6 +166,44 @@ namespace flash {
+
+ using namespace cute;
+
++__forceinline__ __device__ uint2 fp8x4_to_bf16x4(uchar4 codes,
++                                                  float scale) {
++    const __nv_bfloat162 packed01 = __float22bfloat162_rn(
++        make_float2(static_cast<float>(cutlass::float_e4m3_t::bitcast(codes.x)) * scale,
++                    static_cast<float>(cutlass::float_e4m3_t::bitcast(codes.y)) * scale));
++    const __nv_bfloat162 packed23 = __float22bfloat162_rn(
++        make_float2(static_cast<float>(cutlass::float_e4m3_t::bitcast(codes.z)) * scale,
++                    static_cast<float>(cutlass::float_e4m3_t::bitcast(codes.w)) * scale));
++    return make_uint2(*reinterpret_cast<const uint32_t *>(&packed01),
++                      *reinterpret_cast<const uint32_t *>(&packed23));
++}
++
++__forceinline__ __device__ uint2 cubic8x4_to_bf16x4(
++        char4 codes, float scale, int curve) {
++    const int coeff_a = curve == 0 ? 4 : (curve == 3 ? 3 : 2);
++    const int coeff_b = curve == 2 ? 1 : (curve == 3 ? -1 : 0);
++    const int coeff_c = curve == 0 ? 0 : (curve == 2 ? 1 : 2);
++    constexpr float kInverseDenominator =
++        1.0f / (4.0f * 127.0f * 127.0f * 127.0f);
++    const float combined_scale = scale * kInverseDenominator;
++    auto decode = [&](int code) {
++        const int magnitude = min(code < 0 ? -code : code, 127);
++        const int polynomial =
++            ((coeff_c * magnitude + coeff_b * 127) * magnitude +
++             coeff_a * 127 * 127) * magnitude;
++        const int signed_polynomial = code < 0 ? -polynomial : polynomial;
++        return static_cast<float>(signed_polynomial) * combined_scale;
++    };
++    const __nv_bfloat162 packed01 = __float22bfloat162_rn(
++        make_float2(decode(static_cast<int>(codes.x)),
++                    decode(static_cast<int>(codes.y))));
++    const __nv_bfloat162 packed23 = __float22bfloat162_rn(
++        make_float2(decode(static_cast<int>(codes.z)),
++                    decode(static_cast<int>(codes.w))));
++    return make_uint2(*reinterpret_cast<const uint32_t *>(&packed01),
++                      *reinterpret_cast<const uint32_t *>(&packed23));
++}
++
+ template<typename Kernel_traits>
+ struct SharedStorageMLA {
+     using SmemV_t = std::conditional_t<Kernel_traits::Is_FP8,
+@@ -272,7 +313,9 @@ __forceinline__ __device__ void store(const DecodingParams_fp8 &params, const in
+     );
+ }
+
+-template<typename Kernel_traits, bool Is_causal, typename SharedStorage>
++template<typename Kernel_traits, bool Is_causal, bool Fp8Q16,
++         bool Cubic8Cache,
++         typename SharedStorage>
+ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const DecodingParams_fp8 &params,
+                                                                    const int bidb, const int bidh, const int m_block,
+                                                                    const int n_split_idx, const int seqlen_k,
+@@ -442,6 +485,96 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decoding
+         Tensor tKcK = gmem_thr_copy_K.partition_S(cK);  // (BCPY,BCPY_N,BCPY_K) -> (blk_n,blk_k)
+         Tensor tKpK = make_tensor<bool>(make_shape(size<2>(tKsK)));
+
++        // Query-protected FP8 MLA expands E4M3 cache values directly into the
++        // BF16 WGMMA shared-memory layout. The second warpgroup is the producer,
++        // overlapping conversion with QK/softmax/PV on the other buffer.
++        auto load_fp8_q16_page = [&](int logical_block, int buffer_index) {
++            const int producer_tid = tidx - kNThreadsS;
++            const int token = producer_tid >> 1;
++            const int chunk_parity = producer_tid & 1;
++            const int physical_block = __ldg(&block_table[logical_block]);
++            const bool valid_token =
++                token < seqlen_k - logical_block * kBlockN;
++            const uint8_t *token_ptr =
++                reinterpret_cast<const uint8_t *>(params.k_ptr) +
++                physical_block * params.k_batch_stride +
++                token * params.k_row_stride;
++            auto target = sK;
++            if (buffer_index != 0) target.data() = target.data() + size(sK);
++#pragma unroll 4
++            for (int chunk = chunk_parity; chunk < kHeadDim / 16; chunk += 2) {
++                const int dim = chunk * 16;
++                const uchar4 codes0 = valid_token
++                    ? *reinterpret_cast<const uchar4 *>(token_ptr + dim)
++                    : make_uchar4(0, 0, 0, 0);
++                const uchar4 codes1 = valid_token
++                    ? *reinterpret_cast<const uchar4 *>(token_ptr + dim + 4)
++                    : make_uchar4(0, 0, 0, 0);
++                const uchar4 codes2 = valid_token
++                    ? *reinterpret_cast<const uchar4 *>(token_ptr + dim + 8)
++                    : make_uchar4(0, 0, 0, 0);
++                const uchar4 codes3 = valid_token
++                    ? *reinterpret_cast<const uchar4 *>(token_ptr + dim + 12)
++                    : make_uchar4(0, 0, 0, 0);
++                const uint2 packed0 = fp8x4_to_bf16x4(codes0, descale_k);
++                const uint2 packed1 = fp8x4_to_bf16x4(codes1, descale_k);
++                const uint2 packed2 = fp8x4_to_bf16x4(codes2, descale_k);
++                const uint2 packed3 = fp8x4_to_bf16x4(codes3, descale_k);
++                *reinterpret_cast<uint4 *>(&target(token, dim)) =
++                    make_uint4(packed0.x, packed0.y, packed1.x, packed1.y);
++                *reinterpret_cast<uint4 *>(&target(token, dim + 8)) =
++                    make_uint4(packed2.x, packed2.y, packed3.x, packed3.y);
++            }
++        };
++
++        auto load_cubic8_page = [&](int logical_block, int buffer_index) {
++            const int producer_tid = tidx - kNThreadsS;
++            const int token = producer_tid >> 1;
++            const int chunk_parity = producer_tid & 1;
++            const int physical_block = __ldg(&block_table[logical_block]);
++            const bool valid_token =
++                token < seqlen_k - logical_block * kBlockN;
++            const uint8_t *token_ptr =
++                reinterpret_cast<const uint8_t *>(params.k_ptr) +
++                physical_block * params.k_batch_stride +
++                token * params.k_row_stride;
++            auto target = sK;
++            if (buffer_index != 0) target.data() = target.data() + size(sK);
++#pragma unroll 4
++            for (int chunk = chunk_parity; chunk < kHeadDim / 16; chunk += 2) {
++                const int dim = chunk * 16;
++                constexpr int kCubicGroups = kHeadDim / 64;
++                const int group = dim / 64;
++                const uint8_t *scale_ptr = token_ptr + kHeadDim + group * 4;
++                const float scale = valid_token
++                    ? *reinterpret_cast<const float *>(scale_ptr)
++                    : 0.0f;
++                const int curve = valid_token
++                    ? *(token_ptr + kHeadDim + kCubicGroups * 4 + group)
++                    : 0;
++                const char4 codes0 = valid_token
++                    ? *reinterpret_cast<const char4 *>(token_ptr + dim)
++                    : make_char4(0, 0, 0, 0);
++                const char4 codes1 = valid_token
++                    ? *reinterpret_cast<const char4 *>(token_ptr + dim + 4)
++                    : make_char4(0, 0, 0, 0);
++                const char4 codes2 = valid_token
++                    ? *reinterpret_cast<const char4 *>(token_ptr + dim + 8)
++                    : make_char4(0, 0, 0, 0);
++                const char4 codes3 = valid_token
++                    ? *reinterpret_cast<const char4 *>(token_ptr + dim + 12)
++                    : make_char4(0, 0, 0, 0);
++                const uint2 packed0 = cubic8x4_to_bf16x4(codes0, scale, curve);
++                const uint2 packed1 = cubic8x4_to_bf16x4(codes1, scale, curve);
++                const uint2 packed2 = cubic8x4_to_bf16x4(codes2, scale, curve);
++                const uint2 packed3 = cubic8x4_to_bf16x4(codes3, scale, curve);
++                *reinterpret_cast<uint4 *>(&target(token, dim)) =
++                    make_uint4(packed0.x, packed0.y, packed1.x, packed1.y);
++                *reinterpret_cast<uint4 *>(&target(token, dim + 8)) =
++                    make_uint4(packed2.x, packed2.y, packed3.x, packed3.y);
++            }
++        };
++
+         if (n_block % 2 == 1) {
+             // Double buffer for sK
+             constexpr int sK_offset = size(sK);
+@@ -452,12 +585,18 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decoding
+         }
+
+         // We need to clear the sK smem tiles because K is V.
+-        const index_t offset_k = cur_block_table * params.k_batch_stride;
+-        tKgK.data() = tKgK.data() + offset_k;
+-        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/true>(gmem_tiled_copy_K, tKgK, tKsK, tKcK, tKpK,
+-                                                                                        seqlen_k - n_block * kBlockN);
+-        tKgK.data() = tKgK.data() + -offset_k;
+-        cute::cp_async_fence();
++        if constexpr (Cubic8Cache) {
++            load_cubic8_page(n_block, n_block & 1);
++        } else if constexpr (Fp8Q16) {
++            load_fp8_q16_page(n_block, n_block & 1);
++        } else {
++            const index_t offset_k = cur_block_table * params.k_batch_stride;
++            tKgK.data() = tKgK.data() + offset_k;
++            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/true>(gmem_tiled_copy_K, tKgK, tKsK, tKcK, tKpK,
++                                                                                            seqlen_k - n_block * kBlockN);
++            tKgK.data() = tKgK.data() + -offset_k;
++            cute::cp_async_fence();
++        }
+
+         if (n_block - 1 >= n_block_min) {
+             cur_block_table = __ldg(&block_table[n_block - 1]);
+@@ -465,7 +604,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decoding
+
+ #pragma unroll 1
+         for (; n_block >= n_block_min; --n_block) {
+-            flash::cp_async_wait<0>();
++            if constexpr (!Fp8Q16 && !Cubic8Cache) flash::cp_async_wait<0>();
+             __syncthreads();
+
+             if (n_block - 1 >= n_block_min) {
+@@ -473,11 +612,17 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decoding
+                 const int sK_offset = n_block % 2 == 0 ? size(sK) : -size(sK);
+                 tKsK.data() = tKsK.data() + sK_offset;
+
+-                const index_t offset_k = cur_block_table * params.k_batch_stride;
+-                tKgK.data() = tKgK.data() + offset_k;
+-                flash::copy</*Is_even_MN=*/true, /*Is_even_K=*/true>(gmem_tiled_copy_K, tKgK, tKsK, tKcK, tKpK);
+-                tKgK.data() = tKgK.data() + -offset_k;
+-                cute::cp_async_fence();
++                if constexpr (Cubic8Cache) {
++                    load_cubic8_page(n_block - 1, (n_block - 1) & 1);
++                } else if constexpr (Fp8Q16) {
++                    load_fp8_q16_page(n_block - 1, (n_block - 1) & 1);
++                } else {
++                    const index_t offset_k = cur_block_table * params.k_batch_stride;
++                    tKgK.data() = tKgK.data() + offset_k;
++                    flash::copy</*Is_even_MN=*/true, /*Is_even_K=*/true>(gmem_tiled_copy_K, tKgK, tKsK, tKcK, tKpK);
++                    tKgK.data() = tKgK.data() + -offset_k;
++                    cute::cp_async_fence();
++                }
+             }
+
+             if constexpr (Kernel_traits::Is_FP8) {
+@@ -536,13 +681,19 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decoding
+         cute::copy(tRow_sumsRow_sum, softmax.row_sum);
+     }
+
++    // BF16-Q / FP8-KV expands K and V with descale_k before WGMMA, so its
++    // epilogue must not apply the scale a second time. Native FP8-Q/FP8-KV
++    // keeps the original post-accumulation descale behavior.
++    const float output_descale_k = Kernel_traits::Is_FP8 ? descale_k : 1.0f;
+     if (NoSplit)
+-        store<Kernel_traits, false>(params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax, descale_k, scale_softmax);
++        store<Kernel_traits, false>(params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax, output_descale_k, scale_softmax);
+     else
+-        store<Kernel_traits, true>(params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax, descale_k, scale_softmax);
++        store<Kernel_traits, true>(params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax, output_descale_k, scale_softmax);
+ }
+
+-template<typename Kernel_traits, bool Is_causal, typename SharedStorage>
++template<typename Kernel_traits, bool Is_causal, bool Fp8Q16,
++         bool Cubic8Cache,
++         typename SharedStorage>
+ __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
+ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DecodingParams_fp8 params) {
+     constexpr int kBlockN = Kernel_traits::kBlockN;
+@@ -570,6 +721,8 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DecodingParams_fp8 params)
+         descale_k = __ldg(params.descale_k_ptr);
+         scale_softmax = scale_softmax * descale_q * descale_k;
+         scale_softmax_log2 = scale_softmax_log2 * descale_q * descale_k;
++    } else if constexpr (Fp8Q16) {
++        descale_k = __ldg(params.descale_k_ptr);
+     }
+
+ #pragma unroll 1
+@@ -582,7 +735,8 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DecodingParams_fp8 params)
+         if (batch_id > begin_idx) {
+             __syncthreads();  // Barrier between two tiles.
+         }
+-        flash::compute_attn_1rowblock_splitkv_mla<Kernel_traits, Is_causal>(params, batch_id, bidh, m_block, n_split_idx, seqlen_k, n_block_min, n_block_max, NoSplit, shared_storage, descale_k, scale_softmax, scale_softmax_log2);
++        flash::compute_attn_1rowblock_splitkv_mla<Kernel_traits, Is_causal,
++                                                  Fp8Q16, Cubic8Cache>(params, batch_id, bidh, m_block, n_split_idx, seqlen_k, n_block_min, n_block_max, NoSplit, shared_storage, descale_k, scale_softmax, scale_softmax_log2);
+     }
+ }
+
+@@ -679,12 +833,15 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const DecodingParams_fp8
+
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+-template<typename Kernel_traits, typename SharedStorage>
++template<typename Kernel_traits, typename SharedStorage, bool Fp8Q16,
++         bool Cubic8Cache>
+ void run_flash_splitkv_fwd_mla(DecodingParams_fp8 &params, cudaStream_t stream) {
+     FLASH_ASSERT(params.page_block_size == Kernel_traits::kBlockN);
+     const int num_m_block = cute::ceil_div(params.q_seq_per_hk, Kernel_traits::kBlockM);
+     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+-        auto kernel = &flash::flash_fwd_splitkv_mla_kernel<Kernel_traits, Is_causal, SharedStorage>;
++        auto kernel = &flash::flash_fwd_splitkv_mla_kernel<Kernel_traits, Is_causal,
++                                                           Fp8Q16, Cubic8Cache,
++                                                           SharedStorage>;
+         constexpr size_t smem_size = sizeof(SharedStorage);
+         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+         kernel<<<dim3(num_m_block, params.h_k, params.num_sm_parts), Kernel_traits::kNThreads, smem_size, stream>>>(params);
+@@ -700,10 +857,12 @@ void run_flash_splitkv_fwd_mla(DecodingParams_fp8 &params, cudaStream_t stream)
+     CHECK_CUDA_KERNEL_LAUNCH();
+ }
+
+-template<typename T, typename To, int Headdim>
++template<typename T, typename To, int Headdim, bool Fp8Q16, bool Cubic8Cache>
+ void run_mha_fwd_splitkv_mla(DecodingParams_fp8 &params, cudaStream_t stream) {
+     static_assert(Headdim == 576);
+     FLASH_ASSERT(params.d_v == 512);
+     using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 64, 64, 8, T, To, 512>;
+-    run_flash_splitkv_fwd_mla<Kernel_traits, flash::SharedStorageMLA<Kernel_traits>>(params, stream);
+-}
+\ No newline at end of file
++    run_flash_splitkv_fwd_mla<Kernel_traits,
++                              flash::SharedStorageMLA<Kernel_traits>,
++                              Fp8Q16, Cubic8Cache>(params, stream);
++}
+diff --git a/csrc/extension/sm90/dense_fp8/flash_mla.h b/csrc/extension/sm90/dense_fp8/flash_mla.h
+index b56964a..4e4a330 100644
+--- a/csrc/extension/sm90/dense_fp8/flash_mla.h
++++ b/csrc/extension/sm90/dense_fp8/flash_mla.h
+@@ -70,7 +70,8 @@ struct DecodingParams_fp8 : public DenseAttnDecodeParams {
+
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+-template<typename T, typename To, int Headdim>
++template<typename T, typename To, int Headdim, bool Fp8Q16 = false,
++         bool Cubic8Cache = false>
+ void run_mha_fwd_splitkv_mla(DecodingParams_fp8 &params, cudaStream_t stream);
+
+ struct Mla_metadata_params {
+diff --git a/csrc/extension/sm90/dense_fp8/pybind.cpp b/csrc/extension/sm90/dense_fp8/pybind.cpp
+index a1a8830..5abeaf2 100644
+--- a/csrc/extension/sm90/dense_fp8/pybind.cpp
++++ b/csrc/extension/sm90/dense_fp8/pybind.cpp
+@@ -48,8 +48,18 @@ fwd_kvcache_mla_fp8(
+     STD_TORCH_CHECK(dprops.major == 9 && dprops.minor == 0, "Dense FP8 MLA is only supported on SM90");
+
+     // Check data types
+-    STD_TORCH_CHECK(q.scalar_type() == ScalarType::Float8_e4m3fn);
+-    STD_TORCH_CHECK(kcache.scalar_type() == q.scalar_type(), "query and key must have the same dtype");
++    const bool fp8_q16 =
++        q.scalar_type() == ScalarType::BFloat16 &&
++        kcache.scalar_type() == ScalarType::Float8_e4m3fn;
++    const bool cubic8_cache_a16 =
++        q.scalar_type() == ScalarType::BFloat16 &&
++        kcache.scalar_type() == ScalarType::Byte;
++    STD_TORCH_CHECK(q.scalar_type() == ScalarType::Float8_e4m3fn ||
++                        fp8_q16 || cubic8_cache_a16,
++                    "query must be FP8, or BF16 with an FP8/Cubic8 MLA cache");
++    STD_TORCH_CHECK(fp8_q16 || cubic8_cache_a16 ||
++                        kcache.scalar_type() == q.scalar_type(),
++                    "query and key must have the same dtype in FP8 mode");
+     STD_TORCH_CHECK(seqlens_k.scalar_type() == ScalarType::Int, "seqlens_k must have dtype int32");
+     STD_TORCH_CHECK(block_table.scalar_type() == ScalarType::Int, "block_table must have dtype torch.int32");
+     STD_TORCH_CHECK(tile_scheduler_metadata.scalar_type() == ScalarType::Int, "tile_scheduler_metadata must have dtype int32");
+@@ -88,17 +98,28 @@ fwd_kvcache_mla_fp8(
+     STD_TORCH_CHECK(batch_size > 0, "batch size must be positive");
+     STD_TORCH_CHECK(num_heads_q % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+-    STD_TORCH_CHECK(descale_q.has_value() && descale_k.has_value(), "descale is required when input dtype is fp8");
+-    auto descale_q_ = descale_q.value();
+-    auto descale_k_ = descale_k.value();
+-    CHECK_DEVICE(descale_q_);
+-    CHECK_DEVICE(descale_k_);
+-    STD_TORCH_CHECK(descale_q_.stride(-1) == 1);
+-    STD_TORCH_CHECK(descale_k_.stride(-1) == 1);
+-    STD_TORCH_CHECK(descale_q_.scalar_type() == ScalarType::Float);
+-    STD_TORCH_CHECK(descale_k_.scalar_type() == ScalarType::Float);
+-    CHECK_SHAPE(descale_q_, 1);
+-    CHECK_SHAPE(descale_k_, 1);
++    if (!fp8_q16 && !cubic8_cache_a16) {
++        STD_TORCH_CHECK(descale_q.has_value() && descale_k.has_value(),
++                        "descale is required when input dtype is fp8");
++        auto descale_q_ = descale_q.value();
++        auto descale_k_ = descale_k.value();
++        CHECK_DEVICE(descale_q_);
++        CHECK_DEVICE(descale_k_);
++        STD_TORCH_CHECK(descale_q_.stride(-1) == 1);
++        STD_TORCH_CHECK(descale_k_.stride(-1) == 1);
++        STD_TORCH_CHECK(descale_q_.scalar_type() == ScalarType::Float);
++        STD_TORCH_CHECK(descale_k_.scalar_type() == ScalarType::Float);
++        CHECK_SHAPE(descale_q_, 1);
++        CHECK_SHAPE(descale_k_, 1);
++    } else if (fp8_q16) {
++        STD_TORCH_CHECK(descale_k.has_value(),
++                        "descale_k is required for BF16-Q / FP8-KV mode");
++        auto descale_k_ = descale_k.value();
++        CHECK_DEVICE(descale_k_);
++        STD_TORCH_CHECK(descale_k_.stride(-1) == 1);
++        STD_TORCH_CHECK(descale_k_.scalar_type() == ScalarType::Float);
++        CHECK_SHAPE(descale_k_, 1);
++    }
+
+     if (seqlen_q_ori == 1) { is_causal = false; }
+
+@@ -112,7 +133,16 @@ fwd_kvcache_mla_fp8(
+             {batch_size, q_seq_per_hk, num_heads, head_size_k});
+
+     CHECK_SHAPE(q, batch_size, q_seq_per_hk, num_heads, head_size_k);
+-    CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_k);
++    if (cubic8_cache_a16) {
++        CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k,
++                    head_size_k + 48);
++    } else if (fp8_q16) {
++        CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k,
++                    head_size_k);
++    } else {
++        CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k,
++                    head_size_k);
++    }
+     CHECK_SHAPE(seqlens_k, batch_size);
+     CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
+     STD_TORCH_CHECK(tile_scheduler_metadata.size(1) == TileSchedulerMetaDataSize);
+@@ -144,8 +174,15 @@ fwd_kvcache_mla_fp8(
+
+     // FP8-specific parameters
+     params.h_h_k_ratio = 1;
+-    params.descale_q_ptr = reinterpret_cast<float *>(descale_q.value().data_ptr());
+-    params.descale_k_ptr = reinterpret_cast<float *>(descale_k.value().data_ptr());
++    if (!fp8_q16 && !cubic8_cache_a16) {
++        params.descale_q_ptr =
++            reinterpret_cast<float *>(descale_q.value().data_ptr());
++        params.descale_k_ptr =
++            reinterpret_cast<float *>(descale_k.value().data_ptr());
++    } else if (fp8_q16) {
++        params.descale_k_ptr =
++            reinterpret_cast<float *>(descale_k.value().data_ptr());
++    }
+
+     // Set the pointers and strides.
+     params.q_ptr = q.data_ptr();
+@@ -191,7 +228,17 @@ fwd_kvcache_mla_fp8(
+ #ifdef FLASH_MLA_DISABLE_FP8
+     STD_TORCH_CHECK(false, "FlashMLA is compiled with -DFLASH_MLA_DISABLE_FP8. Please remove this flag from your environment and re-compile FlashMLA.");
+ #else
+-    run_mha_fwd_splitkv_mla<cutlass::float_e4m3_t, cutlass::bfloat16_t, 576>(params, stream);
++    if (cubic8_cache_a16) {
++        run_mha_fwd_splitkv_mla<cutlass::bfloat16_t,
++                                cutlass::bfloat16_t, 576, false, true>(params,
++                                                                      stream);
++    } else if (fp8_q16) {
++        run_mha_fwd_splitkv_mla<cutlass::bfloat16_t,
++                                cutlass::bfloat16_t, 576, true>(params, stream);
++    } else {
++        run_mha_fwd_splitkv_mla<cutlass::float_e4m3_t,
++                                cutlass::bfloat16_t, 576>(params, stream);
++    }
+ #endif
+
+     // Reshape outputs back to original format
+@@ -209,6 +256,49 @@ fwd_kvcache_mla_fp8(
+     return {out, softmax_lse};
+ }
+
++std::vector<Tensor>
++fwd_kvcache_mla_fp8_q16(
++    Tensor q,
++    const Tensor &kcache,
++    const int64_t head_size_v,
++    const Tensor &seqlens_k,
++    const Tensor &block_table,
++    const double softmax_scale,
++    bool is_causal,
++    const Tensor &tile_scheduler_metadata,
++    const Tensor &num_splits,
++    const Tensor &descale_k) {
++    STD_TORCH_CHECK(q.scalar_type() == ScalarType::BFloat16,
++                    "FP8 Q16 requires a BF16 query");
++    STD_TORCH_CHECK(kcache.scalar_type() == ScalarType::Float8_e4m3fn,
++                    "FP8 Q16 requires E4M3 cache storage");
++    return fwd_kvcache_mla_fp8(
++        q, kcache, head_size_v, seqlens_k, block_table, softmax_scale,
++        is_causal, tile_scheduler_metadata, num_splits, std::nullopt,
++        descale_k);
++}
++
++std::vector<Tensor>
++fwd_kvcache_mla_cubic8(
++    Tensor q,
++    const Tensor &kcache,
++    const int64_t head_size_v,
++    const Tensor &seqlens_k,
++    const Tensor &block_table,
++    const double softmax_scale,
++    bool is_causal,
++    const Tensor &tile_scheduler_metadata,
++    const Tensor &num_splits) {
++    STD_TORCH_CHECK(q.scalar_type() == ScalarType::BFloat16,
++                    "Cubic8 MLA requires a BF16 query");
++    STD_TORCH_CHECK(kcache.scalar_type() == ScalarType::Byte,
++                    "Cubic8 MLA requires unsigned byte cache storage");
++    return fwd_kvcache_mla_fp8(
++        q, kcache, head_size_v, seqlens_k, block_table, softmax_scale,
++        is_causal, tile_scheduler_metadata, num_splits, std::nullopt,
++        std::nullopt);
++}
++
+ std::vector<Tensor>
+ get_mla_decoding_metadata_dense_fp8(
+     const Tensor &seqlens_k,
+diff --git a/csrc/extension/torch_api.cpp b/csrc/extension/torch_api.cpp
+index a808a05..f38f923 100644
+--- a/csrc/extension/torch_api.cpp
++++ b/csrc/extension/torch_api.cpp
+@@ -23,6 +23,33 @@ fwd_kvcache_mla_fp8(
+     const std::optional<Tensor> &descale_k       // None or batch_size
+ );
+
++extern std::vector<Tensor>
++fwd_kvcache_mla_fp8_q16(
++    Tensor q,
++    const Tensor &kcache,
++    const int64_t head_size_v,
++    const Tensor &seqlens_k,
++    const Tensor &block_table,
++    const double softmax_scale,
++    bool is_causal,
++    const Tensor &tile_scheduler_metadata,
++    const Tensor &num_splits,
++    const Tensor &descale_k
++);
++
++extern std::vector<Tensor>
++fwd_kvcache_mla_cubic8(
++    Tensor q,
++    const Tensor &kcache,
++    const int64_t head_size_v,
++    const Tensor &seqlens_k,
++    const Tensor &block_table,
++    const double softmax_scale,
++    bool is_causal,
++    const Tensor &tile_scheduler_metadata,
++    const Tensor &num_splits
++);
++
+ extern std::vector<Tensor>
+ get_mla_decoding_metadata_dense_fp8(
+     const Tensor &seqlens_k,
+@@ -32,10 +59,16 @@ get_mla_decoding_metadata_dense_fp8(
+
+ STABLE_TORCH_LIBRARY(_flashmla_extension_C, m) {
+     m.def("fwd_kvcache_mla_fp8(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float softmax_scale, bool is_causal, Tensor tile_scheduler_metadata, Tensor num_splits, Tensor? descale_q, Tensor? descale_k) -> Tensor[]");
++    m.def("fwd_kvcache_mla_fp8_q16(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float softmax_scale, bool is_causal, Tensor tile_scheduler_metadata, Tensor num_splits, Tensor descale_k) -> Tensor[]");
++    m.def("fwd_kvcache_mla_cubic8(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float softmax_scale, bool is_causal, Tensor tile_scheduler_metadata, Tensor num_splits) -> Tensor[]");
+     m.def("get_mla_decoding_metadata_dense_fp8(Tensor seqlens_k, int num_heads_per_head_k, int num_heads_k) -> Tensor[]");
+ }
+
+ STABLE_TORCH_LIBRARY_IMPL(_flashmla_extension_C, CUDA, m) {
+     m.impl("fwd_kvcache_mla_fp8", TORCH_BOX(&fwd_kvcache_mla_fp8));
++    m.impl("fwd_kvcache_mla_fp8_q16",
++           TORCH_BOX(&fwd_kvcache_mla_fp8_q16));
++    m.impl("fwd_kvcache_mla_cubic8",
++           TORCH_BOX(&fwd_kvcache_mla_cubic8));
+     m.impl("get_mla_decoding_metadata_dense_fp8", TORCH_BOX(&get_mla_decoding_metadata_dense_fp8));
+ }
