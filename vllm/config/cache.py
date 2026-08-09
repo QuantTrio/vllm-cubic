@@ -25,6 +25,8 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
+    "fp8_q16",
+    "cubic8",
     "turboquant_k8v4",
     "turboquant_4bit_nc",
     "turboquant_k3v4_nc",
@@ -271,7 +273,13 @@ class CacheConfig:
     @field_validator("cache_dtype", mode="after")
     @classmethod
     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
-        if kv_cache_uses_per_token_head_scales(cache_dtype):
+        if cache_dtype == "cubic8":
+            logger.info(
+                "Using query-protected Cubic8 MLA KV cache: each token/group "
+                "stores signed 8-bit Cubic codes, FP32 scale and a fixed-curve id; "
+                "attention queries remain in the model dtype."
+            )
+        elif kv_cache_uses_per_token_head_scales(cache_dtype):
             logger.info(
                 "Using %s data type to store kv cache. It reduces the GPU "
                 "memory footprint and boosts the performance. "

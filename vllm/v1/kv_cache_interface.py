@@ -44,6 +44,7 @@ class KVQuantMode(IntEnum):
     INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, RHT + asymmetric zp
     NVFP4 = 5  # packed fp4 data + fp8 block scales
     TURBOQUANT = 6  # Hadamard-rotated Lloyd-Max quant, packed K+V per slot
+    CUBIC8_GROUPWISE = 7  # signed codes + FP32 scale + fixed-curve id per group
 
     @property
     def is_per_token_head(self) -> bool:
@@ -77,6 +78,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
         return KVQuantMode.TURBOQUANT
+    if kv_cache_dtype == "cubic8":
+        return KVQuantMode.CUBIC8_GROUPWISE
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
@@ -89,6 +92,17 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
     """Return True if *kv_cache_dtype* needs per-token-head scales."""
     return get_kv_quant_mode(kv_cache_dtype).is_per_token_head
+
+
+CUBIC8_MLA_GROUP_SIZE = 64
+CUBIC8_MLA_META_ALIGNMENT = 8
+
+
+def cubic8_mla_token_size_bytes(head_size: int) -> int:
+    """Physical bytes for one self-describing Cubic8 MLA cache token."""
+    groups = cdiv(head_size, CUBIC8_MLA_GROUP_SIZE)
+    metadata_bytes = round_up(groups * 4 + groups, CUBIC8_MLA_META_ALIGNMENT)
+    return head_size + metadata_bytes
 
 
 class KVCacheSpecKind(str, Enum):
@@ -414,6 +428,12 @@ class MLAAttentionSpec(FullAttentionSpec):
             # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
             return self.block_size * 656
+        if self.kv_quant_mode == KVQuantMode.CUBIC8_GROUPWISE:
+            return (
+                self.storage_block_size
+                * self.num_kv_heads
+                * cubic8_mla_token_size_bytes(self.head_size)
+            )
         if self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
             head_dim = self.head_size // 2
         else:
@@ -434,25 +454,30 @@ class MLAAttentionSpec(FullAttentionSpec):
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
+        alignment_set = set(spec.alignment for spec in specs)
+        quant_mode_set = set(spec.kv_quant_mode for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(block_stride_set) == 1
+            and len(alignment_set) == 1
+            and len(quant_mode_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version, and KV block "
-            "stride indexing."
+            "quantization mode, alignment, compress ratio, model version, and "
+            "KV block stride indexing."
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
-            kv_quant_mode=specs[0].kv_quant_mode,
+            kv_quant_mode=quant_mode_set.pop(),
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=block_stride_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
+            alignment=alignment_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
             non_causal_multi_token_decode=any(

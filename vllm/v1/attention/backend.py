@@ -1086,6 +1086,18 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
     ) -> None:
         if kv_cache.numel() == 0:
             return
+        if kv_cache_dtype == "cubic8":
+            from vllm.v1.attention.ops.cubic8_mla import (
+                concat_and_cache_mla_cubic8,
+            )
+
+            concat_and_cache_mla_cubic8(
+                kv_c_normed,
+                k_pe.squeeze(1),
+                kv_cache,
+                slot_mapping.flatten(),
+            )
+            return
         from vllm import _custom_ops as ops
 
         ops.concat_and_cache_mla(

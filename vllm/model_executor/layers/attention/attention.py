@@ -92,6 +92,14 @@ def should_load_quant_weights(quant_method: QuantizeMethodBase | None) -> bool:
     )
 
 
+def should_quantize_query_input(kv_cache_dtype: str) -> bool:
+    """Return whether attention should quantize its query input."""
+    uses_quantized_query = (
+        kv_cache_dtype.startswith("fp8") and kv_cache_dtype != "fp8_q16"
+    ) or kv_cache_dtype.startswith("nvfp4")
+    return uses_quantized_query and not kv_cache_dtype.endswith("per_token_head")
+
+
 def _largest_kernel_block_within(
     attn_backend: "type[AttentionBackend]",
     per_token_bytes: int,
@@ -456,13 +464,8 @@ class Attention(nn.Module, AttentionLayerBase):
 
         # for attn backends supporting query quantization
         self.query_quant = None
-        if (
-            self.impl.supports_quant_query_input
-            and (
-                self.kv_cache_dtype.startswith("fp8")
-                or self.kv_cache_dtype.startswith("nvfp4")
-            )
-            and not self.kv_cache_dtype.endswith("per_token_head")
+        if self.impl.supports_quant_query_input and should_quantize_query_input(
+            self.kv_cache_dtype
         ):
             is_per_head = (
                 hasattr(self, "q_scale") and self.q_scale.numel() == self.num_kv_heads

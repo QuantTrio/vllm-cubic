@@ -300,6 +300,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
+    cubic8_mla_token_size_bytes,
     get_kv_quant_mode,
 )
 
@@ -773,7 +774,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
-        if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
+        if fp8_attention and self.kv_cache_dtype not in ("fp8_ds_mla", "cubic8"):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         assert (
@@ -1364,6 +1365,12 @@ class MLACommonBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str == "cubic8":
+            return (
+                num_blocks,
+                block_size,
+                cubic8_mla_token_size_bytes(head_size),
+            )
         return (num_blocks, block_size, head_size)
 
     @staticmethod
@@ -1960,14 +1967,19 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
     def determine_prefill_query_data_type(
         vllm_config: VllmConfig,
         model_dtype: torch.dtype,
+        cache_dtype: str | None = None,
     ) -> torch.dtype:
         """
         Determine the query data type for prefill queries.
         Return FP8 dtype if cache is FP8 and prefill query quantization
         is enabled, else model dtype.
         """
+        cache_dtype = cache_dtype or vllm_config.cache_config.cache_dtype
+        if cache_dtype in ("fp8_q16", "cubic8"):
+            return model_dtype
+
         use_fp8 = (
-            is_quantized_kv_cache(vllm_config.cache_config.cache_dtype)
+            is_quantized_kv_cache(cache_dtype)
             and vllm_config.attention_config.use_prefill_query_quantization
             and backend_supports_prefill_query_quantization()
         )
@@ -1985,7 +1997,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             )
             return model_dtype
         elif (
-            is_quantized_kv_cache(vllm_config.cache_config.cache_dtype)
+            is_quantized_kv_cache(cache_dtype)
             and backend_supports_prefill_query_quantization()
         ):
             logger.warning_once(
@@ -2517,6 +2529,20 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     batch_size=chunk.num_requests,
                     seq_starts=chunk.starts,
                 )
+            elif self.kv_cache_dtype == "cubic8":
+                from vllm.v1.attention.ops.cubic8_mla import (
+                    gather_cubic8_mla_cache,
+                )
+
+                gather_cubic8_mla_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=block_table,
+                    cu_seq_lens=chunk.cu_seq_lens,
+                    token_to_seq=chunk.token_to_seq,
+                    num_tokens=toks,
+                    seq_starts=chunk.starts,
+                )
             elif not use_fp8_prefill:
                 ops.gather_and_maybe_dequant_cache(
                     src_cache=kv_c_and_k_pe_cache,
@@ -2525,7 +2551,11 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     cu_seq_lens=chunk.cu_seq_lens,
                     token_to_seq=chunk.token_to_seq,
                     num_tokens=toks,
-                    kv_cache_dtype=self.kv_cache_dtype,
+                    kv_cache_dtype=(
+                        "fp8"
+                        if self.kv_cache_dtype == "fp8_q16"
+                        else self.kv_cache_dtype
+                    ),
                     scale=k_scale,
                     seq_starts=chunk.starts,
                 )
@@ -2626,6 +2656,20 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     batch_size=chunk.num_requests,
                     seq_starts=chunk.starts,
                 )
+            elif self.kv_cache_dtype == "cubic8":
+                from vllm.v1.attention.ops.cubic8_mla import (
+                    gather_cubic8_mla_cache,
+                )
+
+                gather_cubic8_mla_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=block_table,
+                    cu_seq_lens=padded_local_cu_seq_lens,
+                    token_to_seq=chunk.padded_local_token_to_seq,
+                    num_tokens=toks,
+                    seq_starts=chunk.starts,
+                )
             elif is_quantized_kv_cache(self.kv_cache_dtype):
                 assert k_scale is not None
                 ops.gather_and_maybe_dequant_cache(
@@ -2635,7 +2679,11 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     cu_seq_lens=padded_local_cu_seq_lens,
                     token_to_seq=chunk.padded_local_token_to_seq,
                     num_tokens=toks,
-                    kv_cache_dtype=self.kv_cache_dtype,
+                    kv_cache_dtype=(
+                        "fp8"
+                        if self.kv_cache_dtype == "fp8_q16"
+                        else self.kv_cache_dtype
+                    ),
                     scale=k_scale,
                     seq_starts=chunk.starts,
                 )

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 
@@ -55,6 +55,12 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     # forward_mqa, so no intra-block causal masking is required.
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
 
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec) -> AttentionCGSupport:
+        if getattr(kv_cache_spec, "cache_dtype_str", None) == "cubic8":
+            return AttentionCGSupport.NEVER
+        return super().get_cudagraph_support(vllm_config, kv_cache_spec)
+
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         # Only the non-causal DSpark draft group serves multi-token blocks via
@@ -87,9 +93,26 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
             current_platform.num_compute_units(),
         )
         lse_dim = self.mla_dims.kv_lora_rank + 1
-        current_workspace_manager().get_simultaneous(
+        workspace_specs: list[tuple[tuple[int, ...], Any]] = [
             ((B, q_num_heads, max_splits, lse_dim), torch.float32),
-        )
+        ]
+        if getattr(self.kv_cache_spec, "cache_dtype_str", None) == "cubic8":
+            from vllm.v1.attention.ops.cubic8_mla import (
+                cubic8_mla_max_materialize_tokens,
+            )
+
+            semantic_dim = self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim
+            page_size = self.vllm_config.cache_config.block_size
+            max_materialize_tokens = cubic8_mla_max_materialize_tokens(
+                B, self.model_config.max_model_len, page_size
+            )
+            workspace_specs.extend(
+                [
+                    ((max_materialize_tokens, semantic_dim), self.model_config.dtype),
+                    ((max_materialize_tokens // page_size,), torch.int32),
+                ]
+            )
+        current_workspace_manager().get_simultaneous(*workspace_specs)
 
 
 class TritonMLABackend(MLACommonBackend):
@@ -100,6 +123,8 @@ class TritonMLABackend(MLACommonBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        "fp8_q16",
+        "cubic8",
     ]
 
     @classmethod
@@ -269,14 +294,105 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         # direct allocation when the workspace manager is not initialized (e.g.
         # unit tests without a GPUModelRunner).
         logits_shape = (B, q_num_heads, num_kv_splits, self.kv_lora_rank + 1)
-        if is_workspace_manager_initialized():
-            (attn_logits,) = current_workspace_manager().get_simultaneous(
-                (logits_shape, torch.float32),
+        materialize_workspace = None
+        contiguous_block_table = None
+        materialize_tokens = 0
+        if self.kv_cache_dtype == "cubic8":
+            from vllm.v1.attention.ops.cubic8_mla import (
+                CUBIC8_MLA_MATERIALIZE_TOKEN_CAP,
+                cubic8_mla_materialize_token_count,
             )
+
+            page_size = kv_c_and_k_pe_cache.shape[1]
+            materialize_tokens = cubic8_mla_materialize_token_count(
+                B, attn_metadata.max_seq_len, page_size
+            )
+            use_materialized = (
+                materialize_tokens <= CUBIC8_MLA_MATERIALIZE_TOKEN_CAP
+            )
+        else:
+            use_materialized = False
+        if is_workspace_manager_initialized():
+            workspace_specs: list[tuple[tuple[int, ...], Any]] = [
+                (logits_shape, torch.float32)
+            ]
+            if use_materialized:
+                workspace_specs.extend(
+                    [
+                        ((materialize_tokens, q.shape[-1]), q.dtype),
+                        (
+                            (
+                                B,
+                                materialize_tokens
+                                // B
+                                // kv_c_and_k_pe_cache.shape[1],
+                            ),
+                            torch.int32,
+                        ),
+                    ]
+                )
+            workspaces = current_workspace_manager().get_simultaneous(*workspace_specs)
+            attn_logits = workspaces[0]
+            if use_materialized:
+                materialize_workspace = workspaces[1]
+                contiguous_block_table = workspaces[2]
         else:
             attn_logits = torch.empty(
                 logits_shape, dtype=torch.float32, device=q.device
             )
+            if use_materialized:
+                materialize_workspace = torch.empty(
+                    materialize_tokens, q.shape[-1], dtype=q.dtype, device=q.device
+                )
+                contiguous_block_table = torch.empty(
+                    B,
+                    materialize_tokens // B // kv_c_and_k_pe_cache.shape[1],
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+
+        if self.kv_cache_dtype == "cubic8":
+            if use_materialized:
+                assert materialize_workspace is not None
+                assert contiguous_block_table is not None
+                from vllm.v1.attention.ops.cubic8_mla import (
+                    cubic8_mla_materialized_decode_attention_fwd,
+                )
+
+                cubic8_mla_materialized_decode_attention_fwd(
+                    q,
+                    kv_c_and_k_pe_cache,
+                    o,
+                    lse,
+                    attn_metadata.decode.block_table,
+                    attn_metadata.decode.seq_lens,
+                    attn_logits,
+                    materialize_workspace,
+                    contiguous_block_table,
+                    num_kv_splits,
+                    self.scale,
+                    self.kv_lora_rank,
+                    attn_metadata.max_seq_len,
+                    layer._k_scale,
+                )
+            else:
+                from vllm.v1.attention.ops.cubic8_mla import (
+                    cubic8_mla_decode_attention_fwd,
+                )
+
+                cubic8_mla_decode_attention_fwd(
+                    q,
+                    kv_c_and_k_pe_cache,
+                    o,
+                    lse,
+                    attn_metadata.decode.block_table,
+                    attn_metadata.decode.seq_lens,
+                    attn_logits,
+                    num_kv_splits,
+                    self.scale,
+                    self.kv_lora_rank,
+                )
+            return o, lse
 
         # Add a head dim of 1
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.unsqueeze(2)
