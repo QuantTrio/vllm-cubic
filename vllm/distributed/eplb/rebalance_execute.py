@@ -20,6 +20,70 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def allocate_expert_buffer(
+    expert_weights: Sequence[Sequence[torch.Tensor]],
+) -> list[torch.Tensor]:
+    """Allocate one reusable buffer that fits every MoE layer."""
+    if not expert_weights or not expert_weights[0]:
+        raise ValueError("EPLB requires at least one expert weight tensor.")
+
+    tensor_count = len(expert_weights[0])
+    if any(len(layer) != tensor_count for layer in expert_weights):
+        raise ValueError("All MoE layers must expose the same expert tensor count.")
+
+    buffers: list[torch.Tensor] = []
+    for tensor_idx in range(tensor_count):
+        tensors = [layer[tensor_idx] for layer in expert_weights]
+        template = tensors[0]
+        if template.ndim < 2:
+            raise ValueError("EPLB expert weights must include an expert dimension.")
+        num_experts = template.shape[0]
+        if any(
+            tensor.shape[0] != num_experts
+            or tensor.dtype != template.dtype
+            or tensor.device != template.device
+            for tensor in tensors
+        ):
+            raise ValueError(
+                "Corresponding EPLB expert tensors must have matching expert "
+                "counts, dtypes, and devices."
+            )
+        max_expert_numel = max(tensor[0].numel() for tensor in tensors)
+        buffers.append(
+            torch.empty(
+                (num_experts, max_expert_numel),
+                dtype=template.dtype,
+                device=template.device,
+            )
+        )
+    return buffers
+
+
+def _expert_buffer_views(
+    expert_weights: Sequence[torch.Tensor],
+    expert_buffers: Sequence[torch.Tensor],
+) -> list[torch.Tensor]:
+    if len(expert_weights) != len(expert_buffers):
+        raise ValueError("EPLB expert weight and buffer counts must match.")
+
+    views: list[torch.Tensor] = []
+    for weight, buffer in zip(expert_weights, expert_buffers):
+        if (
+            weight.shape[0] != buffer.shape[0]
+            or weight.dtype != buffer.dtype
+            or weight.device != buffer.device
+        ):
+            raise ValueError(
+                "EPLB expert weights and buffers must have matching expert "
+                "counts, dtypes, and devices."
+            )
+        expert_numel = weight[0].numel()
+        if buffer[0].numel() < expert_numel:
+            raise ValueError("EPLB expert buffer is too small for this MoE layer.")
+        views.append(buffer.flatten(1)[:, :expert_numel].view_as(weight))
+    return views
+
+
 @dataclass
 class TransferMetadata:
     """Metadata describing a completed EPLB buffer transfer."""
@@ -200,6 +264,9 @@ def move_to_buffer(
         TransferMetadata: Metadata needed for completing remote weight transfers.
     """
     assert old_indices.shape == new_indices.shape
+    expert_weights_buffers = _expert_buffer_views(
+        expert_weights, expert_weights_buffers
+    )
     recv_primary_mask = np.zeros((num_local_experts,), dtype=np.bool_)
     send_expert_ids = np.full((num_local_experts,), -1, dtype=np.int64)
     send_src_rows = np.full((num_local_experts,), -1, dtype=np.int32)
@@ -367,6 +434,9 @@ def move_from_buffer(
             (possibly global) expert id, after rebalance.
         ep_rank: Rank of the process in the expert parallel group.
     """
+    expert_weights_buffers = _expert_buffer_views(
+        expert_weights, expert_weights_buffers
+    )
     is_unchanged = transfer_metadata.is_unchanged
     is_received_locally = transfer_metadata.is_received_locally
     recv_primary_mask = transfer_metadata.recv_primary_mask

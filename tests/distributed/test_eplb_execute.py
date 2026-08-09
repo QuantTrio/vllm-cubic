@@ -3,6 +3,7 @@
 
 import random
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed
@@ -13,6 +14,8 @@ from vllm.distributed.eplb.eplb_communicator import (
     has_nixl,
 )
 from vllm.distributed.eplb.rebalance_execute import (
+    TransferMetadata,
+    allocate_expert_buffer,
     move_from_buffer,
     rearrange_expert_weights_inplace,
     transfer_layer,
@@ -23,6 +26,36 @@ from vllm.distributed.parallel_state import (
 )
 
 from .eplb_utils import distributed_run, set_env_vars_and_device
+
+
+def test_expert_buffer_supports_mixed_layer_widths() -> None:
+    expert_weights = [
+        [torch.zeros(2, 3)],
+        [torch.zeros(2, 5)],
+    ]
+    expert_buffer = allocate_expert_buffer(expert_weights)
+    assert expert_buffer[0].shape == (2, 5)
+
+    expert_buffer[0][0, :3] = torch.tensor([1.0, 2.0, 3.0])
+    transfer_metadata = TransferMetadata(
+        is_unchanged=np.array([False, True]),
+        is_received_locally=np.array([True, False]),
+        recv_primary_mask=np.array([False, False]),
+        recv_count=0,
+        recv_expert_ids=np.array([-1, -1]),
+        recv_dst_rows=np.array([-1, -1]),
+    )
+    move_from_buffer(
+        expert_weights=expert_weights[0],
+        expert_weights_buffers=expert_buffer,
+        transfer_metadata=transfer_metadata,
+        new_indices=np.array([0, 1]),
+        ep_rank=0,
+    )
+
+    torch.testing.assert_close(
+        expert_weights[0][0][0], torch.tensor([1.0, 2.0, 3.0])
+    )
 
 
 def create_expert_indices_with_redundancy(

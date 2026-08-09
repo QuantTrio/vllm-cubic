@@ -54,6 +54,7 @@ from .eplb_utils import CpuGpuEvent
 from .policy import EPLB_POLICIES, AbstractEplbPolicy, DefaultEplbPolicy
 from .rebalance_execute import (
     AsyncEplbLayerResult,
+    allocate_expert_buffer,
     move_from_buffer,
     rearrange_expert_weights_inplace,
 )
@@ -462,7 +463,7 @@ class EplbState:
             logical_replica_count,
         )
         self._propagate_shared_tensors(model, num_unpadded_tokens_tensors)
-        expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
+        expert_buffer = allocate_expert_buffer(model.expert_weights)
 
         assert self.parallel_config.eplb_config.communicator is not None, (
             "EPLB communicator backend must be set by ParallelConfig"
