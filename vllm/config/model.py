@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import secrets
 import warnings
 from collections.abc import Callable
 from dataclasses import InitVar, field
@@ -76,6 +77,13 @@ else:
     LogitsProcessor = Any
 
 logger = init_logger(__name__)
+
+_MAX_RANDOM_SEED = 2**32 - 1
+
+
+def _random_seed() -> int:
+    return secrets.randbelow(_MAX_RANDOM_SEED) + 1
+
 
 # Process-local record of which (arch, target) model-class overrides have been
 # registered in *this* process. Must not live on ModelConfig: that instance is
@@ -176,12 +184,11 @@ class ModelConfig:
     - "bfloat16" for a balance between precision and range.
     - "float" is shorthand for FP32 precision.
     - "float32" for FP32 precision."""
-    seed: int = 0
-    """Random seed for reproducibility.
+    seed: int = Field(default_factory=_random_seed)
+    """Random seed used to initialize the engine.
 
-    We must set the global seed because otherwise,
-    different tensor parallel workers would sample different tokens,
-    leading to inconsistent results."""
+    A random nonzero seed is generated once by default and shared by all tensor
+    parallel workers. Set an explicit value, including 0, for reproducibility."""
     hf_config: PretrainedConfig = field(init=False)
     """The Hugging Face config of the model."""
     hf_text_config: PretrainedConfig = field(init=False)
