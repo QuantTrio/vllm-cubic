@@ -21,7 +21,9 @@ def flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
     return hashlib.sha256(str(factors).encode()).hexdigest()
 
 
-def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
+def resolve_flashinfer_autotune_file(
+    runner: "GPUModelRunner", rank: int | None = None
+) -> Path:
     override_dir = envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR
     if override_dir:
         root = Path(override_dir).expanduser()
@@ -38,7 +40,12 @@ def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
 
     output_dir = root / flashinfer_autotune_cache_hash(runner)
     output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir / "autotune_configs.json"
+    filename = (
+        "autotune_configs.json"
+        if rank is None
+        else f"autotune_configs_rank_{rank}.json"
+    )
+    return output_dir / filename
 
 
 def write_flashinfer_autotune_cache(cache_path: Path, contents: bytes) -> None:

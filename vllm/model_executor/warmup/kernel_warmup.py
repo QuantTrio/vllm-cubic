@@ -22,7 +22,6 @@ from vllm.model_executor.warmup.fa4_cutedsl_warmup import (
 )
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
-    write_flashinfer_autotune_cache,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
@@ -229,8 +228,8 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     Without autotuning, FlashInfer will rely on heuristics, which may
     be significantly slower.
 
-    Tuning is performed only on rank 0. The resulting cache is broadcast
-    to every rank so all ranks dispatch the same kernel tactic.
+    In distributed execution, every rank tunes so model collectives remain
+    synchronized. Each rank persists its own results for later startups.
     """
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
@@ -244,28 +243,14 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         )
         autotune_kwargs["skip_ops"] = skip_ops
 
-    use_persistent_cache = True
-
-    # When distributed, tune on every rank so the collectives stay synchronized.
-    if get_world_group().world_size > 1:
-        use_persistent_cache = False
-
-    if not use_persistent_cache:
-        with torch.inference_mode(), fi_utils.autotune(**autotune_kwargs):
-            runner._dummy_run(
-                num_tokens=runner.scheduler_config.max_num_batched_tokens,
-                skip_eplb=True,
-                is_profile=True,
-            )
-        get_world_group().barrier()
-        return
-
     world = get_world_group()
-    is_leader = world.rank_in_group == 0
-
-    cache_path = resolve_flashinfer_autotune_file(runner)
-    if is_leader:
-        logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
+    cache_rank = world.rank_in_group if world.world_size > 1 else None
+    cache_path = resolve_flashinfer_autotune_file(runner, rank=cache_rank)
+    logger.info(
+        "Using FlashInfer autotune cache on rank %d: %s",
+        world.rank_in_group,
+        cache_path,
+    )
 
     # We skip EPLB here since we don't want to record dummy metrics.
     # When autotuning with number of tokens m, flashinfer will autotune
@@ -277,36 +262,23 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         is_profile=True,
     )
 
-    with torch.inference_mode():
-        if is_leader:
-            with fi_utils.autotune(
-                tune_mode=True, cache=str(cache_path), **autotune_kwargs
-            ):
-                runner._dummy_run(**dummy_run_kwargs)
-        else:
-            runner._dummy_run(**dummy_run_kwargs)
+    with (
+        torch.inference_mode(),
+        fi_utils.autotune(tune_mode=True, cache=str(cache_path), **autotune_kwargs),
+    ):
+        runner._dummy_run(**dummy_run_kwargs)
 
-    # Broadcast autotune cache from rank 0 to all other ranks so every
-    # rank loads the same set of chosen tactics.
-    tune_results: bytes | None = None
-    if is_leader and cache_path.exists():
-        with open(cache_path, "rb") as f:
-            tune_results = f.read()
-
-    tune_results = world.broadcast_object(tune_results, src=0)
-
-    if tune_results is None:
+    world.barrier()
+    if not cache_path.exists():
         logger.warning_once(
             "No FlashInfer autotune cache entries found; "
             "falling back to default tactics."
         )
     else:
-        write_flashinfer_autotune_cache(cache_path, tune_results)
-        world.barrier()
         from flashinfer.autotuner import AutoTuner
 
         AutoTuner.get().load_configs(str(cache_path))
-        logger.info_once(
+        logger.info(
             "FlashInfer autotune cache loaded on rank %d from %s.",
             world.rank_in_group,
             cache_path,
