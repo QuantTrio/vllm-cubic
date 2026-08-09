@@ -326,6 +326,8 @@ def _cubic_a8_moe_grouping(
     num_tokens: int,
     fallback: int,
 ) -> int:
+    if group_size < 256:
+        return 1
     device = torch.accelerator.current_device_index()
     exact = (
         device,
@@ -9741,7 +9743,13 @@ def calibrate_cubic_a8_moe_grouping(
         activation_situ_beta=activation_situ_beta,
         activation_situ_linear_beta=activation_situ_linear_beta,
     )
-    candidates = (1, 2, 4, 8) if num_bits >= 4 else (1, 2)
+    candidates = (
+        (1,)
+        if group_size < 256
+        else (1, 2, 4, 8)
+        if num_bits >= 4
+        else (1, 2)
+    )
     for grouped_routes in candidates:
         _CUBIC_A8_MOE_GROUPING_TACTICS[key] = grouped_routes
 

@@ -56,6 +56,26 @@ def _make_codes(shape: tuple[int, ...], bits: int) -> torch.Tensor:
     )
 
 
+def test_cubic_a8_moe_grouping_keeps_small_input_groups_singleton() -> None:
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        _cubic_a8_moe_grouping,
+    )
+
+    assert (
+        _cubic_a8_moe_grouping(
+            num_bits=8,
+            hidden_size=3072,
+            intermediate_size=1024,
+            group_size=128,
+            group_out=1,
+            local_experts=32,
+            num_tokens=1,
+            fallback=8,
+        )
+        == 1
+    )
+
+
 def _reference_carriers(
     codes: torch.Tensor,
     a: torch.Tensor,
