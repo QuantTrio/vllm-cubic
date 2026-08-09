@@ -8,7 +8,17 @@ from vllm.model_executor.warmup.cubic_warmup import _assign_cubic_tasks
 
 
 def _linear_task(bits: int) -> tuple[object, ...]:
-    return ("linear", bits, 256, 3072, 7168, "torch.float16", "torch.float16", 16)
+    return (
+        "linear",
+        bits,
+        256,
+        1,
+        3072,
+        7168,
+        "torch.float16",
+        "torch.float16",
+        16,
+    )
 
 
 def _metadata(
@@ -125,12 +135,8 @@ def test_cubic_warmup_materializes_merged_tactics_on_every_rank(monkeypatch):
 
         return warmup
 
-    monkeypatch.setattr(
-        cubic_warmup, "_warmup_cubic_linear_families", record("linear")
-    )
-    monkeypatch.setattr(
-        cubic_warmup, "_warmup_cubic_moe_families", record("moe")
-    )
+    monkeypatch.setattr(cubic_warmup, "_warmup_cubic_linear_families", record("linear"))
+    monkeypatch.setattr(cubic_warmup, "_warmup_cubic_moe_families", record("moe"))
 
     cubic_warmup.cubic_kernel_warmup(
         torch.nn.Identity(), max_tokens=16, capture_sizes=(1, 8)
@@ -142,3 +148,13 @@ def test_cubic_warmup_materializes_merged_tactics_on_every_rank(monkeypatch):
         ("linear", False),
         ("moe", False),
     ]
+
+
+def test_cubic_calibration_keeps_large_linear_buckets_beyond_capture_sizes():
+    buckets = cubic_warmup._calibration_token_buckets(
+        8192,
+        (1, 2, 4, 8, 16, 32, 64, 128, 256, 512),
+    )
+
+    assert 1024 in buckets
+    assert 8192 in buckets

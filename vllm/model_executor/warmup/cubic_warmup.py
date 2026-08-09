@@ -246,7 +246,7 @@ def _cubic_calibration_tasks(
 
 def _cubic_task_weight(task: CalibrationTask) -> int:
     if task[0] == "linear":
-        _, _, _, k, n, _, _, m = task
+        _, _, _, _, k, n, _, _, m = task
         return int(k) * int(n) * (32 + int(m))
     if task[0] == "w2_situ":
         _, n, k, _, _, local_experts = task
@@ -823,8 +823,7 @@ def _warmup_cubic_moe_families(
         if not assigned_tokens:
             continue
         logger.info(
-            "%s Cubic MoE %s: W%d G=%dx%d H=%d I=%d "
-            "top_k=%d experts=%d M=%s",
+            "%s Cubic MoE %s: W%d G=%dx%d H=%d I=%d top_k=%d experts=%d M=%s",
             "Calibrating" if calibrate else "Materializing",
             "A8" if method.dynamic_a8 else "A16",
             bits,
@@ -910,9 +909,7 @@ def _warmup_cubic_moe_families(
                     topk_weights,
                     topk_ids,
                     activation=layer.activation,
-                    apply_router_weight_on_input=(
-                        layer.apply_router_weight_on_input
-                    ),
+                    apply_router_weight_on_input=(layer.apply_router_weight_on_input),
                     global_num_experts=layer.global_num_experts,
                     expert_map=layer.expert_map,
                     num_bits=bits,
@@ -949,8 +946,7 @@ def _warmup_cubic_moe_families(
             )
             can_calibrate_grouping = (
                 method.dynamic_a8
-                and
-                tokens <= 1024
+                and tokens <= 1024
                 and group_size in (128, 256, 512)
                 and (bits == 2 or has_cuda_candidate)
             )
@@ -997,8 +993,7 @@ def _warmup_cubic_moe_families(
             # Other paired widths are CUDA-only and need no backend contest.
             calibrate_backend = (
                 method.dynamic_a8
-                and
-                has_cuda_candidate
+                and has_cuda_candidate
                 and tokens <= 128
                 and (grouped_routes == 1 or bits == 2)
             )
@@ -1026,33 +1021,33 @@ def _warmup_cubic_moe_families(
             gate_a, gate_b, down_a, down_b = coefficients
             route_grouping = grouped_routes if dynamic_a8 else 1
             calibrate_cubic_moe_route_ctas(
-                    x,
-                    layer.w13_weight_packed,
-                    layer.w13_weight_scale,
-                    gate_a,
-                    gate_b,
-                    topk_weights,
-                    topk_ids,
-                    layer.expert_map,
-                    dynamic_a8=dynamic_a8,
-                    global_num_experts=layer.global_num_experts,
-                    logical_k=hidden,
-                    num_bits=bits,
-                    group_size=group_size,
-                    group_out=group_out,
-                    top_k=top_k,
-                    multiply_routed_weight=layer.apply_router_weight_on_input,
-                    grouped_routes=route_grouping,
-                    situ_beta=(
-                        method.moe.activation_situ_beta
-                        if bits == 2 and layer.activation == MoEActivation.SITU
-                        else None
-                    ),
-                    situ_linear_beta=(
-                        method.moe.activation_situ_linear_beta
-                        if bits == 2 and layer.activation == MoEActivation.SITU
-                        else None
-                    ),
+                x,
+                layer.w13_weight_packed,
+                layer.w13_weight_scale,
+                gate_a,
+                gate_b,
+                topk_weights,
+                topk_ids,
+                layer.expert_map,
+                dynamic_a8=dynamic_a8,
+                global_num_experts=layer.global_num_experts,
+                logical_k=hidden,
+                num_bits=bits,
+                group_size=group_size,
+                group_out=group_out,
+                top_k=top_k,
+                multiply_routed_weight=layer.apply_router_weight_on_input,
+                grouped_routes=route_grouping,
+                situ_beta=(
+                    method.moe.activation_situ_beta
+                    if bits == 2 and layer.activation == MoEActivation.SITU
+                    else None
+                ),
+                situ_linear_beta=(
+                    method.moe.activation_situ_linear_beta
+                    if bits == 2 and layer.activation == MoEActivation.SITU
+                    else None
+                ),
             )
             phase_index += 1
             if progress is not None:
@@ -1063,23 +1058,23 @@ def _warmup_cubic_moe_families(
                     f"{'A8' if dynamic_a8 else 'A16'} W13 route CTA",
                 )
             calibrate_cubic_moe_route_ctas(
-                    down_inputs,
-                    layer.w2_weight_packed,
-                    layer.w2_weight_scale,
-                    down_a,
-                    down_b,
-                    down_topk_weights,
-                    down_topk_ids,
-                    layer.expert_map,
-                    dynamic_a8=dynamic_a8,
-                    global_num_experts=layer.global_num_experts,
-                    logical_k=intermediate,
-                    num_bits=bits,
-                    group_size=group_size,
-                    group_out=group_out,
-                    top_k=1,
-                    multiply_routed_weight=(not layer.apply_router_weight_on_input),
-                    grouped_routes=route_grouping,
+                down_inputs,
+                layer.w2_weight_packed,
+                layer.w2_weight_scale,
+                down_a,
+                down_b,
+                down_topk_weights,
+                down_topk_ids,
+                layer.expert_map,
+                dynamic_a8=dynamic_a8,
+                global_num_experts=layer.global_num_experts,
+                logical_k=intermediate,
+                num_bits=bits,
+                group_size=group_size,
+                group_out=group_out,
+                top_k=1,
+                multiply_routed_weight=(not layer.apply_router_weight_on_input),
+                grouped_routes=route_grouping,
             )
             phase_index += 1
             if progress is not None:
