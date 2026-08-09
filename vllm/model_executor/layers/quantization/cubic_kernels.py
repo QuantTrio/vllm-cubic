@@ -207,6 +207,7 @@ _CUBIC_MOE_DENSE_N_CONFIGS = [
     triton.Config({"BLOCK_N": 128}, num_warps=8, num_stages=2),
 ]
 
+
 def _cubic_a8_moe_backend(
     *,
     num_bits: int,
@@ -1037,8 +1038,8 @@ def _cubic_linear_kernel(
         else:
             groups = global_k[:, None] // GROUP_SIZE
             metadata_ptrs = (
-                (offs_n[None, :] // GROUP_OUT) * stride_sm + groups * stride_sg
-            )
+                offs_n[None, :] // GROUP_OUT
+            ) * stride_sm + groups * stride_sg
             metadata_mask = weight_mask & (groups < NUM_GROUPS)
             scale = tl.load(
                 scale_ptr + metadata_ptrs,
@@ -6254,9 +6255,7 @@ def _cubic_moe_dynamic_a8_gemv_kernel(
                     mask=metadata_mask,
                     other=0.0,
                 ).to(tl.float32)
-                carrier = _cubic_dynamic_a8_carrier(
-                    raw, cubic_a, cubic_b, NUM_BITS
-                )
+                carrier = _cubic_dynamic_a8_carrier(raw, cubic_a, cubic_b, NUM_BITS)
                 partial = tl.sum(
                     carrier.to(tl.float32)
                     * activation[None, :].to(tl.float32)
@@ -6299,12 +6298,8 @@ def _cubic_moe_dynamic_a8_gemv_kernel(
                         NUM_BITS,
                     )
                 else:
-                    carrier = _cubic_dynamic_a8_carrier(
-                        raw, cubic_a, cubic_b, NUM_BITS
-                    )
-                partial = tl.sum(
-                    carrier.to(tl.int32) * activation[None, :], axis=1
-                )
+                    carrier = _cubic_dynamic_a8_carrier(raw, cubic_a, cubic_b, NUM_BITS)
+                partial = tl.sum(carrier.to(tl.int32) * activation[None, :], axis=1)
                 accumulator += (
                     partial.to(tl.float32)
                     * activation_scale
@@ -7200,9 +7195,7 @@ def _cubic_moe_dynamic_a8_kernel(
                     mask=weight_mask & (byte_indices + 1 < PACKED_K),
                     other=0,
                 ).to(tl.int32)
-            raw = ((low >> shifts) | (high << (8 - shifts))) & (
-                (1 << NUM_BITS) - 1
-            )
+            raw = ((low >> shifts) | (high << (8 - shifts))) & ((1 << NUM_BITS) - 1)
 
             if NUM_BITS == 1:
                 carrier = (raw * 254 - 127).to(tl.int8)
@@ -7243,10 +7236,7 @@ def _cubic_moe_dynamic_a8_kernel(
 
             partial = tl.dot(activation, carrier, out_dtype=tl.int32)
             accumulator += (
-                partial.to(tl.float32)
-                * activation_scale
-                * weight_scale
-                * (1.0 / 127.0)
+                partial.to(tl.float32) * activation_scale * weight_scale * (1.0 / 127.0)
             )
 
     if MUL_ROUTED_WEIGHT:
@@ -8078,8 +8068,7 @@ def _launch_cubic_moe_dynamic_a8(
             return
         if (
             group_out == 1
-            and
-            num_bits == 2
+            and num_bits == 2
             and group_size == 512
             and logical_k % group_size == 0
             and grouped_routes == 1
@@ -8114,8 +8103,7 @@ def _launch_cubic_moe_dynamic_a8(
             return
         if (
             group_out == 1
-            and
-            num_bits == 2
+            and num_bits == 2
             and group_size in (128, 256, 512)
             and logical_k % group_size == 0
         ):
@@ -8233,8 +8221,7 @@ def _launch_cubic_moe_dynamic_a8(
             return
         if (
             group_out == 1
-            and
-            num_bits == 3
+            and num_bits == 3
             and precomputed_3bit_levels
             and group_size in (128, 256, 512)
             and logical_k % group_size == 0
@@ -9743,13 +9730,7 @@ def calibrate_cubic_a8_moe_grouping(
         activation_situ_beta=activation_situ_beta,
         activation_situ_linear_beta=activation_situ_linear_beta,
     )
-    candidates = (
-        (1,)
-        if group_size < 256
-        else (1, 2, 4, 8)
-        if num_bits >= 4
-        else (1, 2)
-    )
+    candidates = (1,) if group_size < 256 else (1, 2, 4, 8) if num_bits >= 4 else (1, 2)
     for grouped_routes in candidates:
         _CUBIC_A8_MOE_GROUPING_TACTICS[key] = grouped_routes
 
@@ -10465,12 +10446,7 @@ def cubic_fused_moe_dynamic_a8(
             num_tokens=num_tokens,
             fallback=grouped_routes,
         )
-    if (
-        use_gemv
-        and group_out > 1
-        and group_size >= 128
-        and 4 <= num_bits <= 8
-    ):
+    if use_gemv and group_out > 1 and group_size >= 128 and 4 <= num_bits <= 8:
         if num_tokens >= 256:
             grouped_routes = 8
         elif num_tokens >= 16:

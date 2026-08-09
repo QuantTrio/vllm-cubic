@@ -43,9 +43,7 @@ def _normalize_group_size(value: Any) -> tuple[int, int]:
         and all(isinstance(size, int) for size in value)
     ):
         return value[0], value[1]
-    raise ValueError(
-        "Cubic group_size must be an integer or [group_out, group_in]."
-    )
+    raise ValueError("Cubic group_size must be an integer or [group_out, group_in].")
 
 
 @dataclass(frozen=True)
@@ -262,9 +260,7 @@ def dequantize_cubic(
         a_values = a[..., input_groups].to(torch.float32)
         b_values = b[..., input_groups].to(torch.float32)
     else:
-        output_groups = (
-            torch.arange(codes.shape[-2], device=packed.device) // group_out
-        )
+        output_groups = torch.arange(codes.shape[-2], device=packed.device) // group_out
         metadata_indices = (output_groups[:, None], input_groups[None, :])
         scale_values = scale[..., metadata_indices[0], metadata_indices[1]]
         a_values = a[..., metadata_indices[0], metadata_indices[1]].to(torch.float32)
@@ -320,9 +316,7 @@ def dequantize_cubic_carrier(
         a_values = a[..., input_groups].to(torch.float32)
         b_values = b[..., input_groups].to(torch.float32)
     else:
-        output_groups = (
-            torch.arange(codes.shape[-2], device=packed.device) // group_out
-        )
+        output_groups = torch.arange(codes.shape[-2], device=packed.device) // group_out
         metadata_indices = (output_groups[:, None], input_groups[None, :])
         scale_values = scale[..., metadata_indices[0], metadata_indices[1]]
         a_values = a[..., metadata_indices[0], metadata_indices[1]].to(torch.float32)
@@ -667,21 +661,15 @@ class CubicLinearMethod(LinearMethodBase):
             "weight_loader": weight_loader,
         }
         scale = GroupQuantScaleParameter(
-            data=torch.empty(
-                output_groups, num_groups, dtype=torch.float32
-            ),
+            data=torch.empty(output_groups, num_groups, dtype=torch.float32),
             **metadata_args,
         )
         a = GroupQuantScaleParameter(
-            data=torch.empty(
-                output_groups, num_groups, dtype=torch.float16
-            ),
+            data=torch.empty(output_groups, num_groups, dtype=torch.float16),
             **metadata_args,
         )
         b = GroupQuantScaleParameter(
-            data=torch.empty(
-                output_groups, num_groups, dtype=torch.float16
-            ),
+            data=torch.empty(output_groups, num_groups, dtype=torch.float16),
             **metadata_args,
         )
         layer.register_parameter("weight_packed", weight)
@@ -1025,6 +1013,7 @@ class CubicMoEMethod(FusedMoEMethodBase):
             for a, b in metadata_pairs:
                 if a.dtype != torch.float16 or b.dtype != torch.float16:
                     raise ValueError("Cubic fused MoE a/b must remain FP16.")
+
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> None:
         return None
 
