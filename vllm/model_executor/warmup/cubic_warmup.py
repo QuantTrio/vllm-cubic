@@ -31,7 +31,7 @@ from vllm.model_executor.layers.quantization.cubic import (
 
 logger = init_logger(__name__)
 
-_CUBIC_TACTIC_CACHE_SCHEMA = 10
+_CUBIC_TACTIC_CACHE_SCHEMA = 13
 _CUBIC_TACTIC_CACHE_FILENAME = "cubic_tactics.json"
 _CUBIC_TACTIC_REGISTRY_NAMES = (
     "_CUBIC_W2_A8_SITU_TACTICS",
@@ -588,6 +588,7 @@ def _warmup_cubic_linear_families(
         calibrate_cubic_linear_execution,
         cubic_linear,
         cubic_linear_dynamic_a8,
+        cubic_linear_dynamic_a8_precomputed,
     )
 
     layers: dict[CalibrationTask, tuple[torch.nn.Module, CubicLinearMethod]] = {}
@@ -612,9 +613,9 @@ def _warmup_cubic_linear_families(
         if not assigned_tokens:
             continue
         logger.info(
-            "%s Cubic Linear A16%s: W%d G=%dx%d N=%d K=%d M=%s",
+            "%s Cubic Linear %s: W%d G=%dx%d N=%d K=%d M=%s",
             "Calibrating" if calibrate else "Materializing",
-            "/A8" if group_out == 1 else "",
+            "A8" if method.dynamic_a8 else "A16",
             bits,
             group_out,
             group_size,
@@ -630,9 +631,32 @@ def _warmup_cubic_linear_families(
         elif bits == 3:
             levels = cubic_carrier_levels(3, layer.weight_a, layer.weight_b)
             a8_a, a8_b = levels[..., 1].contiguous(), levels[..., 2].contiguous()
-        modes = [(False, cubic_linear, a16_a, a16_b)]
-        if group_out == 1:
-            modes.append((True, cubic_linear_dynamic_a8, a8_a, a8_b))
+        if method.dynamic_a8:
+            carrier = getattr(layer, "weight_carrier", None)
+            if carrier is None:
+                modes = [
+                    (
+                        True,
+                        cubic_linear_dynamic_a8,
+                        layer.weight_packed,
+                        a8_a,
+                        a8_b,
+                        False,
+                    )
+                ]
+            else:
+                modes = [
+                    (
+                        True,
+                        cubic_linear_dynamic_a8_precomputed,
+                        carrier,
+                        a8_a,
+                        a8_b,
+                        True,
+                    )
+                ]
+        else:
+            modes = [(False, cubic_linear, layer.weight_packed, a16_a, a16_b, False)]
         for m in token_buckets:
             task = _linear_task_id(layer, method, m)
             if owned_tasks is not None and task not in owned_tasks:
@@ -641,10 +665,17 @@ def _warmup_cubic_linear_families(
             phase_index = 0
             phase_total = (2 if calibrate else 1) * len(modes)
             if calibrate:
-                for dynamic_a8, _, coefficient_a, coefficient_b in modes:
+                for (
+                    dynamic_a8,
+                    _,
+                    weight,
+                    coefficient_a,
+                    coefficient_b,
+                    precomputed_carrier,
+                ) in modes:
                     calibrate_cubic_linear_execution(
                         x,
-                        layer.weight_packed,
+                        weight,
                         layer.weight_scale,
                         coefficient_a,
                         coefficient_b,
@@ -653,6 +684,7 @@ def _warmup_cubic_linear_families(
                         group_out=group_out,
                         input_size=k,
                         dynamic_a8=dynamic_a8,
+                        precomputed_carrier=precomputed_carrier,
                     )
                     phase_index += 1
                     if progress is not None:
@@ -662,7 +694,14 @@ def _warmup_cubic_linear_families(
                             phase_total,
                             f"{'A8' if dynamic_a8 else 'A16'} execution tactics",
                         )
-            for dynamic_a8, func, coefficient_a, coefficient_b in modes:
+            for (
+                dynamic_a8,
+                func,
+                weight,
+                coefficient_a,
+                coefficient_b,
+                _,
+            ) in modes:
                 kwargs = dict(
                     num_bits=bits,
                     group_size=group_size,
@@ -672,7 +711,7 @@ def _warmup_cubic_linear_families(
                     kwargs["group_out"] = group_out
                 output = func(
                     x,
-                    layer.weight_packed,
+                    weight,
                     layer.weight_scale,
                     coefficient_a,
                     coefficient_b,

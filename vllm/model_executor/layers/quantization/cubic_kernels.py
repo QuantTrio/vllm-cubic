@@ -1798,6 +1798,258 @@ def cubic_linear_dynamic_a8(
     return output.reshape(*x.shape[:-1], packed.shape[0])
 
 
+@triton.autotune(
+    configs=_CUBIC_LINEAR_DENSE_CONFIGS,
+    key=["M", "N", "K", "GROUP_SIZE", "BLOCK_K"],
+    cache_results=True,
+)
+@triton.jit
+def _cubic_linear_precomputed_a8_kernel(
+    activation_ptr,
+    activation_scale_ptr,
+    carrier_ptr,
+    weight_scale_ptr,
+    output_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_wn,
+    stride_wk,
+    stride_sn,
+    stride_sg,
+    stride_om,
+    stride_on,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    activation_scale = tl.load(
+        activation_scale_ptr + offs_m,
+        mask=offs_m < M,
+        other=0.0,
+    ).to(tl.float32)[:, None]
+
+    for k_block in range(0, tl.cdiv(K, BLOCK_K)):
+        global_k = k_block * BLOCK_K + offs_k
+        activation = tl.load(
+            activation_ptr
+            + offs_m[:, None] * stride_am
+            + global_k[None, :] * stride_ak,
+            mask=(offs_m[:, None] < M) & (global_k[None, :] < K),
+            other=0,
+        )
+        weight = tl.load(
+            carrier_ptr + offs_n[None, :] * stride_wn + global_k[:, None] * stride_wk,
+            mask=(offs_n[None, :] < N) & (global_k[:, None] < K),
+            other=0,
+        )
+        partial = tl.dot(activation, weight, out_dtype=tl.int32)
+        group = (k_block * BLOCK_K) // GROUP_SIZE
+        weight_scale = tl.load(
+            weight_scale_ptr + offs_n * stride_sn + group * stride_sg,
+            mask=(offs_n < N) & (group < NUM_GROUPS),
+            other=0.0,
+        ).to(tl.float32)[None, :]
+        accumulator += (
+            partial.to(tl.float32) * activation_scale * weight_scale * (1.0 / 127.0)
+        )
+
+    tl.store(
+        output_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+        accumulator,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+@triton.autotune(
+    configs=_CUBIC_LINEAR_GEMV_CONFIGS,
+    key=["M", "N", "K", "GROUP_SIZE", "BLOCK_K"],
+    cache_results=True,
+)
+@triton.jit
+def _cubic_linear_precomputed_a8_gemv_kernel(
+    activation_ptr,
+    activation_scale_ptr,
+    carrier_ptr,
+    weight_scale_ptr,
+    output_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_wn,
+    stride_wk,
+    stride_sn,
+    stride_sg,
+    stride_om,
+    stride_on,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(1)
+    offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    activation_scale = tl.load(
+        activation_scale_ptr + row,
+        mask=row < M,
+        other=0.0,
+    ).to(tl.float32)
+
+    for k_block in range(0, tl.cdiv(K, BLOCK_K)):
+        global_k = k_block * BLOCK_K + offs_k
+        activation = tl.load(
+            activation_ptr + row * stride_am + global_k * stride_ak,
+            mask=(row < M) & (global_k < K),
+            other=0,
+        ).to(tl.int32)
+        weight = tl.load(
+            carrier_ptr + offs_n[:, None] * stride_wn + global_k[None, :] * stride_wk,
+            mask=(offs_n[:, None] < N) & (global_k[None, :] < K),
+            other=0,
+        ).to(tl.int32)
+        partial = tl.sum(weight * activation[None, :], axis=1)
+        group = (k_block * BLOCK_K) // GROUP_SIZE
+        weight_scale = tl.load(
+            weight_scale_ptr + offs_n * stride_sn + group * stride_sg,
+            mask=(offs_n < N) & (group < NUM_GROUPS),
+            other=0.0,
+        ).to(tl.float32)
+        accumulator += (
+            partial.to(tl.float32) * activation_scale * weight_scale * (1.0 / 127.0)
+        )
+
+    tl.store(
+        output_ptr + row * stride_om + offs_n * stride_on,
+        accumulator,
+        mask=(row < M) & (offs_n < N),
+    )
+
+
+def cubic_w8_precompute_carrier(
+    packed: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    group_size: int,
+    input_size: int,
+) -> torch.Tensor:
+    """Materialize the deterministic W8 INT8 carrier once during loading."""
+    if packed.shape[1] != input_size or packed.dtype != torch.uint8:
+        raise ValueError("Cubic W8 carrier requires one packed byte per weight.")
+    codes = packed.view(torch.int8).to(torch.float32)
+    codes = torch.where(codes == -128, 0.0, codes)
+    groups = torch.arange(input_size, device=packed.device) // group_size
+    coefficient_a = a[:, groups].to(torch.float32)
+    coefficient_b = b[:, groups].to(torch.float32)
+    t = codes.abs() * (1.0 / 127.0)
+    normalized = t * (
+        coefficient_a + t * (coefficient_b + t * (1.0 - coefficient_a - coefficient_b))
+    )
+    return torch.clamp(torch.round(codes.sign() * normalized * 127.0), -127, 127).to(
+        torch.int8
+    )
+
+
+def cubic_linear_dynamic_a8_precomputed(
+    x: torch.Tensor,
+    carrier: torch.Tensor,
+    scale: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    num_bits: int,
+    group_size: int,
+    input_size: int,
+) -> torch.Tensor:
+    """Apply Dynamic-A8 using a load-time W8 carrier."""
+    del a, b
+    if num_bits != 8 or carrier.dtype != torch.int8:
+        raise ValueError("Precomputed Cubic Linear requires an INT8 W8 carrier.")
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    x_q, x_scale = per_token_quant_int8(x_2d)
+    output = torch.empty(
+        x_2d.shape[0], carrier.shape[0], device=x.device, dtype=x.dtype
+    )
+    use_gemv = _cubic_linear_use_gemv(
+        dynamic_a8=True,
+        num_bits=num_bits,
+        n=carrier.shape[0],
+        k=input_size,
+        group_size=group_size,
+        group_out=1,
+        m=x_2d.shape[0],
+        fallback=x_2d.shape[0] <= 8,
+    )
+    block_k = min(group_size, 128)
+    if use_gemv:
+        grid = lambda meta: (
+            triton.cdiv(carrier.shape[0], meta["BLOCK_N"]),
+            x_2d.shape[0],
+        )
+        _cubic_linear_precomputed_a8_gemv_kernel[grid](
+            x_q,
+            x_scale,
+            carrier,
+            scale,
+            output,
+            x_2d.shape[0],
+            carrier.shape[0],
+            input_size,
+            scale.shape[1],
+            x_q.stride(0),
+            x_q.stride(1),
+            carrier.stride(0),
+            carrier.stride(1),
+            scale.stride(0),
+            scale.stride(1),
+            output.stride(0),
+            output.stride(1),
+            GROUP_SIZE=group_size,
+            BLOCK_K=block_k,
+        )
+    else:
+        grid = lambda meta: (
+            triton.cdiv(x_2d.shape[0], meta["BLOCK_M"]),
+            triton.cdiv(carrier.shape[0], meta["BLOCK_N"]),
+        )
+        _cubic_linear_precomputed_a8_kernel[grid](
+            x_q,
+            x_scale,
+            carrier,
+            scale,
+            output,
+            x_2d.shape[0],
+            carrier.shape[0],
+            input_size,
+            scale.shape[1],
+            x_q.stride(0),
+            x_q.stride(1),
+            carrier.stride(0),
+            carrier.stride(1),
+            scale.stride(0),
+            scale.stride(1),
+            output.stride(0),
+            output.stride(1),
+            GROUP_SIZE=group_size,
+            BLOCK_K=block_k,
+        )
+    return output.reshape(*x.shape[:-1], carrier.shape[0])
+
+
 @torch.inference_mode()
 def calibrate_cubic_linear_execution(
     x: torch.Tensor,
@@ -1811,7 +2063,8 @@ def calibrate_cubic_linear_execution(
     group_out: int = 1,
     input_size: int,
     dynamic_a8: bool,
-) -> None:
+    precomputed_carrier: bool = False,
+) -> float | None:
     """Measure Cubic Linear GEMV versus dense execution at one real shape."""
     key = (
         torch.accelerator.current_device_index(),
@@ -1823,7 +2076,12 @@ def calibrate_cubic_linear_execution(
         group_out,
         x.reshape(-1, x.shape[-1]).shape[0],
     )
-    func = cubic_linear_dynamic_a8 if dynamic_a8 else cubic_linear
+    if precomputed_carrier:
+        if not dynamic_a8:
+            raise ValueError("A precomputed carrier is only valid for Dynamic-A8.")
+        func = cubic_linear_dynamic_a8_precomputed
+    else:
+        func = cubic_linear_dynamic_a8 if dynamic_a8 else cubic_linear
     candidates = (
         (True, False) if dynamic_a8 or input_size % group_size == 0 else (False,)
     )
@@ -1871,7 +2129,7 @@ def calibrate_cubic_linear_execution(
             )
     if not scores:
         _CUBIC_LINEAR_EXECUTION_TACTICS.pop(key, None)
-        return
+        return None
     measured_best = min(score for score, _ in scores)
     near_best = [item for item in scores if item[0] <= measured_best * 1.01]
     best_score, best_use_gemv = min(near_best, key=lambda item: not item[1])
@@ -1880,7 +2138,7 @@ def calibrate_cubic_linear_execution(
 
     init_logger(__name__).info(
         "Cubic Linear %s: W%d N=%d K=%d G=%d M=%d %s (%.4f ms)",
-        "A8" if dynamic_a8 else "A16",
+        "A8-carrier" if precomputed_carrier else ("A8" if dynamic_a8 else "A16"),
         num_bits,
         packed.shape[0],
         input_size,
@@ -1889,6 +2147,7 @@ def calibrate_cubic_linear_execution(
         "GEMV" if best_use_gemv else "dense",
         best_score,
     )
+    return best_score
 
 
 def _cubic_linear_custom_op(
@@ -1977,6 +2236,50 @@ direct_register_custom_op(
     op_func=_cubic_linear_dynamic_a8_custom_op,
     mutates_args=[],
     fake_impl=_cubic_linear_dynamic_a8_custom_op_fake,
+)
+
+
+def _cubic_linear_dynamic_a8_precomputed_custom_op(
+    x: torch.Tensor,
+    carrier: torch.Tensor,
+    scale: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    num_bits: int,
+    group_size: int,
+    input_size: int,
+) -> torch.Tensor:
+    return cubic_linear_dynamic_a8_precomputed(
+        x,
+        carrier,
+        scale,
+        a,
+        b,
+        num_bits=num_bits,
+        group_size=group_size,
+        input_size=input_size,
+    )
+
+
+def _cubic_linear_dynamic_a8_precomputed_custom_op_fake(
+    x: torch.Tensor,
+    carrier: torch.Tensor,
+    scale: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    num_bits: int,
+    group_size: int,
+    input_size: int,
+) -> torch.Tensor:
+    del scale, a, b, num_bits, group_size, input_size
+    return x.new_empty((*x.shape[:-1], carrier.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="cubic_linear_dynamic_a8_precomputed",
+    op_func=_cubic_linear_dynamic_a8_precomputed_custom_op,
+    mutates_args=[],
+    fake_impl=_cubic_linear_dynamic_a8_precomputed_custom_op_fake,
 )
 
 

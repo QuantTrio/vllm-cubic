@@ -211,6 +211,49 @@ def test_cubic_dynamic_a8_is_runtime_only(
     assert method.dynamic_a8 is enabled
 
 
+@pytest.mark.parametrize("tokens", (1, 8, 16, 64, 256, 2048))
+@pytest.mark.parametrize("dynamic_a8", (False, True))
+def test_cubic_linear_activation_mode_is_strict(
+    monkeypatch: pytest.MonkeyPatch,
+    tokens: int,
+    dynamic_a8: bool,
+) -> None:
+    from vllm.model_executor.layers.quantization import cubic_kernels
+    from vllm.model_executor.layers.quantization.cubic import (
+        CubicLinearMethod,
+        CubicScheme,
+    )
+
+    calls = {"a16": 0, "a8": 0}
+
+    def a16(x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        calls["a16"] += 1
+        return x.new_zeros((*x.shape[:-1], 7))
+
+    def a8(x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        calls["a8"] += 1
+        return x.new_zeros((*x.shape[:-1], 7))
+
+    monkeypatch.setattr(cubic_kernels, "cubic_linear", a16)
+    monkeypatch.setattr(cubic_kernels, "cubic_linear_dynamic_a8", a8)
+    monkeypatch.setattr(cubic_kernels, "cubic_linear_dynamic_a8_precomputed", a8)
+
+    layer = SimpleNamespace(
+        weight_packed=torch.empty(7, 64, dtype=torch.uint8),
+        weight_carrier=torch.empty(7, 64, dtype=torch.int8),
+        weight_scale=torch.empty(7, 2, dtype=torch.float32),
+        weight_a=torch.empty(7, 2, dtype=torch.float16),
+        weight_b=torch.empty(7, 2, dtype=torch.float16),
+        input_size_per_partition=64,
+    )
+    method = CubicLinearMethod(CubicScheme(8, 32), dynamic_a8=dynamic_a8)
+
+    output = method.apply(layer, torch.empty(tokens, 64, dtype=torch.bfloat16))
+
+    assert output.shape == (tokens, 7)
+    assert calls == ({"a16": 0, "a8": 1} if dynamic_a8 else {"a16": 1, "a8": 0})
+
+
 @ONLINE_MLP_REMOVED
 def test_cubic_dynamic_a8_online_is_a_single_opt_in(
     monkeypatch: pytest.MonkeyPatch,
@@ -909,6 +952,42 @@ def test_cubic_dynamic_a8_linear_matches_pytorch_reference(bits: int, group_size
     assert torch.count_nonzero(actual[0, 0]).item() == 0
     assert torch.isfinite(actual).all()
     assert actual.dtype == x.dtype
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("tokens", (1, 16, 256))
+def test_cubic_w8_precomputed_carrier_matches_dynamic_a8(tokens: int) -> None:
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    bits, group_size, outputs, input_size = 8, 128, 64, 256
+    device = torch.device("cuda")
+    codes = _make_codes((outputs, input_size), bits).to(device)
+    packed = pack_cubic_codes(codes, bits)
+    groups = input_size // group_size
+    scale = torch.rand(outputs, groups, device=device, dtype=torch.float32) * 0.1
+    a = torch.full((outputs, groups), 0.5, device=device, dtype=torch.float16)
+    b = torch.full((outputs, groups), 0.25, device=device, dtype=torch.float16)
+    x = torch.randn(tokens, input_size, device=device, dtype=torch.bfloat16)
+    carrier = cubic_kernels.cubic_w8_precompute_carrier(
+        packed,
+        a,
+        b,
+        group_size=group_size,
+        input_size=input_size,
+    )
+    expected_carrier = _reference_carriers(codes, a, b, bits, group_size)
+    torch.testing.assert_close(carrier, expected_carrier, rtol=0, atol=0)
+
+    kwargs = {
+        "num_bits": bits,
+        "group_size": group_size,
+        "input_size": input_size,
+    }
+    expected = cubic_kernels.cubic_linear_dynamic_a8(x, packed, scale, a, b, **kwargs)
+    actual = cubic_kernels.cubic_linear_dynamic_a8_precomputed(
+        x, carrier, scale, a, b, **kwargs
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

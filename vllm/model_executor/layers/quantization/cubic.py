@@ -716,6 +716,18 @@ class CubicLinearMethod(LinearMethodBase):
             or layer.weight_b.dtype != torch.float16
         ):
             raise ValueError("Cubic linear a/b must remain FP16 at runtime.")
+        if self.dynamic_a8 and self.scheme.num_bits == 8 and self.scheme.group_out == 1:
+            from vllm.model_executor.layers.quantization.cubic_kernels import (
+                cubic_w8_precompute_carrier,
+            )
+
+            layer.weight_carrier = cubic_w8_precompute_carrier(
+                layer.weight_packed,
+                layer.weight_a,
+                layer.weight_b,
+                group_size=self.scheme.group_size,
+                input_size=layer.input_size_per_partition,
+            )
 
     def dequantize(self, layer: torch.nn.Module) -> torch.Tensor:
         """Materialize the Linear weight for an operator requiring a vector."""
@@ -745,9 +757,35 @@ class CubicLinearMethod(LinearMethodBase):
         from vllm.model_executor.layers.quantization.cubic_kernels import (
             cubic_linear,
             cubic_linear_dynamic_a8,
+            cubic_linear_dynamic_a8_precomputed,
         )
 
         if self.dynamic_a8:
+            carrier = getattr(layer, "weight_carrier", None)
+            if carrier is not None:
+                if torch.compiler.is_compiling():
+                    output = torch.ops.vllm.cubic_linear_dynamic_a8_precomputed(
+                        x,
+                        carrier,
+                        layer.weight_scale,
+                        layer.weight_a,
+                        layer.weight_b,
+                        self.scheme.num_bits,
+                        self.scheme.group_size,
+                        layer.input_size_per_partition,
+                    )
+                else:
+                    output = cubic_linear_dynamic_a8_precomputed(
+                        x,
+                        carrier,
+                        layer.weight_scale,
+                        layer.weight_a,
+                        layer.weight_b,
+                        num_bits=self.scheme.num_bits,
+                        group_size=self.scheme.group_size,
+                        input_size=layer.input_size_per_partition,
+                    )
+                return output if bias is None else output + bias
             if torch.compiler.is_compiling():
                 output = torch.ops.vllm.cubic_linear_dynamic_a8(
                     x,
