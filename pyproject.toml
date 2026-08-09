@@ -15,11 +15,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm"
-authors = [{name = "vLLM Team"}]
+authors = [
+    {name = "QuantTrio contributors"},
+    {name = "vLLM Team"},
+]
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "A high-throughput and memory-efficient inference and serving engine for LLMs"
+description = "vLLM with native 1-8-bit Cubic quantization"
 classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -36,7 +39,9 @@ requires-python = ">=3.10,<3.15"
 dynamic = [ "version", "dependencies", "optional-dependencies"]
 
 [project.urls]
-Homepage="https://github.com/vllm-project/vllm"
+Homepage="https://github.com/QuantTrio/vllm-cubic"
+Repository="https://github.com/QuantTrio/vllm-cubic"
+Issues="https://github.com/QuantTrio/vllm-cubic/issues"
 Documentation="https://docs.vllm.ai/en/latest/"
 Slack="https://slack.vllm.ai/"
 
