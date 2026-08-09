@@ -910,9 +910,11 @@ class RoutedExperts(PluggableLayer):
                     # w1 and w3 share one fused tensor; use a local copy so the
                     # transpose below doesn't mutate loaded_weight across
                     # iterations (else w3 is transposed twice and wrongly chunked)
-                    fused_weight = self._orient_fused_weight(
-                        loaded_weight, shard_id, unpadded_hidden
-                    )
+                    fused_weight = loaded_weight
+                    if not getattr(self, "cubic_fused_checkpoint_layout", False):
+                        fused_weight = self._orient_fused_weight(
+                            fused_weight, shard_id, unpadded_hidden
+                        )
                     if shard_id in {"w1", "w3"}:
                         # Repurpose expert_id for deconcatenating w1 and w3
                         experts_shard = fused_weight.chunk(2, dim=1)[expert_id]

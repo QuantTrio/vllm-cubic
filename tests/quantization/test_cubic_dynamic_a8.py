@@ -1,0 +1,1176 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import math
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from vllm.model_executor.layers.quantization.cubic import (
+    cubic_carrier_levels,
+    dequantize_cubic_carrier,
+    pack_cubic_codes,
+    unpack_cubic_codes,
+)
+
+GROUP_SIZES = (32, 64, 128, 256, 512)
+ONLINE_MLP_REMOVED = pytest.mark.skip(
+    reason="Online MLP A8 was rolled back after failing performance gates"
+)
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [(None, False), ("0", False), ("1", True)],
+)
+@ONLINE_MLP_REMOVED
+def test_cubic_dynamic_a8_online_environment_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_value: str | None,
+    expected: bool,
+) -> None:
+    from vllm import envs
+
+    name = "VLLM_CUBIC_DYNAMIC_A8_ONLINE"
+    if raw_value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, raw_value)
+
+    assert envs.environment_variables[name]() is expected
+
+
+def _make_codes(shape: tuple[int, ...], bits: int) -> torch.Tensor:
+    generator = torch.Generator(device="cpu").manual_seed(1000 + bits)
+    if bits == 1:
+        codes = torch.randint(0, 2, shape, generator=generator, dtype=torch.int16)
+        return codes * 2 - 1
+    magnitude_max = (1 << (bits - 1)) - 1
+    return torch.randint(
+        -magnitude_max,
+        magnitude_max + 1,
+        shape,
+        generator=generator,
+        dtype=torch.int16,
+    )
+
+
+def _reference_carriers(
+    codes: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bits: int,
+    group_size: int,
+) -> torch.Tensor:
+    if bits == 1:
+        return codes.to(torch.int8) * 127
+    group_indices = torch.arange(codes.shape[-1], device=codes.device) // group_size
+    a_values = a[..., group_indices].to(torch.float32)
+    b_values = b[..., group_indices].to(torch.float32)
+    magnitude_max = (1 << (bits - 1)) - 1
+    code_f32 = codes.to(torch.float32)
+    t = code_f32.abs() / magnitude_max
+    q = t * (a_values + t * (b_values + t * (1 - a_values - b_values)))
+    return (code_f32.sign() * torch.round(127 * q)).to(torch.int8)
+
+
+def _reference_dynamic_a8_linear(
+    x: torch.Tensor,
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bits: int,
+    group_size: int,
+) -> torch.Tensor:
+    input_size = x.shape[-1]
+    x_f32 = x.reshape(-1, input_size).to(torch.float32)
+    amax = x_f32.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+    activation_scale = amax / 127
+    x_int8 = torch.round(x_f32 * (127 / amax)).clamp(-127, 127).to(torch.int8)
+
+    codes = unpack_cubic_codes(packed, bits, input_size)
+    carriers = _reference_carriers(codes, a, b, bits, group_size)
+    output = torch.zeros(
+        x_int8.shape[0], packed.shape[0], device=x.device, dtype=torch.float32
+    )
+    for group in range(math.ceil(input_size / group_size)):
+        start = group * group_size
+        end = min(start + group_size, input_size)
+        partial = (
+            x_int8[:, start:end].to(torch.float32)
+            @ carriers[:, start:end].to(torch.float32).T
+        )
+        output += partial * (activation_scale * scale[:, group][None, :] / 127)
+    return output.reshape(*x.shape[:-1], packed.shape[0]).to(x.dtype)
+
+
+@pytest.mark.parametrize("bits", range(1, 9))
+def test_cubic_carrier_levels_use_round_to_even(bits: int):
+    a = torch.tensor([0.5, 1.0], dtype=torch.float16)
+    b = torch.tensor([0.25, 0.0], dtype=torch.float16)
+
+    actual = cubic_carrier_levels(bits, a, b)
+    if bits == 1:
+        expected = torch.full((2, 1), 127, dtype=torch.int8)
+    else:
+        magnitude_max = (1 << (bits - 1)) - 1
+        t = torch.arange(magnitude_max + 1, dtype=torch.float32) / magnitude_max
+        a_f32 = a.float()[:, None]
+        b_f32 = b.float()[:, None]
+        q = t * (a_f32 + t * (b_f32 + t * (1 - a_f32 - b_f32)))
+        expected = torch.round(127 * q).to(torch.int8)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.dtype == torch.int8
+    assert torch.all(actual[..., 1:] >= actual[..., :-1])
+    assert torch.all(actual[..., -1] == 127)
+    if bits > 1:
+        assert torch.all(actual[..., 0] == 0)
+
+
+@pytest.mark.parametrize("group_size", GROUP_SIZES)
+@pytest.mark.parametrize("bits", range(1, 9))
+def test_cubic_carrier_dequant_preserves_checkpoint_packing(bits: int, group_size: int):
+    outputs, input_size = 3, group_size + 13
+    codes = _make_codes((outputs, input_size), bits)
+    packed = pack_cubic_codes(codes, bits)
+    packed_before = packed.clone()
+    groups = math.ceil(input_size / group_size)
+    scale = torch.linspace(0.2, 1.1, outputs * groups, dtype=torch.float32).reshape(
+        outputs, groups
+    )
+    a = torch.full((outputs, groups), 0.5, dtype=torch.float16)
+    b = torch.full((outputs, groups), 0.25, dtype=torch.float16)
+
+    actual = dequantize_cubic_carrier(
+        packed,
+        scale,
+        a,
+        b,
+        total_bits=bits,
+        group_size=group_size,
+        num_values=input_size,
+    )
+    carriers = _reference_carriers(codes, a, b, bits, group_size).float()
+    group_indices = torch.arange(input_size) // group_size
+    expected = carriers * scale[:, group_indices] / 127
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(packed, packed_before, rtol=0, atol=0)
+    assert packed.dtype == torch.uint8
+    assert packed.shape == (outputs, math.ceil(input_size * bits / 8))
+
+
+def test_cubic_carrier_dequant_requires_fp32_weight_scale():
+    packed = pack_cubic_codes(torch.tensor([[0, 1]], dtype=torch.int8), 2)
+    metadata = torch.ones((1, 1), dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="scale must be FP32"):
+        dequantize_cubic_carrier(
+            packed,
+            metadata,
+            metadata,
+            torch.zeros_like(metadata),
+            total_bits=2,
+            group_size=32,
+            num_values=2,
+        )
+
+
+@pytest.mark.parametrize("enabled", (False, True))
+def test_cubic_dynamic_a8_is_runtime_only(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+):
+    from vllm import envs
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.cubic import (
+        CUBIC_FORMAT,
+        CubicConfig,
+        CubicLinearMethod,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_CUBIC_DYNAMIC_A8", enabled)
+    config = CubicConfig.from_config(
+        {
+            "quant_method": "cubic",
+            "format": CUBIC_FORMAT,
+            "config_groups": {
+                "linear": {
+                    "targets": ["Linear"],
+                    "weights": {"num_bits": 4, "group_size": 128},
+                }
+            },
+        }
+    )
+
+    method = config.get_quant_method(object.__new__(LinearBase), "model.proj")
+
+    assert isinstance(method, CubicLinearMethod)
+    assert method.dynamic_a8 is enabled
+
+
+@ONLINE_MLP_REMOVED
+def test_cubic_dynamic_a8_online_is_a_single_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm import envs
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.cubic import (
+        CUBIC_FORMAT,
+        CubicConfig,
+        CubicLinearMethod,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_CUBIC_DYNAMIC_A8", False)
+    monkeypatch.setattr(envs, "VLLM_CUBIC_DYNAMIC_A8_ONLINE", True)
+    config = CubicConfig.from_config(
+        {
+            "quant_method": "cubic",
+            "format": CUBIC_FORMAT,
+            "config_groups": {
+                "linear": {
+                    "targets": ["Linear"],
+                    "weights": {"num_bits": 2, "group_size": 512},
+                }
+            },
+        }
+    )
+
+    method = config.get_quant_method(object.__new__(LinearBase), "model.proj")
+
+    assert isinstance(method, CubicLinearMethod)
+    assert method.dynamic_a8 is True
+
+
+@ONLINE_MLP_REMOVED
+def test_cubic_online_a8_and_query_protected_cubic_kv_are_orthogonal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Online W/A carrier selection must not quantize MLA queries."""
+    from vllm import envs
+    from vllm.model_executor.layers.attention.mla_attention import (
+        MLACommonMetadataBuilder,
+    )
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.cubic import (
+        CUBIC_FORMAT,
+        CubicConfig,
+        CubicLinearMethod,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_CUBIC_DYNAMIC_A8", False)
+    monkeypatch.setattr(envs, "VLLM_CUBIC_DYNAMIC_A8_ONLINE", True)
+    config = CubicConfig.from_config(
+        {
+            "quant_method": "cubic",
+            "format": CUBIC_FORMAT,
+            "config_groups": {
+                "linear": {
+                    "targets": ["Linear"],
+                    "weights": {"num_bits": 3, "group_size": 256},
+                }
+            },
+        }
+    )
+    method = config.get_quant_method(object.__new__(LinearBase), "model.proj")
+    cache_config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype="cubic8"),
+        attention_config=SimpleNamespace(use_prefill_query_quantization=True),
+    )
+
+    assert isinstance(method, CubicLinearMethod)
+    assert method.dynamic_a8 is True
+    assert (
+        MLACommonMetadataBuilder.determine_prefill_query_data_type(
+            cache_config, torch.bfloat16, "cubic8"
+        )
+        == torch.bfloat16
+    )
+
+
+@pytest.mark.parametrize(
+    ("bits", "group_size"),
+    tuple((bits, group) for bits in range(1, 9) for group in GROUP_SIZES),
+)
+@ONLINE_MLP_REMOVED
+def test_cubic_online_groupwise_a8_is_not_decode_batch_limited(
+    monkeypatch: pytest.MonkeyPatch,
+    bits: int,
+    group_size: int,
+):
+    from vllm import envs
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        _cubic_online_groupwise_a8_eligible,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_CUBIC_DYNAMIC_A8_ONLINE", True)
+    metadata_dtype = torch.int8 if bits == 3 else torch.float16
+    metadata = torch.empty(1, dtype=metadata_dtype)
+
+    assert _cubic_online_groupwise_a8_eligible(
+        num_bits=bits,
+        group_size=group_size,
+        intermediate_size=2 * group_size,
+        num_tokens=64,
+        use_gemv=True,
+        grouped_routes=2,
+        activation=MoEActivation.SITU,
+        w2_a=metadata,
+        w2_b=metadata,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cubic_dynamic_a8_quantization_handles_zero_activation_row():
+    from vllm.model_executor.layers.quantization.utils.int8_utils import (
+        per_token_quant_int8,
+    )
+
+    x = torch.zeros((2, 129), device="cuda", dtype=torch.bfloat16)
+    quantized, scale = per_token_quant_int8(x)
+
+    assert torch.count_nonzero(quantized).item() == 0
+    assert torch.isfinite(scale).all()
+    assert torch.all(scale > 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("group_size", (256, 512))
+@ONLINE_MLP_REMOVED
+def test_cubic_online_groupwise_a8_producer_is_per_sample_per_group(
+    group_size: int,
+):
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        _quantize_cubic_groupwise_a8,
+    )
+
+    x = torch.randn(3, 2 * group_size, device="cuda", dtype=torch.bfloat16)
+    x[0, :group_size] *= 0.01
+    x[0, group_size:] *= 10
+    carrier = _quantize_cubic_groupwise_a8(x, group_size)
+    expected_scales = (
+        x.float().reshape(3, 2, group_size).abs().amax(dim=-1).clamp_min(1e-10) / 127
+    )
+
+    torch.testing.assert_close(carrier.scales, expected_scales)
+    assert carrier.values.shape == x.shape
+    assert carrier.scales.shape == (3, 2)
+    assert carrier.scales.dtype == torch.float32
+    assert carrier.values.dtype == torch.int8
+    assert not torch.equal(carrier.scales[0, 0], carrier.scales[0, 1])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("group_size", (256, 512))
+@ONLINE_MLP_REMOVED
+def test_cubic_online_cubic8_producer_persists_true_curve_metadata(
+    group_size: int,
+):
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        _quantize_cubic_groupwise_cubic8,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(20260804)
+    x = torch.randn(
+        4,
+        2 * group_size,
+        generator=generator,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    encoded = _quantize_cubic_groupwise_cubic8(x, group_size)
+    codes = encoded.codes.reshape(4, 2, group_size)
+    t = codes.float().abs() / 127.0
+    a = encoded.a.float()[..., None]
+    b = encoded.b.float()[..., None]
+    decoded = (
+        codes.sign().float()
+        * encoded.scales[..., None]
+        * t
+        * (a + t * (b + t * (1.0 - a - b)))
+    ).reshape_as(x)
+
+    assert encoded.codes.dtype == torch.int8
+    assert encoded.scales.dtype == torch.float32
+    assert encoded.a.dtype == torch.float16
+    assert encoded.b.dtype == torch.float16
+    assert encoded.scales.shape == encoded.a.shape == encoded.b.shape == (4, 2)
+    assert torch.any((encoded.a != 1) | (encoded.b != 0))
+    nrmse = (
+        decoded - x.float()
+    ).square().mean().sqrt() / x.float().square().mean().sqrt()
+    assert nrmse < 0.01
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("group_size", (256, 512))
+@ONLINE_MLP_REMOVED
+def test_cubic_online_cubic8_w2_consumer_matches_exact_curve(
+    group_size: int,
+):
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        CubicA8Code,
+        _launch_cubic_moe_cubic8_w2,
+        _launch_cubic_moe_cubic8_w2_moment,
+    )
+
+    device = torch.device("cuda")
+    rows, outputs, groups = 3, 37, 2
+    input_size = groups * group_size
+    activation_codes = torch.randint(
+        -127, 128, (rows, input_size), device=device, dtype=torch.int8
+    )
+    activation_scale = torch.tensor(
+        [[0.01, 0.03], [0.07, 0.02], [0.04, 0.09]],
+        device=device,
+        dtype=torch.float32,
+    )
+    activation_a = torch.tensor(
+        [[0.5, 0.75], [1.0, 0.5], [0.5, 1.0]],
+        device=device,
+        dtype=torch.float16,
+    )
+    activation_b = torch.tensor(
+        [[0.25, -0.25], [0.0, 0.0], [0.25, 0.0]],
+        device=device,
+        dtype=torch.float16,
+    )
+    carrier = CubicA8Code(
+        activation_codes,
+        activation_scale,
+        activation_a,
+        activation_b,
+        group_size,
+    )
+    weight_codes = _make_codes((1, outputs, input_size), 2).to(device)
+    packed = pack_cubic_codes(weight_codes, 2)
+    weight_scale = torch.linspace(
+        0.003,
+        0.031,
+        outputs * groups,
+        device=device,
+        dtype=torch.float32,
+    ).reshape(1, outputs, groups)
+    actual = torch.empty(rows, outputs, device=device, dtype=torch.bfloat16)
+    topk_weights = torch.ones(rows, device=device)
+    sorted_ids = torch.arange(rows, device=device, dtype=torch.int32)
+    expert_ids = torch.zeros(rows, device=device, dtype=torch.int32)
+    count = torch.tensor(rows, device=device, dtype=torch.int32)
+    _launch_cubic_moe_cubic8_w2(
+        carrier,
+        packed,
+        weight_scale,
+        actual,
+        topk_weights,
+        sorted_ids,
+        expert_ids,
+        count,
+        logical_k=input_size,
+        top_k=1,
+        multiply_routed_weight=False,
+        route_ctas=rows,
+    )
+    moment = torch.empty_like(actual)
+    _launch_cubic_moe_cubic8_w2_moment(
+        carrier,
+        packed,
+        weight_scale,
+        moment,
+        topk_weights,
+        sorted_ids,
+        expert_ids,
+        count,
+        logical_k=input_size,
+        weight_group_size=group_size,
+        top_k=1,
+        multiply_routed_weight=False,
+        route_ctas=rows,
+    )
+    lut = torch.empty_like(actual)
+    torch.ops._C.cubic_w2_cubic8_lut_gemv(
+        carrier.codes,
+        carrier.scales,
+        carrier.a,
+        carrier.b,
+        packed,
+        weight_scale,
+        lut,
+        topk_weights,
+        sorted_ids,
+        expert_ids,
+        count,
+        group_size,
+        group_size,
+        1,
+        False,
+        rows,
+        8,
+    )
+
+    code_groups = activation_codes.reshape(rows, groups, group_size)
+    t = code_groups.float().abs() / 127.0
+    aa = activation_a.float()[..., None]
+    bb = activation_b.float()[..., None]
+    activation = (
+        code_groups.sign().float()
+        * activation_scale[..., None]
+        * t
+        * (aa + t * (bb + t * (1.0 - aa - bb)))
+    )
+    expected = torch.zeros(rows, outputs, device=device, dtype=torch.float32)
+    for group in range(groups):
+        expected += (
+            activation[:, group]
+            @ weight_codes[0, :, group * group_size : (group + 1) * group_size]
+            .float()
+            .T
+        ) * weight_scale[0, :, group]
+    error_nrmse = (
+        actual.float() - expected
+    ).square().mean().sqrt() / expected.square().mean().sqrt()
+    assert error_nrmse < 0.005
+    moment_error_nrmse = (
+        moment.float() - expected
+    ).square().mean().sqrt() / expected.square().mean().sqrt()
+    assert moment_error_nrmse < 0.01
+    lut_error_nrmse = (
+        lut.float() - expected
+    ).square().mean().sqrt() / expected.square().mean().sqrt()
+    assert lut_error_nrmse < 0.005
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(moment).all()
+    assert torch.isfinite(lut).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("group_size", (256, 512))
+@ONLINE_MLP_REMOVED
+def test_cubic_online_cubic8_fused_w2_producer_matches_staged_reference(
+    group_size: int,
+):
+    """W2+SITU producer avoids BF16 storage without changing its contract."""
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        _launch_cubic_moe_situ_cubic8_2bit,
+        _launch_cubic_moe_situ_gemv_2bit,
+        _quantize_cubic_groupwise_a8,
+    )
+
+    device = torch.device("cuda")
+    experts, rows = 2, 2
+    hidden = output_n = group_size
+    generator = torch.Generator(device=device).manual_seed(91000 + group_size)
+    x = torch.randn(
+        rows, hidden, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    codes = _make_codes((experts, 2 * output_n, hidden), 2).to(device)
+    packed = pack_cubic_codes(codes, 2)
+    weight_scale = (
+        torch.rand(
+            experts,
+            2 * output_n,
+            hidden // group_size,
+            generator=generator,
+            device=device,
+            dtype=torch.float32,
+        )
+        * 0.02
+    )
+    topk_ids = torch.tensor([[0], [1]], device=device, dtype=torch.int32)
+    topk_weights = torch.ones(rows, 1, device=device, dtype=torch.float32)
+    expert_map = torch.arange(experts, device=device, dtype=torch.int32)
+    sorted_ids, expert_ids, padded_count = moe_align_block_size(
+        topk_ids,
+        1,
+        experts,
+        expert_map,
+        ignore_invalid_experts=True,
+    )
+    staged = torch.empty(rows, output_n, device=device, dtype=torch.bfloat16)
+    _launch_cubic_moe_situ_gemv_2bit(
+        x,
+        packed,
+        weight_scale,
+        staged,
+        topk_weights,
+        sorted_ids,
+        expert_ids,
+        padded_count,
+        logical_k=hidden,
+        group_size=group_size,
+        top_k=1,
+        multiply_routed_weight=False,
+        beta=4.0,
+        linear_beta=25.0,
+        dynamic_a8=True,
+        grouped_routes=1,
+    )
+    expected = _quantize_cubic_groupwise_a8(staged, group_size)
+    actual = _launch_cubic_moe_situ_cubic8_2bit(
+        x,
+        packed,
+        weight_scale,
+        topk_weights,
+        sorted_ids,
+        expert_ids,
+        padded_count,
+        logical_k=hidden,
+        group_size=group_size,
+        output_group_size=group_size,
+        top_k=1,
+        multiply_routed_weight=False,
+        beta=4.0,
+        linear_beta=25.0,
+    )
+
+    def decode_actual(carrier):
+        code = carrier.codes.float().reshape(rows, -1, group_size)
+        return (code * carrier.scales.unsqueeze(-1)).reshape(rows, -1)
+
+    def decode_expected(carrier):
+        code = carrier.values.float().reshape(rows, -1, group_size)
+        return (code * carrier.scales.unsqueeze(-1)).reshape(rows, -1)
+
+    torch.testing.assert_close(
+        decode_actual(actual), decode_expected(expected), rtol=0.02, atol=0.02
+    )
+    assert torch.isfinite(actual.scales).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("bits", "group_size"),
+    tuple((bits, group) for bits in range(1, 9) for group in GROUP_SIZES),
+)
+@pytest.mark.parametrize("grouped_routes", (1, 2))
+@ONLINE_MLP_REMOVED
+def test_cubic_online_groupwise_a8_consumer_matches_reference(
+    bits: int,
+    group_size: int,
+    grouped_routes: int,
+):
+    if grouped_routes == 2 and group_size < 256:
+        pytest.skip("production grouping heuristic uses singleton small groups")
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        CubicA8Carrier,
+        _launch_cubic_moe_groupwise_a8,
+    )
+
+    device = torch.device("cuda")
+    rows, outputs, input_size = 4, 37, 2 * group_size
+    codes = _make_codes((1, outputs, input_size), bits).to(device)
+    packed = pack_cubic_codes(codes, bits)
+    weight_scale = torch.linspace(
+        0.001,
+        0.02,
+        outputs * 2,
+        device=device,
+        dtype=torch.float32,
+    ).reshape(1, outputs, 2)
+    fit_a = torch.full_like(weight_scale, 0.5, dtype=torch.float16)
+    fit_b = torch.full_like(weight_scale, 0.25, dtype=torch.float16)
+    carriers = _reference_carriers(
+        codes,
+        fit_a,
+        fit_b,
+        bits,
+        group_size,
+    )
+    if bits == 3:
+        levels = cubic_carrier_levels(bits, fit_a, fit_b)
+        runtime_a = levels[..., 1].contiguous()
+        runtime_b = levels[..., 2].contiguous()
+    else:
+        runtime_a, runtime_b = fit_a, fit_b
+    values = torch.randint(
+        -127,
+        128,
+        (rows, input_size),
+        device=device,
+        dtype=torch.int8,
+    )
+    activation_scale = torch.tensor(
+        [
+            [0.001, 0.017],
+            [0.031, 0.004],
+            [0.009, 0.023],
+            [0.027, 0.006],
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    carrier = CubicA8Carrier(values, activation_scale, group_size)
+    actual = torch.empty(rows, outputs, device=device, dtype=torch.bfloat16)
+    topk_weights = torch.ones(rows, device=device)
+    sorted_ids = torch.arange(rows, device=device, dtype=torch.int32)
+    expert_ids = torch.zeros(rows, device=device, dtype=torch.int32)
+    count = torch.tensor(rows, device=device, dtype=torch.int32)
+
+    _launch_cubic_moe_groupwise_a8(
+        carrier,
+        packed,
+        weight_scale,
+        runtime_a,
+        runtime_b,
+        actual,
+        topk_weights,
+        sorted_ids,
+        expert_ids,
+        count,
+        logical_k=input_size,
+        num_bits=bits,
+        group_size=group_size,
+        top_k=1,
+        multiply_routed_weight=False,
+        sum_routes=False,
+        route_ctas=rows,
+        grouped_routes=grouped_routes,
+    )
+
+    expected = torch.zeros(rows, outputs, device=device, dtype=torch.float32)
+    for group in range(2):
+        start, end = group * group_size, (group + 1) * group_size
+        partial = values[:, start:end].float() @ carriers[0, :, start:end].float().T
+        expected += partial * (
+            activation_scale[:, group, None] * weight_scale[0, :, group][None, :] / 127
+        )
+
+    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("bits", "group_size"),
+    tuple((bits, group) for bits in range(1, 9) for group in (256, 512)),
+)
+@ONLINE_MLP_REMOVED
+def test_cubic_online_a8_bounded_batch_matches_token_slices(
+    monkeypatch: pytest.MonkeyPatch,
+    bits: int,
+    group_size: int,
+):
+    """Exact Online Cubic and Dynamic-A8 fallbacks remain chunk invariant."""
+    from vllm import envs
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    device = torch.device("cuda")
+    experts, tokens, top_k = 2, 17, 2
+    hidden = intermediate = 2 * group_size
+
+    def make_weight(shape: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
+        codes = _make_codes(shape, bits).to(device)
+        packed = pack_cubic_codes(codes, bits)
+        groups = shape[-1] // group_size
+        scale = torch.full(
+            (*shape[:-1], groups), 0.01, device=device, dtype=torch.float32
+        )
+        fit_a = torch.full_like(scale, 0.5, dtype=torch.float16)
+        fit_b = torch.full_like(scale, 0.25, dtype=torch.float16)
+        if bits == 3:
+            levels = cubic_carrier_levels(bits, fit_a, fit_b)
+            runtime_a = levels[..., 1].contiguous()
+            runtime_b = levels[..., 2].contiguous()
+        else:
+            runtime_a, runtime_b = fit_a, fit_b
+        return packed, scale, runtime_a, runtime_b
+
+    w1, w1_scale, w1_a, w1_b = make_weight((experts, 2 * intermediate, hidden))
+    w2, w2_scale, w2_a, w2_b = make_weight((experts, hidden, intermediate))
+    generator = torch.Generator(device=device).manual_seed(18700 + bits + group_size)
+    x = torch.randn(
+        tokens, hidden, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    topk_ids = torch.randint(
+        experts,
+        (tokens, top_k),
+        generator=generator,
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_weights = torch.softmax(
+        torch.randn(tokens, top_k, generator=generator, device=device), dim=-1
+    )
+    expert_map = torch.arange(experts, device=device, dtype=torch.int32)
+
+    monkeypatch.setattr(envs, "VLLM_CUBIC_DYNAMIC_A8_ONLINE", True)
+
+    def run(start: int, end: int) -> torch.Tensor:
+        return cubic_kernels.cubic_fused_moe_dynamic_a8(
+            x[start:end],
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_a,
+            w1_b,
+            w2_a,
+            w2_b,
+            topk_weights[start:end],
+            topk_ids[start:end],
+            activation=MoEActivation.SITU,
+            apply_router_weight_on_input=False,
+            global_num_experts=experts,
+            expert_map=expert_map,
+            num_bits=bits,
+            group_size=group_size,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            activation_situ_beta=4.0,
+            activation_situ_linear_beta=25.0,
+        )
+
+    monkeypatch.setattr(
+        cubic_kernels, "_CUBIC_A8_ROUTE_WORKSPACE_THRESHOLD_BYTES", 1 << 60
+    )
+    expected = torch.cat([run(0, 8), run(8, 16), run(16, 17)])
+
+    calls = 0
+    original_launch = cubic_kernels._launch_cubic_moe_groupwise_a8
+
+    def counted_launch(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_launch(*args, **kwargs)
+
+    monkeypatch.setattr(cubic_kernels, "_launch_cubic_moe_groupwise_a8", counted_launch)
+    bytes_per_token = top_k * hidden * x.element_size()
+    monkeypatch.setattr(cubic_kernels, "_CUBIC_A8_ROUTE_WORKSPACE_THRESHOLD_BYTES", 1)
+    monkeypatch.setattr(cubic_kernels, "_CUBIC_A8_ROUTE_WORKSPACE_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        cubic_kernels,
+        "_CUBIC_A8_ROUTE_WORKSPACE_MAX_BYTES",
+        3 * bytes_per_token,
+    )
+    actual = run(0, tokens)
+
+    torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.01)
+    if bits == 2 and group_size == 512:
+        assert calls >= math.ceil(tokens / 3)
+    else:
+        # Unsupported exact Cubic consumers must remain on established
+        # Dynamic A8 rather than silently using a linear groupwise carrier.
+        assert calls == 0
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("group_size", GROUP_SIZES)
+@pytest.mark.parametrize("bits", range(1, 9))
+def test_cubic_dynamic_a8_linear_matches_pytorch_reference(bits: int, group_size: int):
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        cubic_linear_dynamic_a8,
+    )
+
+    device = torch.device("cuda")
+    leading_shape, outputs, input_size = (4, 4), 7, group_size + 13
+    codes = _make_codes((outputs, input_size), bits).to(device)
+    packed = pack_cubic_codes(codes, bits)
+    packed_before = packed.clone()
+    groups = math.ceil(input_size / group_size)
+    scale = (
+        torch.linspace(0.01, 0.08, outputs * groups, device=device)
+        .reshape(outputs, groups)
+        .float()
+    )
+    a = torch.full((outputs, groups), 0.5, device=device, dtype=torch.float16)
+    b = torch.full((outputs, groups), 0.25, device=device, dtype=torch.float16)
+    generator = torch.Generator(device=device).manual_seed(2000 + bits + group_size)
+    x = torch.randn(
+        *leading_shape,
+        input_size,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    x[0, 0].zero_()
+    x[0, 1, 0] = 100
+
+    expected = _reference_dynamic_a8_linear(x, packed, scale, a, b, bits, group_size)
+    actual = cubic_linear_dynamic_a8(
+        x,
+        packed,
+        scale,
+        a,
+        b,
+        num_bits=bits,
+        group_size=group_size,
+        input_size=input_size,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+    torch.testing.assert_close(packed, packed_before, rtol=0, atol=0)
+    assert torch.count_nonzero(actual[0, 0]).item() == 0
+    assert torch.isfinite(actual).all()
+    assert actual.dtype == x.dtype
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("expert_parallel", (False, True))
+@pytest.mark.parametrize("group_size", GROUP_SIZES)
+@pytest.mark.parametrize("bits", range(1, 9))
+def test_cubic_dynamic_a8_moe_matches_pytorch_reference(
+    bits: int,
+    group_size: int,
+    expert_parallel: bool,
+):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        cubic_fused_moe_dynamic_a8,
+    )
+
+    device = torch.device("cuda")
+    experts, tokens, top_k = 2, 16, 2
+    hidden = intermediate = max(64, group_size)
+
+    def make_weight(shape: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
+        codes = _make_codes(shape, bits).to(device)
+        packed = pack_cubic_codes(codes, bits)
+        groups = shape[-1] // group_size
+        scale = torch.full(
+            (*shape[:-1], groups), 0.1, device=device, dtype=torch.float32
+        )
+        a = torch.full_like(scale, 0.5, dtype=torch.float16)
+        b = torch.full_like(scale, 0.25, dtype=torch.float16)
+        return packed, scale, a, b
+
+    w1, w1_scale, w1_a, w1_b = make_weight((experts, 2 * intermediate, hidden))
+    w2, w2_scale, w2_a, w2_b = make_weight((experts, hidden, intermediate))
+    w1_before, w2_before = w1.clone(), w2.clone()
+    generator = torch.Generator(device=device).manual_seed(73)
+    x = torch.randn(
+        tokens, hidden, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    topk_ids = torch.tensor([[0, 1], [1, 0]], device=device, dtype=torch.int32).repeat(
+        (tokens + 1) // 2, 1
+    )[:tokens]
+    topk_weights = torch.softmax(
+        torch.randn(tokens, top_k, generator=generator, device=device), dim=-1
+    )
+
+    actual = cubic_fused_moe_dynamic_a8(
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_a,
+        w1_b,
+        w2_a,
+        w2_b,
+        topk_weights,
+        topk_ids,
+        activation=MoEActivation.SITU,
+        apply_router_weight_on_input=False,
+        global_num_experts=experts,
+        expert_map=(
+            torch.arange(experts, device=device, dtype=torch.int32)
+            if expert_parallel
+            else None
+        ),
+        num_bits=bits,
+        group_size=group_size,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+    )
+
+    expected = torch.zeros_like(actual, dtype=torch.float32)
+    for token in range(tokens):
+        for route in range(top_k):
+            expert = topk_ids[token, route].item()
+            gate_up = _reference_dynamic_a8_linear(
+                x[token : token + 1],
+                w1[expert],
+                w1_scale[expert],
+                w1_a[expert],
+                w1_b[expert],
+                bits,
+                group_size,
+            )
+            gate = gate_up[:, :intermediate].float()
+            up = gate_up[:, intermediate:].float()
+            activated = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
+            activated *= 25.0 * torch.tanh(up / 25.0)
+            expert_output = _reference_dynamic_a8_linear(
+                activated.to(torch.bfloat16),
+                w2[expert],
+                w2_scale[expert],
+                w2_a[expert],
+                w2_b[expert],
+                bits,
+                group_size,
+            )
+            expected[token] += expert_output[0].float() * topk_weights[token, route]
+
+    torch.testing.assert_close(actual.float(), expected, rtol=0.04, atol=0.04)
+    torch.testing.assert_close(w1, w1_before, rtol=0, atol=0)
+    torch.testing.assert_close(w2, w2_before, rtol=0, atol=0)
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cubic_dynamic_a8_w2_grouped_routes_single_token_is_bounded():
+    """Cover EP compact-route and fused-sum hazards for grouped W2 routes."""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        cubic_fused_moe_dynamic_a8,
+    )
+
+    device = torch.device("cuda")
+    experts, hidden, intermediate, group_size, bits = 3, 256, 256, 256, 2
+
+    def make_weight(shape: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
+        codes = _make_codes(shape, bits).to(device)
+        packed = pack_cubic_codes(codes, bits)
+        groups = shape[-1] // group_size
+        scale = torch.full(
+            (*shape[:-1], groups), 0.1, device=device, dtype=torch.float32
+        )
+        a = torch.full_like(scale, 0.5, dtype=torch.float16)
+        b = torch.full_like(scale, 0.25, dtype=torch.float16)
+        return packed, scale, a, b
+
+    w1, w1_scale, w1_a, w1_b = make_weight((experts, 2 * intermediate, hidden))
+    w2, w2_scale, w2_a, w2_b = make_weight((experts, hidden, intermediate))
+    x = torch.randn(1, hidden, device=device, dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[0, 1]], device=device, dtype=torch.int32)
+    topk_weights = torch.tensor([[0.6, 0.4]], device=device)
+
+    actual = cubic_fused_moe_dynamic_a8(
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_a,
+        w1_b,
+        w2_a,
+        w2_b,
+        topk_weights,
+        topk_ids,
+        activation=MoEActivation.SITU,
+        apply_router_weight_on_input=False,
+        global_num_experts=experts,
+        expert_map=torch.arange(experts, device=device, dtype=torch.int32),
+        num_bits=bits,
+        group_size=group_size,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+    )
+
+    assert actual.shape == x.shape
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bits", (1, 2, 3, 4, 8))
+def test_cubic_dynamic_a8_chunked_down_projection_matches_one_shot(
+    monkeypatch: pytest.MonkeyPatch,
+    bits: int,
+):
+    """The bounded W1-W8 workspace must preserve route math exactly."""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    device = torch.device("cuda")
+    experts, tokens, top_k = 3, 17, 2
+    hidden = intermediate = group_size = 512
+
+    def make_weight(shape: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
+        codes = _make_codes(shape, bits).to(device)
+        packed = pack_cubic_codes(codes, bits)
+        groups = shape[-1] // group_size
+        scale = torch.full(
+            (*shape[:-1], groups), 0.1, device=device, dtype=torch.float32
+        )
+        a = torch.full_like(scale, 0.5, dtype=torch.float16)
+        b = torch.full_like(scale, 0.25, dtype=torch.float16)
+        return packed, scale, a, b
+
+    w1, w1_scale, w1_a, w1_b = make_weight((experts, 2 * intermediate, hidden))
+    w2, w2_scale, w2_a, w2_b = make_weight((experts, hidden, intermediate))
+    generator = torch.Generator(device=device).manual_seed(9120 + bits)
+    x = torch.randn(
+        tokens, hidden, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    topk_ids = torch.randint(
+        experts,
+        (tokens, top_k),
+        generator=generator,
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_weights = torch.softmax(
+        torch.randn(tokens, top_k, generator=generator, device=device), dim=-1
+    )
+    expert_map = torch.arange(experts, device=device, dtype=torch.int32)
+
+    def run() -> torch.Tensor:
+        return cubic_kernels.cubic_fused_moe_dynamic_a8(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_a,
+            w1_b,
+            w2_a,
+            w2_b,
+            topk_weights,
+            topk_ids,
+            activation=MoEActivation.SITU,
+            apply_router_weight_on_input=False,
+            global_num_experts=experts,
+            expert_map=expert_map,
+            num_bits=bits,
+            group_size=group_size,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            activation_situ_beta=4.0,
+            activation_situ_linear_beta=25.0,
+        )
+
+    monkeypatch.setattr(
+        cubic_kernels, "_CUBIC_A8_ROUTE_WORKSPACE_THRESHOLD_BYTES", 1 << 60
+    )
+    monkeypatch.setattr(
+        cubic_kernels, "_CUBIC_A8_PIPELINE_WORKSPACE_MAX_BYTES", 1 << 60
+    )
+    expected = run()
+
+    cache1_bytes_per_token = top_k * (2 * intermediate) * x.element_size()
+    monkeypatch.setattr(cubic_kernels, "_CUBIC_A8_PIPELINE_WORKSPACE_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        cubic_kernels,
+        "_CUBIC_A8_PIPELINE_WORKSPACE_MAX_BYTES",
+        3 * cache1_bytes_per_token,
+    )
+    pipeline_actual = run()
+    torch.testing.assert_close(pipeline_actual, expected, rtol=0, atol=0)
+
+    monkeypatch.setattr(
+        cubic_kernels, "_CUBIC_A8_PIPELINE_WORKSPACE_MAX_BYTES", 1 << 60
+    )
+
+    bytes_per_token = top_k * hidden * x.element_size()
+    monkeypatch.setattr(cubic_kernels, "_CUBIC_A8_ROUTE_WORKSPACE_THRESHOLD_BYTES", 1)
+    monkeypatch.setattr(cubic_kernels, "_CUBIC_A8_ROUTE_WORKSPACE_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        cubic_kernels,
+        "_CUBIC_A8_ROUTE_WORKSPACE_MAX_BYTES",
+        3 * bytes_per_token,
+    )
+    actual = run()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.isfinite(actual).all()

@@ -442,6 +442,19 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
+        if not load_dummy_weights:
+            from vllm.model_executor.warmup.cubic_warmup import (
+                cubic_kernel_warmup,
+            )
+
+            cubic_kernel_warmup(
+                self.model_runner.get_model(),
+                max_tokens=self.scheduler_config.max_num_batched_tokens,
+                capture_sizes=tuple(
+                    self.vllm_config.compilation_config.cudagraph_capture_sizes or ()
+                ),
+            )
+
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,

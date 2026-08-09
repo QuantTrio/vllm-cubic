@@ -29,6 +29,80 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "()");
   ops.def("permute_cols(Tensor A, Tensor perm) -> Tensor");
 
+#ifndef USE_ROCM
+  ops.def(
+      "cubic_w2_a8_gemv(Tensor input, Tensor input_scale, Tensor weight, "
+      "Tensor weight_scale, Tensor! output, Tensor topk_weights, "
+      "Tensor token_ids, Tensor expert_ids, Tensor num_routes, "
+      "int group_size, int top_k, bool multiply_routed_weight, "
+      "int route_ctas) -> ()");
+  ops.def(
+      "cubic_w2_groupwise_a8_gemv(Tensor input, Tensor input_scale, "
+      "Tensor weight, Tensor weight_scale, Tensor! output, "
+      "Tensor topk_weights, Tensor token_ids, Tensor expert_ids, "
+      "Tensor num_routes, int group_size, int top_k, "
+      "bool multiply_routed_weight, int route_ctas, "
+      "int num_valid_tokens, int routes_per_block) -> ()");
+  ops.def(
+      "cubic_w2_situ_cubic8_producer(Tensor input, Tensor input_scale, "
+      "Tensor weight, Tensor weight_scale, Tensor! output_code, "
+      "Tensor! output_scale, Tensor! output_a, Tensor! output_b, "
+      "Tensor topk_weights, Tensor token_ids, Tensor expert_ids, "
+      "Tensor num_routes, int group_size, int output_group_size, int top_k, "
+      "bool multiply_routed_weight, int route_ctas, float beta, "
+      "float linear_beta, bool has_linear_beta, "
+      "int threads_per_output) -> ()");
+  ops.def(
+      "cubic_w2_cubic8_moment_gemv(Tensor input_code, Tensor input_scale, "
+      "Tensor input_a, Tensor input_b, Tensor weight, Tensor weight_scale, "
+      "Tensor! output, Tensor topk_weights, Tensor token_ids, "
+      "Tensor expert_ids, Tensor num_routes, int weight_group_size, "
+      "int activation_group_size, int top_k, bool multiply_routed_weight, "
+      "int route_ctas) -> ()");
+  ops.def(
+      "cubic_w2_cubic8_lut_gemv(Tensor input_code, Tensor input_scale, "
+      "Tensor input_a, Tensor input_b, Tensor weight, Tensor weight_scale, "
+      "Tensor! output, Tensor topk_weights, Tensor token_ids, "
+      "Tensor expert_ids, Tensor num_routes, int weight_group_size, "
+      "int activation_group_size, int top_k, bool multiply_routed_weight, "
+      "int route_ctas, int threads_per_output) -> ()");
+  ops.def(
+      "cubic_w2_cubic8_shared_gemv(Tensor input_code, Tensor input_scale, "
+      "Tensor input_a, Tensor input_b, Tensor weight, Tensor weight_scale, "
+      "Tensor! output, Tensor topk_weights, Tensor token_ids, "
+      "Tensor expert_ids, Tensor num_routes, int weight_group_size, "
+      "int activation_group_size, int top_k, bool multiply_routed_weight, "
+      "int route_ctas) -> ()");
+  ops.def(
+      "cubic_w3_a8_gemv(Tensor input, Tensor input_scale, Tensor weight, "
+      "Tensor weight_scale, Tensor level1, Tensor level2, Tensor! output, "
+      "Tensor topk_weights, Tensor token_ids, Tensor expert_ids, "
+      "Tensor num_routes, int group_size, int top_k, "
+      "bool multiply_routed_weight, int route_ctas, "
+      "int num_valid_tokens, int routes_per_block) -> ()");
+  ops.def(
+      "cubic_w3_groupwise_a8_gemv(Tensor input, Tensor input_scale, "
+      "Tensor weight, Tensor weight_scale, Tensor level1, Tensor level2, "
+      "Tensor! output, Tensor topk_weights, Tensor token_ids, "
+      "Tensor expert_ids, Tensor num_routes, int group_size, int top_k, "
+      "bool multiply_routed_weight, int route_ctas, "
+      "int num_valid_tokens, int routes_per_block) -> ()");
+  ops.def(
+      "cubic_w4_w8_a8_gemv(Tensor input, Tensor input_scale, Tensor weight, "
+      "Tensor weight_scale, Tensor cubic_a, Tensor cubic_b, Tensor! output, "
+      "Tensor topk_weights, Tensor token_ids, Tensor expert_ids, "
+      "Tensor num_routes, int bits, int group_size, int group_out, int top_k, "
+      "bool multiply_routed_weight, int route_ctas, "
+      "int num_valid_tokens, int routes_per_block) -> ()");
+  ops.def(
+      "cubic_w4_w8_groupwise_a8_gemv(Tensor input, Tensor input_scale, "
+      "Tensor weight, Tensor weight_scale, Tensor cubic_a, Tensor cubic_b, "
+      "Tensor! output, Tensor topk_weights, Tensor token_ids, "
+      "Tensor expert_ids, Tensor num_routes, int bits, int group_size, "
+      "int group_out, int top_k, bool multiply_routed_weight, int route_ctas, "
+      "int num_valid_tokens, int routes_per_block) -> ()");
+#endif
+
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
 
 #ifndef USE_ROCM
