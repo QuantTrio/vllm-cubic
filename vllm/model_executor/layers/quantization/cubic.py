@@ -48,7 +48,7 @@ def _normalize_group_size(value: Any) -> tuple[int, int]:
 class CubicScheme:
     num_bits: int
     group_size: int
-    group_out: int = 1
+    group_out: int
     param_dtype: torch.dtype = torch.float16
     reserved_code: str = "zero"
 
@@ -109,9 +109,7 @@ class CubicLinearMetadataParameter(PackedvLLMParameter):
         shard_size = self.data.shape[self.input_dim]
         input_offset = self.tp_rank * self.input_size_per_partition
         group_offset = input_offset // self.input_group_size
-        loaded_weight = loaded_weight.narrow(
-            self.input_dim, group_offset, shard_size
-        )
+        loaded_weight = loaded_weight.narrow(self.input_dim, group_offset, shard_size)
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 
@@ -253,7 +251,7 @@ def dequantize_cubic(
     *,
     total_bits: int,
     group_size: int,
-    group_out: int = 1,
+    group_out: int,
     num_values: int,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
@@ -308,7 +306,7 @@ def dequantize_cubic_carrier(
     *,
     total_bits: int,
     group_size: int,
-    group_out: int = 1,
+    group_out: int,
     num_values: int,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
@@ -400,8 +398,9 @@ def quantize_cubic(
     group_size: int = 128,
 ) -> CubicQuantizedTensor:
     scheme = CubicScheme(
-        total_bits,
-        group_size,
+        num_bits=total_bits,
+        group_size=group_size,
+        group_out=1,
         reserved_code="binary" if total_bits == 1 else "zero",
     )
     original_shape = tuple(weight.shape)
@@ -484,6 +483,7 @@ def quantize_cubic(
         b,
         total_bits=total_bits,
         group_size=group_size,
+        group_out=1,
         num_values=num_values,
     )
     loss = (weight.to(torch.float32) - reference).square().sum(dim=-1)

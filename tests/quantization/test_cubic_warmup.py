@@ -7,6 +7,26 @@ from vllm.model_executor.warmup import cubic_warmup
 from vllm.model_executor.warmup.cubic_warmup import _assign_cubic_tasks
 
 
+def test_cubic_w2_situ_specs_keep_the_normalized_output_group():
+    from vllm.model_executor.layers.quantization.cubic import (
+        CubicMoEMethod,
+        CubicScheme,
+    )
+
+    layer = torch.nn.Module()
+    method = object.__new__(CubicMoEMethod)
+    method.scheme = CubicScheme(num_bits=2, group_size=512, group_out=128)
+    layer.quant_method = method
+    layer.cubic_intermediate_size = 3072
+    layer.cubic_hidden_size = 3584
+    layer.top_k = 16
+    layer.w13_weight_packed = torch.empty(112, 0, 0, device="meta", dtype=torch.uint8)
+
+    assert cubic_warmup._cubic_w2_a8_situ_specs(layer) == (
+        (3072, 3584, 128, 512, 16, 112),
+    )
+
+
 def _linear_task(bits: int) -> tuple[object, ...]:
     return (
         "linear",

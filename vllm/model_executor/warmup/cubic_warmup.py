@@ -15,6 +15,7 @@ import os
 import socket
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -251,7 +252,7 @@ def _cubic_task_weight(task: CalibrationTask) -> int:
         _, _, _, _, k, n, _, _, m = task
         return int(k) * int(n) * (32 + int(m))
     if task[0] == "w2_situ":
-        _, n, k, _, _, local_experts = task
+        _, n, k, _, _, _, local_experts = task
         return int(n) * int(k) * max(int(local_experts), 1) * 256
     _, _, _, _, hidden, intermediate, top_k, local_experts, _, *tail = task
     tokens = int(tail[-1])
@@ -546,9 +547,9 @@ def _save_cubic_tactic_cache(cache_key: str) -> None:
 
 def _cubic_w2_a8_situ_specs(
     model: torch.nn.Module,
-) -> tuple[tuple[int, int, int, int, int], ...]:
-    """Return unique (N, K, group_size, top_k, local_experts) shapes."""
-    specs: set[tuple[int, int, int, int, int]] = set()
+) -> tuple[tuple[int, int, int, int, int, int], ...]:
+    """Return unique (N, K, group_out, group_in, top_k, experts) shapes."""
+    specs: set[tuple[int, int, int, int, int, int]] = set()
     for module in model.modules():
         method = getattr(module, "quant_method", None)
         if not isinstance(method, CubicMoEMethod):
@@ -562,7 +563,14 @@ def _cubic_w2_a8_situ_specs(
         if n is None or k is None or top_k is None or packed is None:
             continue
         specs.add(
-            (int(n), int(k), method.scheme.group_size, int(top_k), packed.shape[0])
+            (
+                int(n),
+                int(k),
+                method.scheme.group_out,
+                method.scheme.group_size,
+                int(top_k),
+                packed.shape[0],
+            )
         )
     return tuple(sorted(specs))
 
@@ -639,6 +647,16 @@ def _warmup_cubic_linear_families(
         elif bits == 3:
             levels = cubic_carrier_levels(3, layer.weight_a, layer.weight_b)
             a8_a, a8_b = levels[..., 1].contiguous(), levels[..., 2].contiguous()
+        modes: list[
+            tuple[
+                bool,
+                Callable[..., torch.Tensor],
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                bool,
+            ]
+        ]
         if method.dynamic_a8:
             carrier = getattr(layer, "weight_carrier", None)
             if carrier is None:
@@ -920,8 +938,8 @@ def _warmup_cubic_moe_families(
                     global_num_experts=layer.global_num_experts,
                     expert_map=layer.expert_map,
                     num_bits=bits,
-                    group_size=group_size,
                     group_out=group_out,
+                    group_size=group_size,
                     hidden_size=hidden,
                     intermediate_size=intermediate,
                     activation_situ_beta=method.moe.activation_situ_beta,
@@ -1151,6 +1169,7 @@ def _warmup_cubic_moe_families(
                     global_num_experts=layer.global_num_experts,
                     expert_map=layer.expert_map,
                     num_bits=bits,
+                    group_out=group_out,
                     group_size=group_size,
                     hidden_size=hidden,
                     intermediate_size=intermediate,
@@ -1321,15 +1340,24 @@ def cubic_kernel_warmup(
             "Calibrating assigned Cubic W2 A8 SITU tactics: %s",
             owned_specs,
         )
-        for n, k, group_size, top_k, local_experts in owned_specs:
-            task = ("w2_situ", n, k, group_size, top_k, local_experts)
-            if k % group_size:
+        for n, k, group_out, group_size, top_k, local_experts in owned_specs:
+            task = (
+                "w2_situ",
+                n,
+                k,
+                group_out,
+                group_size,
+                top_k,
+                local_experts,
+            )
+            if n % group_out or k % group_size:
                 progress(task)
                 continue
             try:
                 calibrate_cubic_w2_a8_situ(
                     n=n,
                     k=k,
+                    group_out=group_out,
                     group_size=group_size,
                     top_k=top_k,
                     local_experts=local_experts,
@@ -1344,10 +1372,11 @@ def cubic_kernel_warmup(
             except (RuntimeError, AssertionError) as error:
                 calibration_complete = False
                 logger.warning(
-                    "Cubic tactic calibration failed for N=%d K=%d G=%d; "
+                    "Cubic tactic calibration failed for N=%d K=%d G=%dx%d; "
                     "using the safe fallback: %s",
                     n,
                     k,
+                    group_out,
                     group_size,
                     error,
                 )

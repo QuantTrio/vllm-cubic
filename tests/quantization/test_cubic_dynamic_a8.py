@@ -20,6 +20,28 @@ ONLINE_MLP_REMOVED = pytest.mark.skip(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("group_out", (1, 32))
+def test_cubic_w2_situ_calibration_uses_normalized_group_shape(group_out: int):
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        _CUBIC_W2_A8_SITU_TACTICS,
+        calibrate_cubic_w2_a8_situ,
+    )
+
+    calibrate_cubic_w2_a8_situ(
+        n=64,
+        k=128,
+        group_out=group_out,
+        group_size=128,
+        top_k=1,
+        local_experts=1,
+        route_ctas_values=(1,),
+    )
+
+    device = torch.accelerator.current_device_index()
+    assert (device, 64, 128, group_out, 128, 1, 1) in (_CUBIC_W2_A8_SITU_TACTICS)
+
+
 @pytest.mark.parametrize(
     ("raw_value", "expected"),
     [(None, False), ("0", False), ("1", True)],
@@ -239,6 +261,7 @@ def test_cubic_carrier_dequant_preserves_checkpoint_packing(bits: int, group_siz
         b,
         total_bits=bits,
         group_size=group_size,
+        group_out=1,
         num_values=input_size,
     )
     carriers = _reference_carriers(codes, a, b, bits, group_size).float()
@@ -263,6 +286,7 @@ def test_cubic_carrier_dequant_requires_fp32_weight_scale():
             torch.zeros_like(metadata),
             total_bits=2,
             group_size=32,
+            group_out=1,
             num_values=2,
         )
 
@@ -334,7 +358,10 @@ def test_cubic_linear_activation_mode_is_strict(
         weight_b=torch.empty(7, 2, dtype=torch.float16),
         input_size_per_partition=64,
     )
-    method = CubicLinearMethod(CubicScheme(8, 32), dynamic_a8=dynamic_a8)
+    method = CubicLinearMethod(
+        CubicScheme(num_bits=8, group_size=32, group_out=1),
+        dynamic_a8=dynamic_a8,
+    )
 
     output = method.apply(layer, torch.empty(tokens, 64, dtype=torch.bfloat16))
 
@@ -734,6 +761,7 @@ def test_cubic_online_cubic8_fused_w2_producer_matches_staged_reference(
         padded_count,
         logical_k=hidden,
         group_size=group_size,
+        group_out=1,
         top_k=1,
         multiply_routed_weight=False,
         beta=4.0,
@@ -752,6 +780,7 @@ def test_cubic_online_cubic8_fused_w2_producer_matches_staged_reference(
         padded_count,
         logical_k=hidden,
         group_size=group_size,
+        group_out=1,
         output_group_size=group_size,
         top_k=1,
         multiply_routed_weight=False,
@@ -856,6 +885,7 @@ def test_cubic_online_groupwise_a8_consumer_matches_reference(
         logical_k=input_size,
         num_bits=bits,
         group_size=group_size,
+        group_out=1,
         top_k=1,
         multiply_routed_weight=False,
         sum_routes=False,
@@ -951,6 +981,7 @@ def test_cubic_online_a8_bounded_batch_matches_token_slices(
             expert_map=expert_map,
             num_bits=bits,
             group_size=group_size,
+            group_out=1,
             hidden_size=hidden,
             intermediate_size=intermediate,
             activation_situ_beta=4.0,
@@ -1032,6 +1063,7 @@ def test_cubic_dynamic_a8_linear_matches_pytorch_reference(bits: int, group_size
         b,
         num_bits=bits,
         group_size=group_size,
+        group_out=1,
         input_size=input_size,
     )
 
@@ -1226,7 +1258,7 @@ def test_cubic_situ_warmup_accepts_legacy_scalar_group_size(
 
     def do_bench(function, **_kwargs) -> float:
         function()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         return 1.0
 
     monkeypatch.setattr(cubic_kernels.triton.testing, "do_bench", do_bench)
@@ -1244,6 +1276,7 @@ def test_cubic_situ_warmup_accepts_legacy_scalar_group_size(
         logical_k=hidden,
         num_bits=2,
         group_size=hidden,
+        group_out=1,
         top_k=1,
         multiply_routed_weight=False,
         grouped_routes=1,
@@ -1317,6 +1350,7 @@ def test_cubic_dynamic_a8_moe_matches_pytorch_reference(
         ),
         num_bits=bits,
         group_size=group_size,
+        group_out=1,
         hidden_size=hidden,
         intermediate_size=intermediate,
         activation_situ_beta=4.0,
@@ -1403,6 +1437,7 @@ def test_cubic_dynamic_a8_w2_grouped_routes_single_token_is_bounded():
         expert_map=torch.arange(experts, device=device, dtype=torch.int32),
         num_bits=bits,
         group_size=group_size,
+        group_out=1,
         hidden_size=hidden,
         intermediate_size=intermediate,
         activation_situ_beta=4.0,
@@ -1475,6 +1510,7 @@ def test_cubic_dynamic_a8_chunked_down_projection_matches_one_shot(
             expert_map=expert_map,
             num_bits=bits,
             group_size=group_size,
+            group_out=1,
             hidden_size=hidden,
             intermediate_size=intermediate,
             activation_situ_beta=4.0,

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ast
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -98,7 +100,14 @@ def test_cubic_linear_can_materialize_operator_weight():
         input_size_per_partition=weight.shape[-1],
         params_dtype=torch.bfloat16,
     )
-    method = CubicLinearMethod(CubicScheme(1, 128, reserved_code="binary"))
+    method = CubicLinearMethod(
+        CubicScheme(
+            num_bits=1,
+            group_size=128,
+            group_out=1,
+            reserved_code="binary",
+        )
+    )
 
     actual = method.dequantize(layer)
     cached = method.dequantize(layer)
@@ -109,6 +118,7 @@ def test_cubic_linear_can_materialize_operator_weight():
         quantized.b,
         total_bits=1,
         group_size=128,
+        group_out=1,
         num_values=weight.shape[-1],
         output_dtype=torch.bfloat16,
     )
@@ -133,6 +143,7 @@ def test_cubic_exact_zero_endpoints_and_int_special_case(bits: int):
         b,
         total_bits=bits,
         group_size=128,
+        group_out=1,
         num_values=3,
     )
 
@@ -155,6 +166,7 @@ def test_cubic_one_bit_dequantizes_without_widening():
         b,
         total_bits=1,
         group_size=128,
+        group_out=1,
         num_values=4,
     )
 
@@ -219,6 +231,46 @@ def test_cubic_config_accepts_legacy_and_two_dimensional_group_shapes():
     assert config.schemes[2][1].group_shape == (512, 1)
 
 
+def test_cubic_internal_group_interfaces_require_both_dimensions():
+    import vllm.model_executor.layers.quantization.cubic_kernels as cubic_kernels
+
+    source_path = Path(cubic_kernels.__file__)
+    tree = ast.parse(source_path.read_text())
+    definitions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+
+    for definition in definitions.values():
+        keyword_defaults = dict(
+            zip(definition.args.kwonlyargs, definition.args.kw_defaults)
+        )
+        for argument, default in keyword_defaults.items():
+            if argument.arg == "group_out":
+                assert default is None, (
+                    f"{definition.name} must require the normalized output-group "
+                    "dimension"
+                )
+
+    grouped_kernels = {
+        name
+        for name, definition in definitions.items()
+        if any(argument.arg == "GROUP_OUT" for argument in definition.args.args)
+    }
+    missing: list[tuple[int, str]] = []
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        target = call.func
+        if isinstance(target, ast.Subscript):
+            target = target.value
+        if isinstance(target, ast.Attribute) and target.attr == "fn":
+            target = target.value
+        if not isinstance(target, ast.Name) or target.id not in grouped_kernels:
+            continue
+        if not any(keyword.arg == "GROUP_OUT" for keyword in call.keywords):
+            missing.append((call.lineno, target.id))
+
+    assert missing == []
+
+
 def test_cubic_levels_are_monotonic_and_normalized():
     for a, b in ((1.0, 0.0), (0.5, 0.25), (1.25, -0.25)):
         assert cubic_is_strictly_monotonic(a, b)
@@ -240,6 +292,7 @@ def test_cubic_quantization_persists_metadata_and_handles_tail():
         quantized.b,
         total_bits=4,
         group_size=128,
+        group_out=1,
         num_values=259,
     )
 
@@ -300,10 +353,15 @@ def test_cubic_config_supports_custom_linear_and_moe_widths():
     )
     assert not config.has_explicit_scheme("model.regular_proj")
     assert config.has_explicit_scheme("model.special_proj")
-    binary = CubicScheme(1, 128, reserved_code="binary")
+    binary = CubicScheme(
+        num_bits=1,
+        group_size=128,
+        group_out=1,
+        reserved_code="binary",
+    )
     assert binary.effective_bits == 1.5
     with pytest.raises(ValueError, match="reserved_code"):
-        CubicScheme(1, 128)
+        CubicScheme(num_bits=1, group_size=128, group_out=1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -370,6 +428,7 @@ def test_cubic_linear_kernel_reads_native_packed_width(bits: int):
         b,
         total_bits=bits,
         group_size=group_size,
+        group_out=1,
         num_values=inputs,
         output_dtype=torch.bfloat16,
     )
@@ -382,6 +441,7 @@ def test_cubic_linear_kernel_reads_native_packed_width(bits: int):
         b,
         num_bits=bits,
         group_size=group_size,
+        group_out=1,
         input_size=inputs,
     )
 
@@ -510,6 +570,7 @@ def test_cubic_fused_moe_kernel_supports_kimi_situ(bits: int, tokens: int):
             b,
             total_bits=bits,
             group_size=group_size,
+            group_out=1,
             num_values=shape[-1],
             output_dtype=torch.bfloat16,
         )
@@ -552,6 +613,7 @@ def test_cubic_fused_moe_kernel_supports_kimi_situ(bits: int, tokens: int):
         expert_map=expert_map,
         num_bits=bits,
         group_size=group_size,
+        group_out=1,
         hidden_size=hidden,
         intermediate_size=intermediate,
         activation_situ_beta=4.0,
@@ -807,6 +869,7 @@ def test_cubic_decode_w2_route_sum_fusion_is_exact(bits: int):
         logical_k=intermediate,
         num_bits=bits,
         group_size=group_size,
+        group_out=1,
         top_k=1,
         multiply_routed_weight=True,
         sum_routes=False,
@@ -819,6 +882,7 @@ def test_cubic_decode_w2_route_sum_fusion_is_exact(bits: int):
         logical_k=intermediate,
         num_bits=bits,
         group_size=group_size,
+        group_out=1,
         top_k=1,
         multiply_routed_weight=True,
         sum_routes=True,
