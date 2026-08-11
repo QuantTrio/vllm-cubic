@@ -23,6 +23,15 @@ __device__ __forceinline__ int cubic_dp4a_w4_w8(int a, int b, int c) {
   return out;
 }
 
+__device__ __forceinline__ uint4 cubic_ldcs_u32x4(
+    const uint4* __restrict__ address) {
+  uint4 value;
+  asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+               : "l"(address));
+  return value;
+}
+
 template <int Bits, int GroupSize, int ThreadsPerOutput, bool GroupwiseScale>
 __global__ void cubic_w4_w8_a8_gemv_kernel(
     const int8_t* __restrict__ input, const float* __restrict__ input_scale,
@@ -395,8 +404,8 @@ __global__ void cubic_w4_w8_grouped2_a8_gemv_kernel(
 }
 
 template <int Bits, int GroupSize, int ThreadsPerOutput, int RoutesPerBlock,
-          bool GroupwiseScale>
-__global__ void cubic_w4_w8_grouped_a8_gemv_kernel(
+          bool GroupwiseScale, bool UsePairLut = false>
+__global__ __launch_bounds__(128, 8) void cubic_w4_w8_grouped_a8_gemv_kernel(
     const int8_t* __restrict__ input, const float* __restrict__ input_scale,
     const uint8_t* __restrict__ weight, const float* __restrict__ weight_scale,
     const __half* __restrict__ cubic_a, const __half* __restrict__ cubic_b,
@@ -415,19 +424,28 @@ __global__ void cubic_w4_w8_grouped_a8_gemv_kernel(
   constexpr int levels = 1 << (Bits - 1);
   constexpr bool use_full_signed_lut = Bits <= 6;
   constexpr int lut_entries = use_full_signed_lut ? (1 << Bits) : levels;
+  constexpr int lut_bytes = outputs_per_block * lut_entries;
+  constexpr int pair_lut_bytes = UsePairLut ? 256 * sizeof(uint16_t) : 0;
+  static_assert(!UsePairLut || Bits == 4);
   constexpr unsigned mask = 0xffffffffu;
   static_assert(code_blocks_per_group % ThreadsPerOutput == 0);
   extern __shared__ int8_t carrier_lut[];
+  uint16_t* carrier_pair_lut =
+      reinterpret_cast<uint16_t*>(carrier_lut + lut_bytes);
+  int* shared_inputs =
+      reinterpret_cast<int*>(carrier_lut + lut_bytes + pair_lut_bytes);
 
   const int output_in_block = threadIdx.x / ThreadsPerOutput;
   const int lane = threadIdx.x & (ThreadsPerOutput - 1);
-  const int out_channel = blockIdx.x * outputs_per_block + output_in_block;
+  const int out_channel = blockIdx.y * outputs_per_block + output_in_block;
   const bool valid_output = out_channel < n;
+  const bool share_output_lut =
+      group_out >= outputs_per_block && group_out % outputs_per_block == 0;
   const int num_route_blocks = (*num_routes_ptr + routes_per_block - 1) /
                                routes_per_block;
   const int input_words_per_row = k / 4;
 
-  for (int route_block = blockIdx.y; route_block < num_route_blocks;
+  for (int route_block = blockIdx.x; route_block < num_route_blocks;
        route_block += route_ctas) {
     int tokens[routes_per_block];
     bool valid[routes_per_block];
@@ -463,9 +481,25 @@ __global__ void cubic_w4_w8_grouped_a8_gemv_kernel(
         (static_cast<int64_t>(expert) * (n / group_out) +
          out_channel / group_out) *
         num_groups;
+    const int64_t shared_meta_base =
+        (static_cast<int64_t>(expert) * (n / group_out) +
+         (blockIdx.y * outputs_per_block) / group_out) *
+        num_groups;
 
     for (int group = 0; group < num_groups; ++group) {
-      const int64_t meta = meta_base + group;
+      for (int route = 0; route < routes_per_block; ++route) {
+        for (int word = threadIdx.x; word < input_words_per_group;
+             word += kThreads) {
+          shared_inputs[route * input_words_per_group + word] =
+              valid[route]
+                  ? input_rows[route][group * input_words_per_group + word]
+                  : 0;
+        }
+      }
+      __syncthreads();
+
+      const int64_t meta =
+          (share_output_lut ? shared_meta_base : meta_base) + group;
       if constexpr (GroupwiseScale) {
         if constexpr (Bits == 4) {
           if ((threadIdx.x & 31) == 0) {
@@ -490,24 +524,55 @@ __global__ void cubic_w4_w8_grouped_a8_gemv_kernel(
           }
         }
       }
-      const float a = valid_output ? __half2float(cubic_a[meta]) : 0.0f;
-      const float b = valid_output ? __half2float(cubic_b[meta]) : 0.0f;
-      const float c = 1.0f - a - b;
-      for (int level = lane; level < levels; level += ThreadsPerOutput) {
-        const float t = static_cast<float>(level) / (levels - 1);
-        const float normalized = t * (a + t * (b + t * c));
-        const int8_t carrier =
-            static_cast<int8_t>(__float2int_rn(normalized * 127.0f));
-        carrier_lut[output_in_block * lut_entries + level] = carrier;
-        if constexpr (use_full_signed_lut) {
-          if (level == 0)
-            carrier_lut[output_in_block * lut_entries + levels] = 0;
-          else
-            carrier_lut[output_in_block * lut_entries + (1 << Bits) - level] =
-                -carrier;
+      if (share_output_lut) {
+        const int level = threadIdx.x;
+        if (level < levels) {
+          const float a = __half2float(cubic_a[meta]);
+          const float b = __half2float(cubic_b[meta]);
+          const float t = static_cast<float>(level) / (levels - 1);
+          const float normalized = t * (a + t * (b + t * (1.0f - a - b)));
+          const int8_t carrier =
+              static_cast<int8_t>(__float2int_rn(normalized * 127.0f));
+          carrier_lut[level] = carrier;
+          if constexpr (use_full_signed_lut) {
+            if (level == 0)
+              carrier_lut[levels] = 0;
+            else
+              carrier_lut[(1 << Bits) - level] = -carrier;
+          }
         }
+        __syncthreads();
+        if constexpr (UsePairLut) {
+          for (int pair = threadIdx.x; pair < 256; pair += kThreads) {
+            const unsigned low =
+                static_cast<unsigned>(carrier_lut[pair & 0xf]) & 0xff;
+            const unsigned high =
+                static_cast<unsigned>(carrier_lut[pair >> 4]) & 0xff;
+            carrier_pair_lut[pair] =
+                static_cast<uint16_t>(low | (high << 8));
+          }
+          __syncthreads();
+        }
+      } else {
+        const float a = valid_output ? __half2float(cubic_a[meta]) : 0.0f;
+        const float b = valid_output ? __half2float(cubic_b[meta]) : 0.0f;
+        const float c = 1.0f - a - b;
+        for (int level = lane; level < levels; level += ThreadsPerOutput) {
+          const float t = static_cast<float>(level) / (levels - 1);
+          const float normalized = t * (a + t * (b + t * c));
+          const int8_t carrier =
+              static_cast<int8_t>(__float2int_rn(normalized * 127.0f));
+          carrier_lut[output_in_block * lut_entries + level] = carrier;
+          if constexpr (use_full_signed_lut) {
+            if (level == 0)
+              carrier_lut[output_in_block * lut_entries + levels] = 0;
+            else
+              carrier_lut[output_in_block * lut_entries + (1 << Bits) - level] =
+                  -carrier;
+          }
+        }
+        __syncwarp();
       }
-      __syncwarp();
 
       int dots[routes_per_block] = {};
 #pragma unroll
@@ -515,50 +580,98 @@ __global__ void cubic_w4_w8_grouped_a8_gemv_kernel(
            ++block_index) {
         const int code_block = lane + block_index * ThreadsPerOutput;
         unsigned packed_words[Bits];
+        if constexpr (Bits == 4) {
+          const uint4 packed =
+              valid_output
+                  ? cubic_ldcs_u32x4(reinterpret_cast<const uint4*>(
+                        weight_words + group * words_per_group +
+                        code_block * Bits))
+                  : make_uint4(0, 0, 0, 0);
+          packed_words[0] = packed.x;
+          packed_words[1] = packed.y;
+          packed_words[2] = packed.z;
+          packed_words[3] = packed.w;
+        } else if constexpr (Bits == 8) {
+          const int* source =
+              weight_words + group * words_per_group + code_block * Bits;
+          const uint4 packed0 =
+              valid_output
+                  ? cubic_ldcs_u32x4(reinterpret_cast<const uint4*>(source))
+                  : make_uint4(0, 0, 0, 0);
+          const uint4 packed1 =
+              valid_output
+                  ? cubic_ldcs_u32x4(reinterpret_cast<const uint4*>(source + 4))
+                  : make_uint4(0, 0, 0, 0);
+          packed_words[0] = packed0.x;
+          packed_words[1] = packed0.y;
+          packed_words[2] = packed0.z;
+          packed_words[3] = packed0.w;
+          packed_words[4] = packed1.x;
+          packed_words[5] = packed1.y;
+          packed_words[6] = packed1.z;
+          packed_words[7] = packed1.w;
+        } else {
 #pragma unroll
-        for (int word_index = 0; word_index < Bits; ++word_index) {
-          packed_words[word_index] =
-              valid_output ? weight_words[group * words_per_group +
-                                          code_block * Bits + word_index]
-                           : 0;
+          for (int word_index = 0; word_index < Bits; ++word_index) {
+            packed_words[word_index] =
+                valid_output
+                    ? __ldcs(weight_words + group * words_per_group +
+                             code_block * Bits + word_index)
+                    : 0;
+          }
         }
 #pragma unroll
         for (int quad = 0; quad < 8; ++quad) {
           unsigned carrier_word = 0;
+          if constexpr (UsePairLut) {
+            const int shift = (quad & 1) * 16;
+            const unsigned raw = (packed_words[quad >> 1] >> shift) & 0xffff;
+            carrier_word =
+                static_cast<unsigned>(carrier_pair_lut[raw & 0xff]) |
+                (static_cast<unsigned>(carrier_pair_lut[raw >> 8]) << 16);
+          } else {
 #pragma unroll
-          for (int code_in_quad = 0; code_in_quad < 4; ++code_in_quad) {
-            constexpr unsigned code_mask = (1u << Bits) - 1;
-            const int bit = (quad * 4 + code_in_quad) * Bits;
-            const int word_index = bit >> 5;
-            const int shift = bit & 31;
-            unsigned raw = packed_words[word_index] >> shift;
-            if constexpr (Bits > 4) {
-              if (shift + Bits > 32)
-                raw |= packed_words[word_index + 1] << (32 - shift);
+            for (int code_in_quad = 0; code_in_quad < 4; ++code_in_quad) {
+              constexpr unsigned code_mask = (1u << Bits) - 1;
+              const int bit = (quad * 4 + code_in_quad) * Bits;
+              const int word_index = bit >> 5;
+              const int shift = bit & 31;
+              unsigned raw = packed_words[word_index] >> shift;
+              if constexpr (Bits > 4) {
+                if (shift + Bits > 32)
+                  raw |= packed_words[word_index + 1] << (32 - shift);
+              }
+              raw &= code_mask;
+              int carrier;
+              if constexpr (use_full_signed_lut) {
+                carrier = carrier_lut[(share_output_lut
+                                           ? 0
+                                           : output_in_block * lut_entries) +
+                                      raw];
+              } else {
+                constexpr int sign_bit = 1 << (Bits - 1);
+                int signed_code = raw >= sign_bit
+                                      ? static_cast<int>(raw) - (1 << Bits)
+                                      : static_cast<int>(raw);
+                if (signed_code == -sign_bit) signed_code = 0;
+                const int magnitude = abs(signed_code);
+                carrier = carrier_lut[(share_output_lut
+                                           ? 0
+                                           : output_in_block * levels) +
+                                      magnitude];
+                if (signed_code < 0) carrier = -carrier;
+              }
+              carrier_word |= (static_cast<unsigned>(carrier) & 0xff)
+                              << (code_in_quad * 8);
             }
-            raw &= code_mask;
-            int carrier;
-            if constexpr (use_full_signed_lut) {
-              carrier = carrier_lut[output_in_block * lut_entries + raw];
-            } else {
-              constexpr int sign_bit = 1 << (Bits - 1);
-              int signed_code = raw >= sign_bit
-                                    ? static_cast<int>(raw) - (1 << Bits)
-                                    : static_cast<int>(raw);
-              if (signed_code == -sign_bit) signed_code = 0;
-              const int magnitude = abs(signed_code);
-              carrier = carrier_lut[output_in_block * levels + magnitude];
-              if (signed_code < 0) carrier = -carrier;
-            }
-            carrier_word |= (static_cast<unsigned>(carrier) & 0xff)
-                            << (code_in_quad * 8);
           }
-          const int input_index =
-              group * input_words_per_group + code_block * 8 + quad;
+          const int input_index = code_block * 8 + quad;
 #pragma unroll
           for (int route = 0; route < routes_per_block; ++route) {
             dots[route] = cubic_dp4a_w4_w8(
-                carrier_word, input_rows[route][input_index], dots[route]);
+                carrier_word,
+                shared_inputs[route * input_words_per_group + input_index],
+                dots[route]);
           }
         }
       }
@@ -578,7 +691,7 @@ __global__ void cubic_w4_w8_grouped_a8_gemv_kernel(
                                  (1.0f / 127.0f);
         }
       }
-      __syncwarp();
+      __syncthreads();
     }
     if (lane == 0 && valid_output) {
 #pragma unroll
@@ -649,14 +762,33 @@ void launch_cubic_w4_w8_grouped_a8(
   constexpr int outputs_per_block = 128 / ThreadsPerOutput;
   constexpr int levels = 1 << (Bits - 1);
   constexpr int lut_entries = Bits <= 6 ? (1 << Bits) : levels;
-  dim3 grid((n + outputs_per_block - 1) / outputs_per_block, route_ctas);
+  dim3 grid(route_ctas,
+            (n + outputs_per_block - 1) / outputs_per_block);
+  if constexpr (Bits == 4) {
+    const bool share_output_lut =
+        group_out >= outputs_per_block && group_out % outputs_per_block == 0;
+    if (share_output_lut) {
+      cubic_w4_w8_grouped_a8_gemv_kernel<Bits, GroupSize, ThreadsPerOutput,
+                                         RoutesPerBlock, GroupwiseScale, false>
+          <<<grid, 128,
+             outputs_per_block * lut_entries + RoutesPerBlock * GroupSize,
+             stream>>>(
+              input, input_scale, weight, weight_scale, cubic_a, cubic_b,
+              output, topk_weights, token_ids, expert_ids, num_routes,
+              num_valid_tokens, n, k, num_groups, packed_k, group_out, top_k,
+              route_ctas, multiply_routed_weight);
+      return;
+    }
+  }
   cubic_w4_w8_grouped_a8_gemv_kernel<Bits, GroupSize, ThreadsPerOutput,
-                                     RoutesPerBlock, GroupwiseScale>
-      <<<grid, 128, outputs_per_block * lut_entries, stream>>>(
+                                     RoutesPerBlock, GroupwiseScale, false>
+      <<<grid, 128,
+         outputs_per_block * lut_entries + RoutesPerBlock * GroupSize,
+         stream>>>(
           input, input_scale, weight, weight_scale, cubic_a, cubic_b, output,
-          topk_weights, token_ids, expert_ids, num_routes, num_valid_tokens, n,
-          k, num_groups, packed_k, group_out, top_k, route_ctas,
-          multiply_routed_weight);
+          topk_weights, token_ids, expert_ids, num_routes,
+          num_valid_tokens, n, k, num_groups, packed_k, group_out, top_k,
+          route_ctas, multiply_routed_weight);
 }
 
 
@@ -716,7 +848,7 @@ void cubic_w4_w8_a8_gemv_impl(
       input_scale.numel() ==
           input.size(0) * static_cast<int64_t>(groupwise_scale ? groups : 1),
       "cubic_w4_w8_a8_gemv: invalid input scale shape");
-  const int desired_subgroup = group_size == 128 || k <= 4096 ? 4 : 8;
+  const int desired_subgroup = group_size == 128 ? 4 : 8;
   const auto stream = get_current_cuda_stream(input.get_device_index());
 
 #define CUBIC_ARGS                                                            \
@@ -764,13 +896,13 @@ void cubic_w4_w8_a8_gemv_impl(
             CUBIC_GROUPED_ARGS);                             \
     } else if (routes_per_block == 2) {                      \
       if constexpr (G == 128)                                \
-        launch_cubic_w4_w8_grouped2_a8<B, G, 4, GROUPWISE>(  \
+        launch_cubic_w4_w8_grouped_a8<B, G, 4, 2, GROUPWISE>(\
             CUBIC_GROUPED_ARGS);                             \
       else if (desired_subgroup == 4)                        \
-        launch_cubic_w4_w8_grouped2_a8<B, G, 4, GROUPWISE>(  \
+        launch_cubic_w4_w8_grouped_a8<B, G, 4, 2, GROUPWISE>(\
             CUBIC_GROUPED_ARGS);                             \
       else                                                   \
-        launch_cubic_w4_w8_grouped2_a8<B, G, 8, GROUPWISE>(  \
+        launch_cubic_w4_w8_grouped_a8<B, G, 8, 2, GROUPWISE>(\
             CUBIC_GROUPED_ARGS);                             \
     } else if constexpr (G == 128)                           \
       launch_cubic_w4_w8_a8<B, G, 4, GROUPWISE>(CUBIC_ARGS); \
