@@ -460,6 +460,30 @@ def _get_vLLM_output(
     return outs, vllm_model
 
 
+def test_gdn_apc_single_token_prompt_is_stable(vllm_runner) -> None:
+    model = "tiny-random/qwen3-next-moe"
+    with vllm_runner(
+        model,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+        max_model_len=128,
+        max_num_seqs=1,
+        attention_backend=ATTN_BACKEND,
+    ) as runner:
+        outputs = [
+            runner.generate_greedy_logprobs(["hi"], max_tokens=8, num_logprobs=1)
+            for _ in range(3)
+        ]
+
+    for repetition, output in enumerate(outputs[1:], start=2):
+        check_logprobs_close(
+            outputs_0_lst=outputs[0],
+            outputs_1_lst=output,
+            name_0="first_request",
+            name_1=f"request_{repetition}",
+        )
+
+
 @pytest.mark.parametrize("model", [HYBRID_MODELS[0]])
 @pytest.mark.parametrize("max_tokens", [64])
 @pytest.mark.parametrize("n_repetitions", [2])

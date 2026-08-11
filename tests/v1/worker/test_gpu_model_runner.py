@@ -1531,6 +1531,15 @@ def test_is_uniform_decode() -> None:
         num_tokens=16,
         num_reqs=15,
     )
+    # A fresh prefill can have the same shape as a uniform decode but may
+    # require different stateful-attention metadata.
+    assert not GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=1,
+        uniform_decode_query_len=1,
+        num_tokens=16,
+        num_reqs=16,
+        has_fresh_prefill=True,
+    )
     # Spec decoding
     assert GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=5,
@@ -1556,6 +1565,7 @@ def test_is_uniform_decode() -> None:
         uniform_decode_query_len=1,
         num_tokens=16,
         num_reqs=16,
+        has_fresh_prefill=True,
         force_uniform_decode=True,
     )
     assert GPUModelRunner._is_uniform_decode(

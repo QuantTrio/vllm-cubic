@@ -3962,6 +3962,7 @@ class GPUModelRunner(
         uniform_decode_query_len: int,
         num_tokens: int,
         num_reqs: int,
+        has_fresh_prefill: bool = False,
         force_uniform_decode: bool | None = None,
     ) -> bool:
         """
@@ -3972,6 +3973,7 @@ class GPUModelRunner(
             (
                 (max_num_scheduled_tokens == uniform_decode_query_len)
                 and (num_tokens == max_num_scheduled_tokens * num_reqs)
+                and not has_fresh_prefill
             )
             if force_uniform_decode is None
             else force_uniform_decode
@@ -4044,11 +4046,16 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        num_computed_tokens = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        num_prompt_tokens = self.input_batch.num_prompt_tokens[:num_reqs]
+        is_prefilling = num_computed_tokens < num_prompt_tokens
+        has_fresh_prefill = bool(np.any(is_prefilling & (num_computed_tokens == 0)))
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
+            has_fresh_prefill=has_fresh_prefill,
             force_uniform_decode=force_uniform_decode,
         )
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output

@@ -210,7 +210,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         if spec_sequence_masks is None:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-                split_decodes_and_prefills(m, decode_threshold=1)
+                split_decodes_and_prefills(
+                    m,
+                    decode_threshold=1,
+                    treat_short_extends_as_decodes=False,
+                )
             )
             num_spec_decode_tokens = 0
             spec_token_indx = None

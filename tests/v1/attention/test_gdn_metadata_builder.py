@@ -39,9 +39,35 @@ class GDNBuildTestCase:
     expected_num_prefills: int
     expected_num_prefill_tokens: int
     expected_num_spec_decodes: int
+    is_prefilling: list[bool] | None = None
 
 
 GDN_BUILD_TEST_CASES = {
+    # A one-token request with no computed context is a prefill, not a decode.
+    "single_token_fresh_prefill": GDNBuildTestCase(
+        seq_lens=[1],
+        query_lens=[1],
+        num_decode_draft_tokens=None,
+        num_speculative_tokens=0,
+        expected_num_decodes=0,
+        expected_num_prefills=1,
+        expected_num_prefill_tokens=1,
+        expected_num_spec_decodes=0,
+        is_prefilling=[True],
+    ),
+    # Preserve the decode-first ordering while keeping a fresh one-token row
+    # on the prefill path.
+    "decode_then_single_token_fresh_prefill": GDNBuildTestCase(
+        seq_lens=[40, 1],
+        query_lens=[1, 1],
+        num_decode_draft_tokens=None,
+        num_speculative_tokens=0,
+        expected_num_decodes=1,
+        expected_num_prefills=1,
+        expected_num_prefill_tokens=1,
+        expected_num_spec_decodes=0,
+        is_prefilling=[False, True],
+    ),
     # The original #34845 crash: non-spec query_len=1 + spec decode
     "mixed_decode_and_spec_decode": GDNBuildTestCase(
         seq_lens=[65, 20],
@@ -155,9 +181,15 @@ def _build(
     builder: GDNAttentionMetadataBuilder,
     batch_spec: BatchSpec,
     num_decode_draft_tokens: list[int] | None = None,
+    is_prefilling: list[bool] | None = None,
 ) -> GDNAttentionMetadata:
     """Build GDN attention metadata, optionally with spec-decode kwargs."""
     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
+    if is_prefilling is None:
+        is_prefilling = [query_len > 1 for query_len in batch_spec.query_lens]
+    common = common.replace(
+        is_prefilling=torch.tensor(is_prefilling, dtype=torch.bool, device=DEVICE)
+    )
     kwargs: dict = {}
     if num_decode_draft_tokens is not None:
         kwargs["num_decode_draft_tokens_cpu"] = torch.tensor(
@@ -176,7 +208,12 @@ def test_gdn_build_classification(test_case: GDNBuildTestCase):
     """Test that GDN metadata builder classifies requests correctly."""
     builder = _create_gdn_builder(test_case.num_speculative_tokens)
     batch = BatchSpec(seq_lens=test_case.seq_lens, query_lens=test_case.query_lens)
-    meta = _build(builder, batch, test_case.num_decode_draft_tokens)
+    meta = _build(
+        builder,
+        batch,
+        test_case.num_decode_draft_tokens,
+        test_case.is_prefilling,
+    )
 
     assert meta.num_decodes == test_case.expected_num_decodes
     assert meta.num_prefills == test_case.expected_num_prefills
