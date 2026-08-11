@@ -30,6 +30,33 @@ endif()
 FetchContent_MakeAvailable(flashmla)
 message(STATUS "FlashMLA is available at ${flashmla_SOURCE_DIR}")
 
+# Extend the pinned FlashMLA source with query-protected compressed-cache
+# kernels. Refuse to configure if the dependency changes incompatibly instead
+# of silently falling back to a slower implementation.
+set(FLASHMLA_COMPRESSED_MLA_PATCH
+    "${CMAKE_SOURCE_DIR}/cmake/patches/flashmla_compressed_mla_q16.patch")
+execute_process(
+  COMMAND git apply --reverse --check "${FLASHMLA_COMPRESSED_MLA_PATCH}"
+  WORKING_DIRECTORY "${flashmla_SOURCE_DIR}"
+  RESULT_VARIABLE FLASHMLA_COMPRESSED_MLA_ALREADY_APPLIED
+  OUTPUT_QUIET ERROR_QUIET)
+if(NOT FLASHMLA_COMPRESSED_MLA_ALREADY_APPLIED EQUAL 0)
+  execute_process(
+    COMMAND git apply --check "${FLASHMLA_COMPRESSED_MLA_PATCH}"
+    WORKING_DIRECTORY "${flashmla_SOURCE_DIR}"
+    RESULT_VARIABLE FLASHMLA_COMPRESSED_MLA_PATCH_CHECK
+    ERROR_VARIABLE FLASHMLA_COMPRESSED_MLA_PATCH_ERROR)
+  if(NOT FLASHMLA_COMPRESSED_MLA_PATCH_CHECK EQUAL 0)
+    message(FATAL_ERROR
+      "Cannot apply FlashMLA compressed MLA patch: "
+      "${FLASHMLA_COMPRESSED_MLA_PATCH_ERROR}")
+  endif()
+  execute_process(
+    COMMAND git apply "${FLASHMLA_COMPRESSED_MLA_PATCH}"
+    WORKING_DIRECTORY "${flashmla_SOURCE_DIR}"
+    COMMAND_ERROR_IS_FATAL ANY)
+endif()
+
 # Vendor FlashMLA interface into vLLM with torch-ops shim.
 set(FLASHMLA_VENDOR_DIR "${CMAKE_SOURCE_DIR}/vllm/third_party/flashmla")
 file(MAKE_DIRECTORY "${FLASHMLA_VENDOR_DIR}")

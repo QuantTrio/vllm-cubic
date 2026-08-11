@@ -34,15 +34,19 @@ def _is_flashmla_available() -> tuple[bool, str | None]:
     if not _flashmla_C_AVAILABLE:
         return (
             False,
-            "vllm._flashmla_C is not available, likely was not "
-            "compiled due to insufficient nvcc version or a supported arch "
-            "was not in the list of target arches to compile for.",
+            (
+                "vllm._flashmla_C is not available, likely was not "
+                "compiled due to insufficient nvcc version or a supported arch "
+                "was not in the list of target arches to compile for."
+            ),
         )
     if not _flashmla_extension_C_AVAILABLE:
         return (
             False,
-            "vllm._flashmla_extension_C is not available, likely "
-            "was not compiled due to a build error.",
+            (
+                "vllm._flashmla_extension_C is not available, likely "
+                "was not compiled due to a build error."
+            ),
         )
 
     return True, None
@@ -149,5 +153,67 @@ def flash_mla_with_kvcache_fp8(
         num_splits,
         descale_q,
         descale_k,
+    )
+    return out, softmax_lse
+
+
+def flash_mla_with_kvcache_fp8_q16(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    head_dim_v: int,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    descale_k: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run FlashMLA with a model-dtype query and tensor-scaled FP8 cache."""
+    if not _is_flashmla_available()[0]:
+        _raise_flashmla_unavailable()
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    out, softmax_lse = torch.ops._flashmla_extension_C.fwd_kvcache_mla_fp8_q16(
+        q,
+        k_cache,
+        head_dim_v,
+        cache_seqlens,
+        block_table,
+        softmax_scale,
+        causal,
+        tile_scheduler_metadata,
+        num_splits,
+        descale_k,
+    )
+    return out, softmax_lse
+
+
+def flash_mla_with_kvcache_cubic8(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    head_dim_v: int,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run FlashMLA with a model-dtype query and Cubic8 cache."""
+    if not _is_flashmla_available()[0]:
+        _raise_flashmla_unavailable()
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    out, softmax_lse = torch.ops._flashmla_extension_C.fwd_kvcache_mla_cubic8(
+        q,
+        k_cache,
+        head_dim_v,
+        cache_seqlens,
+        block_table,
+        softmax_scale,
+        causal,
+        tile_scheduler_metadata,
+        num_splits,
     )
     return out, softmax_lse

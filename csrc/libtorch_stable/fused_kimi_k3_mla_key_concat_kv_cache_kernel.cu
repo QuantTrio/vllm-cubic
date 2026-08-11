@@ -316,7 +316,7 @@ __device__ __forceinline__ void writeDsMlaCache(
 // ────────────────────────────────────────────────────────────────────────────
 // bf16 variant: optional q RoPE + full-key concat + latent cache insert
 // ────────────────────────────────────────────────────────────────────────────
-template <typename scalar_t, bool APPLY_ROPE>
+template <typename scalar_t, bool KV_FP8, bool APPLY_ROPE>
 __global__ void fusedKimiK3MLAKeyConcatKVCacheInsertKernel(
     scalar_t* __restrict__ q, int64_t const q_tok_stride,
     int64_t const q_head_stride, const scalar_t* __restrict__ k_nope,
@@ -324,9 +324,10 @@ __global__ void fusedKimiK3MLAKeyConcatKVCacheInsertKernel(
     const scalar_t* __restrict__ k_pe, int64_t const k_pe_tok_stride,
     const scalar_t* __restrict__ kv_c, int64_t const kv_c_tok_stride,
     scalar_t* __restrict__ k_out, int64_t const ko_tok_stride,
-    int64_t const ko_head_stride, scalar_t* __restrict__ k_cache,
+    int64_t const ko_head_stride, void* __restrict__ k_cache,
     int64_t const cache_block_stride, int64_t const cache_token_stride,
     const int64_t* __restrict__ slot_mapping,
+    const float* __restrict__ cache_scale_inv,
     const int64_t* __restrict__ position_ids,
     const float* __restrict__ cos_sin_cache, int const num_tokens,
     int const num_heads, int const cache_block_size) {
@@ -359,12 +360,15 @@ __global__ void fusedKimiK3MLAKeyConcatKVCacheInsertKernel(
   } else {
     int64_t const slot_id = slot_mapping[tokenIdx];
     if (slot_id >= 0) {
-      scalar_t* row = k_cache +
-                      (slot_id / cache_block_size) * cache_block_stride +
-                      (slot_id % cache_block_size) * cache_token_stride;
-      writeLatent576<scalar_t, false, APPLY_ROPE>(
+      constexpr int kCacheElem = KV_FP8 ? 1 : sizeof(scalar_t);
+      auto* row = reinterpret_cast<uint8_t*>(k_cache) +
+                  ((slot_id / cache_block_size) * cache_block_stride +
+                   (slot_id % cache_block_size) * cache_token_stride) *
+                      kCacheElem;
+      float const scale_inv = KV_FP8 ? __ldg(cache_scale_inv) : 1.0f;
+      writeLatent576<scalar_t, KV_FP8, APPLY_ROPE>(
           row, kv_c + tokenIdx * kv_c_tok_stride,
-          k_pe + tokenIdx * k_pe_tok_stride, laneId, sizeof(scalar_t), 1.0f,
+          k_pe + tokenIdx * k_pe_tok_stride, laneId, kCacheElem, scale_inv,
           rope_cache);
     }
   }
@@ -800,10 +804,9 @@ void fused_kimi_k3_mla_key_concat_kv_cache_insert(
               reinterpret_cast<scalar_t const*>(kv_c_normed.const_data_ptr()),
               kv_c_normed.stride(0),
               reinterpret_cast<scalar_t*>(k_out.mutable_data_ptr()),
-              k_out.stride(0), k_out.stride(1),
-              reinterpret_cast<scalar_t*>(k_cache.mutable_data_ptr()),
+              k_out.stride(0), k_out.stride(1), k_cache.mutable_data_ptr(),
               k_cache.stride(0), k_cache.stride(1),
-              slot_mapping.const_data_ptr<int64_t>(),
+              slot_mapping.const_data_ptr<int64_t>(), nullptr,
               apply_rope ? position_ids.value().const_data_ptr<int64_t>()
                          : nullptr,
               apply_rope ? reinterpret_cast<float const*>(
@@ -812,11 +815,108 @@ void fused_kimi_k3_mla_key_concat_kv_cache_insert(
               num_tokens, num_heads, static_cast<int>(cache_block_size));
         };
         if (apply_rope) {
-          launch(
-              kk3::fusedKimiK3MLAKeyConcatKVCacheInsertKernel<scalar_t, true>);
+          launch(kk3::fusedKimiK3MLAKeyConcatKVCacheInsertKernel<scalar_t,
+                                                                 false, true>);
         } else {
-          launch(
-              kk3::fusedKimiK3MLAKeyConcatKVCacheInsertKernel<scalar_t, false>);
+          launch(kk3::fusedKimiK3MLAKeyConcatKVCacheInsertKernel<scalar_t,
+                                                                 false, false>);
+        }
+      });
+}
+
+void fused_kimi_k3_mla_key_concat_kv_cache_fp8_q16_insert(
+    torch::stable::Tensor& q,                   // [Tp, H, 192] bf16
+    torch::stable::Tensor const& k_nope,        // [Tp, H, 128] bf16
+    torch::stable::Tensor const& k_pe,          // [Tp, 64] bf16
+    torch::stable::Tensor const& kv_c_normed,   // [Tp, 512] bf16
+    torch::stable::Tensor& k_out,               // [Tp, H, 192] bf16, written
+    torch::stable::Tensor& k_cache,             // [nblk, bs, 576] fp8, written
+    torch::stable::Tensor const& slot_mapping,  // [Tp] int64
+    torch::stable::Tensor const& cache_scale_inv, int64_t cache_block_size,
+    std::optional<torch::stable::Tensor> position_ids,
+    std::optional<torch::stable::Tensor> cos_sin_cache) {
+  using torch::headeronly::ScalarType;
+  namespace kk3 = vllm::kimi_k3_fused_ops;
+  ScalarType const dt = k_nope.scalar_type();
+  STD_TORCH_CHECK(
+      k_nope.device().is_cuda() && k_nope.dim() == 3 && k_nope.size(2) == 128,
+      "k_nope shape [Tp, H, 128] CUDA");
+  STD_TORCH_CHECK(q.device().is_cuda() && q.scalar_type() == dt &&
+                      q.dim() == 3 && q.size(2) == 192,
+                  "q shape [Tp, H, 192]");
+  STD_TORCH_CHECK(k_pe.device().is_cuda() && k_pe.dim() == 2 &&
+                      k_pe.stride(1) == 1 && k_pe.scalar_type() == dt &&
+                      k_pe.size(1) == 64,
+                  "k_pe shape [Tp, 64], unit last-dim stride");
+  STD_TORCH_CHECK(kv_c_normed.device().is_cuda() &&
+                      kv_c_normed.is_contiguous() &&
+                      kv_c_normed.scalar_type() == dt &&
+                      kv_c_normed.dim() == 2 && kv_c_normed.size(1) == 512,
+                  "kv_c_normed shape [Tp, 512] contiguous");
+  STD_TORCH_CHECK(k_out.device().is_cuda() && k_out.is_contiguous() &&
+                      k_out.scalar_type() == dt && k_out.dim() == 3 &&
+                      k_out.size(2) == 192,
+                  "k_out shape [Tp, H, 192] contiguous");
+  STD_TORCH_CHECK(k_cache.device().is_cuda() && k_cache.dim() == 3 &&
+                      k_cache.size(1) == cache_block_size &&
+                      k_cache.size(2) == 576 && k_cache.stride(2) == 1 &&
+                      k_cache.scalar_type() == ScalarType::Float8_e4m3fn,
+                  "k_cache shape [nblk, block_size, 576] fp8 contiguous");
+  STD_TORCH_CHECK(slot_mapping.device().is_cuda() &&
+                      slot_mapping.scalar_type() == ScalarType::Long,
+                  "slot_mapping must be int64 CUDA");
+  STD_TORCH_CHECK(cache_scale_inv.device().is_cuda() &&
+                      cache_scale_inv.scalar_type() == ScalarType::Float &&
+                      cache_scale_inv.numel() == 1,
+                  "cache_scale_inv must be scalar float32 CUDA");
+  kk3::checkBfloat16Support(dt);
+
+  int const num_tokens = static_cast<int>(k_nope.size(0));
+  int const num_heads = static_cast<int>(k_nope.size(1));
+  STD_TORCH_CHECK(static_cast<int>(k_out.size(1)) == num_heads,
+                  "k_out head count must match k_nope");
+  STD_TORCH_CHECK(q.size(0) == num_tokens && q.size(1) == num_heads,
+                  "q token/head dimensions must match k_nope");
+  bool const apply_rope =
+      check_rope_inputs(position_ids, cos_sin_cache, q, num_tokens);
+  if (num_tokens == 0) return;
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      k_nope.get_device_index());
+  const cudaStream_t stream =
+      get_current_cuda_stream(k_nope.get_device_index());
+
+  VLLM_STABLE_DISPATCH_HALF_TYPES(
+      dt, "fused_kimi_k3_mla_key_concat_kv_cache_fp8_q16_insert", [&] {
+        auto launch = [&](auto kernel) {
+          kk3::launchPdl(
+              kernel, num_tokens, num_heads, stream,
+              reinterpret_cast<scalar_t*>(q.mutable_data_ptr()), q.stride(0),
+              q.stride(1),
+              reinterpret_cast<scalar_t const*>(k_nope.const_data_ptr()),
+              k_nope.stride(0), k_nope.stride(1),
+              reinterpret_cast<scalar_t const*>(k_pe.const_data_ptr()),
+              k_pe.stride(0),
+              reinterpret_cast<scalar_t const*>(kv_c_normed.const_data_ptr()),
+              kv_c_normed.stride(0),
+              reinterpret_cast<scalar_t*>(k_out.mutable_data_ptr()),
+              k_out.stride(0), k_out.stride(1), k_cache.mutable_data_ptr(),
+              k_cache.stride(0), k_cache.stride(1),
+              slot_mapping.const_data_ptr<int64_t>(),
+              reinterpret_cast<float const*>(cache_scale_inv.const_data_ptr()),
+              apply_rope ? position_ids.value().const_data_ptr<int64_t>()
+                         : nullptr,
+              apply_rope ? reinterpret_cast<float const*>(
+                               cos_sin_cache.value().const_data_ptr())
+                         : nullptr,
+              num_tokens, num_heads, static_cast<int>(cache_block_size));
+        };
+        if (apply_rope) {
+          launch(kk3::fusedKimiK3MLAKeyConcatKVCacheInsertKernel<scalar_t, true,
+                                                                 true>);
+        } else {
+          launch(kk3::fusedKimiK3MLAKeyConcatKVCacheInsertKernel<scalar_t, true,
+                                                                 false>);
         }
       });
 }
@@ -1206,6 +1306,77 @@ void fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_insert(
                                                                true, true>);
         } else {
           launch(kk3::fusedKimiK3MLADecodeQConcatKVCacheKernel<scalar_t, true,
+                                                               true, false>);
+        }
+      });
+}
+
+void fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_q16_insert(
+    torch::stable::Tensor const& ql_nope,       // [B, H, 512] bf16
+    torch::stable::Tensor const& q_pe,          // [B, H, 64] bf16
+    torch::stable::Tensor const& kv_c_normed,   // [B, 512] bf16
+    torch::stable::Tensor const& k_pe,          // [B, 64] bf16
+    torch::stable::Tensor& mqa_q,               // [B, H, 576] bf16, written
+    torch::stable::Tensor& k_cache,             // [nblk, bs, 576] fp8, written
+    torch::stable::Tensor const& slot_mapping,  // [B] int64
+    torch::stable::Tensor const& cache_scale_inv, int64_t cache_block_size,
+    std::optional<torch::stable::Tensor> position_ids,
+    std::optional<torch::stable::Tensor> cos_sin_cache) {
+  using torch::headeronly::ScalarType;
+  namespace kk3 = vllm::kimi_k3_fused_ops;
+  ScalarType const dt = ql_nope.scalar_type();
+  check_decode_inputs(ql_nope, q_pe, kv_c_normed, k_pe, mqa_q, slot_mapping);
+  STD_TORCH_CHECK(mqa_q.scalar_type() == dt,
+                  "mqa_q must match ql_nope dtype (bf16/fp16)");
+  STD_TORCH_CHECK(k_cache.device().is_cuda() && k_cache.dim() == 3 &&
+                      k_cache.size(1) == cache_block_size &&
+                      k_cache.size(2) == 576 && k_cache.stride(2) == 1 &&
+                      k_cache.scalar_type() == ScalarType::Float8_e4m3fn,
+                  "k_cache shape [nblk, block_size, 576] fp8 contiguous");
+  STD_TORCH_CHECK(cache_scale_inv.device().is_cuda() &&
+                      cache_scale_inv.scalar_type() == ScalarType::Float &&
+                      cache_scale_inv.numel() == 1,
+                  "cache_scale_inv must be scalar float32 CUDA");
+  kk3::checkBfloat16Support(dt);
+
+  int const num_tokens = static_cast<int>(ql_nope.size(0));
+  int const num_heads = static_cast<int>(ql_nope.size(1));
+  bool const apply_rope =
+      check_rope_inputs(position_ids, cos_sin_cache, q_pe, num_tokens);
+  if (num_tokens == 0) return;
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      ql_nope.get_device_index());
+  const cudaStream_t stream =
+      get_current_cuda_stream(ql_nope.get_device_index());
+
+  VLLM_STABLE_DISPATCH_HALF_TYPES(
+      dt, "fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_q16_insert", [&] {
+        auto launch = [&](auto kernel) {
+          kk3::launchPdl(
+              kernel, num_tokens, num_heads, stream,
+              reinterpret_cast<scalar_t const*>(ql_nope.const_data_ptr()),
+              ql_nope.stride(0), ql_nope.stride(1),
+              reinterpret_cast<scalar_t const*>(q_pe.const_data_ptr()),
+              q_pe.stride(0), q_pe.stride(1),
+              reinterpret_cast<scalar_t const*>(kv_c_normed.const_data_ptr()),
+              kv_c_normed.stride(0),
+              reinterpret_cast<scalar_t const*>(k_pe.const_data_ptr()),
+              k_pe.stride(0), mqa_q.mutable_data_ptr(), mqa_q.stride(0),
+              mqa_q.stride(1), k_cache.mutable_data_ptr(), k_cache.stride(0),
+              k_cache.stride(1), slot_mapping.const_data_ptr<int64_t>(),
+              nullptr, cache_scale_inv.const_data_ptr<float>(), num_tokens,
+              num_heads, static_cast<int>(cache_block_size),
+              apply_rope ? position_ids.value().const_data_ptr<int64_t>()
+                         : nullptr,
+              apply_rope ? reinterpret_cast<float const*>(
+                               cos_sin_cache.value().const_data_ptr())
+                         : nullptr);
+        };
+        if (apply_rope) {
+          launch(kk3::fusedKimiK3MLADecodeQConcatKVCacheKernel<scalar_t, false,
+                                                               true, true>);
+        } else {
+          launch(kk3::fusedKimiK3MLADecodeQConcatKVCacheKernel<scalar_t, false,
                                                                true, false>);
         }
       });

@@ -60,6 +60,42 @@ def fused_mla_key_concat_kv_cache_insert(
     return k_out
 
 
+def fused_mla_key_concat_kv_cache_fp8_q16_insert(
+    q: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    cache_scale_inv: torch.Tensor,
+    positions: torch.Tensor | None = None,
+    cos_sin_cache: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Keep Q/K in model dtype while inserting the latent into an FP8 cache."""
+    k_pe = k_pe.reshape(k_pe.shape[0], -1)
+    tp, num_heads, qk_nope_head_dim = k_nope.shape
+    qk_head_dim = qk_nope_head_dim + k_pe.shape[1]
+    k_out = torch.empty(
+        (tp, num_heads, qk_head_dim), dtype=k_nope.dtype, device=k_nope.device
+    )
+    if tp == 0:
+        return k_out
+    torch.ops._C.fused_kimi_k3_mla_key_concat_kv_cache_fp8_q16_insert(
+        q,
+        k_nope,
+        k_pe,
+        kv_c_normed,
+        k_out,
+        kv_cache,
+        slot_mapping,
+        cache_scale_inv,
+        kv_cache.shape[1],
+        positions,
+        cos_sin_cache,
+    )
+    return k_out
+
+
 def fused_mla_key_concat_ds_mla_insert(
     q: torch.Tensor,  # [Tp, H, qk_head_dim], RoPE is applied in place
     k_nope: torch.Tensor,  # [Tp, H, qk_nope_head_dim]
@@ -223,6 +259,25 @@ def fused_mla_decode_q_concat_kv_cache_insert(
             cache,
             slot_mapping,
             q_scale_inv,
+            cache_scale_inv,
+            cache.shape[1],
+            positions,
+            cos_sin_cache,
+        )
+    elif cache_scale_inv is not None:
+        cache = (
+            kv_cache
+            if kv_cache.dtype == torch.float8_e4m3fn
+            else kv_cache.view(torch.float8_e4m3fn)
+        )
+        torch.ops._C.fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_q16_insert(
+            ql_nope,
+            q_pe,
+            kv_c_normed,
+            k_pe,
+            mqa_q,
+            cache,
+            slot_mapping,
             cache_scale_inv,
             cache.shape[1],
             positions,

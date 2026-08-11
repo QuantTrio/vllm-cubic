@@ -62,6 +62,7 @@ from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_decode_q_concat_kv_cache_insert,
     fused_mla_key_concat_ds_mla_insert,
+    fused_mla_key_concat_kv_cache_fp8_q16_insert,
     fused_mla_key_concat_kv_cache_insert,
     fused_mla_qkv_quant_kv_cache_fp8_insert,
 )
@@ -616,6 +617,21 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 positions=positions,
                 cos_sin_cache=cos_sin_cache,
             )
+        if self.kv_cache_dtype == "fp8_q16":
+            cache = self.kv_cache
+            if cache.dtype != torch.float8_e4m3fn:
+                cache = cache.view(torch.float8_e4m3fn)
+            return fused_mla_decode_q_concat_kv_cache_insert(
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                cache,
+                slot_mapping,
+                cache_scale_inv=self._k_scale_inv,
+                positions=positions,
+                cos_sin_cache=cos_sin_cache,
+            )
         if is_quantized_kv_cache(self.kv_cache_dtype):
             assert self.impl.supports_quant_query_input, (  # type: ignore[attr-defined]
                 "Kimi-K3 fp8 KV cache decode requires a backend that accepts an "
@@ -678,7 +694,25 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         )
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-        if self.kv_cache_dtype == "fp8_ds_mla":
+        if self.kv_cache_dtype == "fp8_q16":
+            assert not fp8_prefill, (
+                "Kimi-K3 fp8_q16 requires a model-dtype prefill query."
+            )
+            kv_cache = self.kv_cache
+            if kv_cache.dtype != torch.float8_e4m3fn:
+                kv_cache = kv_cache.view(torch.float8_e4m3fn)
+            k = fused_mla_key_concat_kv_cache_fp8_q16_insert(
+                q,
+                k_nope,
+                k_pe,
+                kv_c_normed,
+                kv_cache,
+                slot_mapping,
+                self._k_scale_inv,
+                positions,
+                cos_sin_cache,
+            )
+        elif self.kv_cache_dtype == "fp8_ds_mla":
             # fp8_ds_mla cache (656B, per-tile self-scaled); bf16 attention.
             assert not fp8_prefill, (
                 "Kimi-K3 fp8_ds_mla uses a bf16 prefill query; fp8 prefill "
@@ -752,9 +786,32 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         )
 
         if has_context:
-            context_output, context_lse = self.impl._compute_prefill_context(  # type: ignore[attr-defined]
-                q, self._attn_read_kv_cache(), attn_metadata, self._k_scale
+            compressed_context = getattr(
+                self.impl, "_forward_fp8_q16_prefill_context", None
             )
+            if self.kv_cache_dtype == "fp8_q16" and compressed_context is not None:
+                q_nope, q_pe = q.split(
+                    [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+                )
+                q_latent = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(
+                    0, 1
+                )
+                q_absorbed = torch.cat((q_latent, q_pe), dim=-1)
+                latent_output, context_lse = compressed_context(
+                    q_absorbed,
+                    self._attn_read_kv_cache(),
+                    prefill,
+                    self._k_scale,
+                )
+                projected_context = torch.empty_like(out)
+                self._v_up_proj(latent_output, out=projected_context)
+                context_output = projected_context.view(
+                    -1, self.num_local_heads, self.v_head_dim
+                )
+            else:
+                context_output, context_lse = self.impl._compute_prefill_context(  # type: ignore[attr-defined]
+                    q, self._attn_read_kv_cache(), attn_metadata, self._k_scale
+                )
             suffix_output, suffix_lse = output_prefill
             out = out.view(-1, self.num_local_heads, self.v_head_dim)
             merge_attn_states(

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import torch
 
@@ -18,6 +18,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
     QueryLenSupport,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import triton
 from vllm.utils.platform_utils import num_compute_units
@@ -35,7 +36,9 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.ops.flashmla import (
     FlashMLASchedMeta,
     flash_mla_with_kvcache,
+    flash_mla_with_kvcache_cubic8,
     flash_mla_with_kvcache_fp8,
+    flash_mla_with_kvcache_fp8_q16,
     get_mla_metadata,
     get_mla_metadata_dense_fp8,
     is_flashmla_dense_supported,
@@ -51,6 +54,7 @@ logger = init_logger(__name__)
 
 _MIN_WORK_PER_CACHE_ONLY_SPLIT = 512
 _CACHE_ONLY_SPLIT_OCCUPANCY_MULTIPLIER = 2
+_FP8_Q16_NATIVE_MAX_TOKEN_WORK = 32 * 1024
 
 
 def _compute_cache_only_num_kv_splits(max_seq_len: int, sm_count: int) -> int:
@@ -141,10 +145,7 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec) -> AttentionCGSupport:
-        if getattr(kv_cache_spec, "cache_dtype_str", None) in (
-            "fp8_q16",
-            "cubic8",
-        ):
+        if getattr(kv_cache_spec, "cache_dtype_str", None) == "cubic8":
             return AttentionCGSupport.NEVER
         return super().get_cudagraph_support(vllm_config, kv_cache_spec)
 
@@ -158,9 +159,10 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
         cache_dtype = getattr(kv_cache_spec, "cache_dtype_str", None)
         self.fp8_cache_only = cache_dtype == "fp8_q16"
         self.cubic8_cache = cache_dtype == "cubic8"
+        self.native_cubic8_cache = cache_dtype == "cubic8"
         if self.fp8_cache_only or self.cubic8_cache:
             self.reorder_batch_threshold = 1
-            self.query_len_support = QueryLenSupport.SINGLE_ONLY
+            cast(Any, self).query_len_support = QueryLenSupport.SINGLE_ONLY
 
         super().__init__(
             kv_cache_spec, layer_names, vllm_config, device, FlashMLAMetadata
@@ -175,11 +177,14 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
         self.is_fp8_kvcache = is_quantized_kv_cache(
             vllm_config.cache_config.cache_dtype
         ) and not (self.fp8_cache_only or self.cubic8_cache)
+        self.use_native_compressed_scheduler = (
+            self.is_fp8_kvcache or self.fp8_cache_only or self.native_cubic8_cache
+        )
 
         num_sms = num_compute_units(self.device.index)
 
         if (
-            self.fp8_cache_only or self.cubic8_cache
+            self.fp8_cache_only or (self.cubic8_cache and not self.native_cubic8_cache)
         ) and is_workspace_manager_initialized():
             max_splits = _compute_cache_only_num_kv_splits(
                 self.model_config.max_model_len, num_sms
@@ -253,7 +258,7 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             1,  # MQA for the decode path
             is_fp8_kvcache=self.is_fp8_kvcache,
         )
-        if self.is_fp8_kvcache:
+        if self.use_native_compressed_scheduler:
             tile_scheduler_metadata, num_splits = get_mla_metadata_dense_fp8(
                 seq_lens_device,
                 num_q_tokens_per_head_k,
@@ -337,10 +342,16 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
 
         self._fp8_cache_only = self.kv_cache_dtype == "fp8_q16"
         self._cubic8_cache = self.kv_cache_dtype == "cubic8"
+        self._native_cubic8_cache = self.kv_cache_dtype == "cubic8"
         if self._fp8_cache_only or self._cubic8_cache:
             self.supports_quant_query_input = False
-            self._sm_count = num_compute_units(
-                torch.accelerator.current_device_index()
+            device_index = torch.accelerator.current_device_index()
+            self._sm_count = num_compute_units(device_index)
+            logger.info_once(
+                "%s MLA cache-only decode keeps queries in model dtype and "
+                "dequantizes cached values inside the attention kernel on GPU %d.",
+                self.kv_cache_dtype,
+                device_index,
             )
 
     def _forward_fp8_q16(
@@ -350,7 +361,56 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         attn_metadata: FlashMLAMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run a model-dtype query against a compressed MLA cache."""
+        assert q.ndim == 3, (
+            "Compressed-cache FlashMLA supports single-token decode; "
+            f"received query shape {tuple(q.shape)}"
+        )
         assert attn_metadata.decode is not None
+
+        if (
+            self._fp8_cache_only
+            and q.dtype == torch.bfloat16
+            and q.shape[0] * attn_metadata.max_seq_len <= _FP8_Q16_NATIVE_MAX_TOKEN_WORK
+        ):
+            scheduler = attn_metadata.decode.scheduler_metadata
+            assert scheduler.tile_scheduler_metadata is not None
+            assert scheduler.num_splits is not None
+            output, lse = flash_mla_with_kvcache_fp8_q16(
+                q=q.unsqueeze(1),
+                k_cache=kv_c_and_k_pe_cache.unsqueeze(2),
+                block_table=attn_metadata.decode.block_table,
+                cache_seqlens=attn_metadata.decode.seq_lens,
+                head_dim_v=self.kv_lora_rank,
+                tile_scheduler_metadata=scheduler.tile_scheduler_metadata,
+                num_splits=scheduler.num_splits,
+                descale_k=layer._k_scale.reshape(1),
+                softmax_scale=self.scale,
+                causal=False,
+            )
+            return output.squeeze(1), lse.squeeze(-1)
+
+        if (
+            self._native_cubic8_cache
+            and q.dtype == torch.bfloat16
+            and q.shape[-1] == 576
+            and kv_c_and_k_pe_cache.shape[1] == 64
+        ):
+            scheduler = attn_metadata.decode.scheduler_metadata
+            assert scheduler.tile_scheduler_metadata is not None
+            assert scheduler.num_splits is not None
+            output, lse = flash_mla_with_kvcache_cubic8(
+                q=q.unsqueeze(1),
+                k_cache=kv_c_and_k_pe_cache.unsqueeze(2),
+                block_table=attn_metadata.decode.block_table,
+                cache_seqlens=attn_metadata.decode.seq_lens,
+                head_dim_v=self.kv_lora_rank,
+                tile_scheduler_metadata=scheduler.tile_scheduler_metadata,
+                num_splits=scheduler.num_splits,
+                softmax_scale=self.scale,
+                causal=False,
+            )
+            return output.squeeze(1), lse.squeeze(-1)
         batch, num_heads, _ = q.shape
         output = torch.zeros(
             batch, num_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
@@ -382,9 +442,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             materialize_tokens = cubic8_mla_materialize_token_count(
                 batch, attn_metadata.max_seq_len, page_size
             )
-            use_materialized = (
-                materialize_tokens <= CUBIC8_MLA_MATERIALIZE_TOKEN_CAP
-            )
+            use_materialized = materialize_tokens <= CUBIC8_MLA_MATERIALIZE_TOKEN_CAP
         else:
             use_materialized = False
 
@@ -488,6 +546,82 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             is_mla=True,
         )
         return output, lse
+
+    def _forward_fp8_q16_prefill_context(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        prefill_metadata,
+        k_scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend model-dtype absorbed queries directly to an FP8 cache."""
+        assert self._fp8_cache_only
+        assert q.dtype == torch.bfloat16
+        assert prefill_metadata.query_lens_cpu is not None
+        chunked_context = prefill_metadata.chunked_context
+        assert chunked_context is not None
+
+        cache = kv_c_and_k_pe_cache
+        if cache.dtype != current_platform.fp8_dtype():
+            cache = cache.view(current_platform.fp8_dtype())
+        cache = cache.unsqueeze(2)
+
+        outputs: list[torch.Tensor] = []
+        lses: list[torch.Tensor] = []
+        query_offset = 0
+        query_lens = prefill_metadata.query_lens_cpu.tolist()
+        for request_idx, (query_len, context_len) in enumerate(
+            zip(query_lens, chunked_context.context_lens_list)
+        ):
+            query_end = query_offset + query_len
+            request_q = q[query_offset:query_end]
+            if context_len == 0:
+                outputs.append(
+                    torch.zeros(
+                        query_len,
+                        q.shape[1],
+                        self.kv_lora_rank,
+                        dtype=q.dtype,
+                        device=q.device,
+                    )
+                )
+                lses.append(
+                    torch.full(
+                        (query_len, q.shape[1]),
+                        -float("inf"),
+                        dtype=torch.float32,
+                        device=q.device,
+                    )
+                )
+                query_offset = query_end
+                continue
+
+            request_context_len = chunked_context.context_lens[
+                request_idx : request_idx + 1
+            ]
+            tile_metadata, num_splits = get_mla_metadata_dense_fp8(
+                request_context_len,
+                query_len * q.shape[1],
+                1,
+            )
+            request_output, request_lse = flash_mla_with_kvcache_fp8_q16(
+                q=request_q.unsqueeze(0),
+                k_cache=cache,
+                block_table=prefill_metadata.block_table[request_idx : request_idx + 1],
+                cache_seqlens=request_context_len,
+                head_dim_v=self.kv_lora_rank,
+                tile_scheduler_metadata=tile_metadata,
+                num_splits=num_splits,
+                descale_k=k_scale.reshape(1),
+                softmax_scale=self.scale,
+                causal=False,
+            )
+            outputs.append(request_output.squeeze(0))
+            lses.append(request_lse.squeeze(0).transpose(0, 1).contiguous())
+            query_offset = query_end
+
+        assert query_offset == q.shape[0]
+        return torch.cat(outputs, dim=0), torch.cat(lses, dim=0)
 
     def forward_mqa(
         self,

@@ -307,6 +307,8 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
+_MLA_FP8_QUERY_CACHE_DTYPES = frozenset({"fp8", "fp8_e4m3"})
+_MLA_MODEL_DTYPE_QUERY_CACHE_DTYPES = frozenset({"fp8_q16", "cubic8", "fp8_ds_mla"})
 
 
 def _detect_output_quant_key(
@@ -1975,12 +1977,23 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         is enabled, else model dtype.
         """
         cache_dtype = cache_dtype or vllm_config.cache_config.cache_dtype
-        if cache_dtype in ("fp8_q16", "cubic8"):
+        query_quantization_requested = (
+            vllm_config.attention_config.use_prefill_query_quantization
+        )
+
+        if cache_dtype in _MLA_MODEL_DTYPE_QUERY_CACHE_DTYPES:
+            if query_quantization_requested:
+                logger.warning_once(
+                    "Ignoring use_prefill_query_quantization=True for KV cache "
+                    "dtype %s because this format requires model-dtype prefill "
+                    "queries.",
+                    cache_dtype,
+                )
             return model_dtype
 
         use_fp8 = (
-            is_quantized_kv_cache(cache_dtype)
-            and vllm_config.attention_config.use_prefill_query_quantization
+            cache_dtype in _MLA_FP8_QUERY_CACHE_DTYPES
+            and query_quantization_requested
             and backend_supports_prefill_query_quantization()
         )
 
@@ -1988,7 +2001,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             fp8_dtype = current_platform.fp8_dtype()
             logger.info_once("FP8 prefill attention enabled: query data type is FP8")
             return fp8_dtype
-        elif vllm_config.attention_config.use_prefill_query_quantization:
+        elif query_quantization_requested:
             logger.info_once(
                 "Unable to perform FP8 prefill attention when"
                 " use_prefill_query_quantization is enabled. Please"
@@ -1997,7 +2010,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             )
             return model_dtype
         elif (
-            is_quantized_kv_cache(cache_dtype)
+            cache_dtype in _MLA_FP8_QUERY_CACHE_DTYPES
             and backend_supports_prefill_query_quantization()
         ):
             logger.warning_once(
@@ -2245,6 +2258,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 output_dtype=self.model_config.dtype,
                 q_data_type=self.q_data_type,
                 prefill_backend=self._prefill_backend,
+                query_lens_cpu=prefill_query_lens_cpu,
             )
 
             self._prefill_backend.prepare_metadata(prefill_metadata)

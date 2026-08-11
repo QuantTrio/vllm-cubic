@@ -251,18 +251,67 @@ def test_cubic8_mla_hybrid_alignment_uses_backend_granularity(
     assert cache_config.mamba_page_size_padded == expected_block_size * 624
 
 
-def test_cubic8_mla_dtype_is_query_protected() -> None:
+@pytest.mark.parametrize("cache_dtype", ["fp8_q16", "cubic8", "fp8_ds_mla"])
+def test_mla_query_protected_cache_dtype_ignores_quantization_request(
+    cache_dtype: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import vllm.model_executor.layers.attention.mla_attention as mla_attention
+
     config = SimpleNamespace(
-        cache_config=SimpleNamespace(cache_dtype="cubic8"),
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
         attention_config=SimpleNamespace(use_prefill_query_quantization=True),
     )
-    assert is_quantized_kv_cache("cubic8")
-    assert kv_cache_dtype_str_to_dtype("cubic8", None) == torch.uint8
+    warning = []
+    monkeypatch.setattr(
+        mla_attention.logger,
+        "warning_once",
+        lambda message, *args: warning.append(message % args),
+    )
     assert (
         MLACommonMetadataBuilder.determine_prefill_query_data_type(
-            config, torch.bfloat16, "cubic8"
+            config, torch.bfloat16, cache_dtype
         )
         == torch.bfloat16
+    )
+    assert cache_dtype in warning[0]
+
+
+def test_cubic8_mla_storage_is_quantized() -> None:
+    assert is_quantized_kv_cache("cubic8")
+    assert kv_cache_dtype_str_to_dtype("cubic8", None) == torch.uint8
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "requested", "expected_dtype"),
+    [
+        ("auto", False, torch.bfloat16),
+        ("auto", True, torch.bfloat16),
+        ("bfloat16", True, torch.bfloat16),
+        ("fp8", False, torch.bfloat16),
+        ("fp8", True, torch.float8_e4m3fn),
+        ("fp8_e4m3", True, torch.float8_e4m3fn),
+    ],
+)
+def test_mla_prefill_query_quantization_is_explicitly_scoped(
+    cache_dtype: str,
+    requested: bool,
+    expected_dtype: torch.dtype,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.layers.attention.mla_attention as mla_attention
+
+    monkeypatch.setattr(
+        mla_attention, "backend_supports_prefill_query_quantization", lambda: True
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        attention_config=SimpleNamespace(use_prefill_query_quantization=requested),
+    )
+    assert (
+        MLACommonMetadataBuilder.determine_prefill_query_data_type(
+            config, torch.bfloat16, cache_dtype
+        )
+        == expected_dtype
     )
 
 
@@ -291,6 +340,126 @@ def test_cubic8_mla_uses_piecewise_cudagraph_boundary() -> None:
         TritonMLAMetadataBuilder.get_cudagraph_support(config, spec)
         == AttentionCGSupport.NEVER
     )
+
+
+def test_fp8_q16_mla_retains_cudagraph_support() -> None:
+    from vllm.v1.attention.backends.mla.flashmla import (
+        FlashMLAMetadataBuilder,
+    )
+
+    spec = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float8_e4m3fn,
+        cache_dtype_str="fp8_q16",
+        kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+    )
+    assert (
+        FlashMLAMetadataBuilder.get_cudagraph_support(SimpleNamespace(), spec)
+        == AttentionCGSupport.UNIFORM_BATCH
+    )
+
+
+def test_fp8_q16_flashmla_decode_uses_native_operator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.mla.flashmla as flashmla
+
+    calls = []
+
+    def fake_native(**kwargs):
+        calls.append(kwargs)
+        q = kwargs["q"]
+        return (
+            torch.zeros(q.shape[0], 1, q.shape[2], 512, dtype=q.dtype),
+            torch.zeros(q.shape[0], q.shape[2], 1, dtype=torch.float32),
+        )
+
+    monkeypatch.setattr(flashmla, "flash_mla_with_kvcache_fp8_q16", fake_native)
+    impl = object.__new__(flashmla.FlashMLAImpl)
+    impl._fp8_cache_only = True
+    impl._cubic8_cache = False
+    impl._native_cubic8_cache = False
+    impl.kv_lora_rank = 512
+    impl.scale = 576**-0.5
+    q = torch.zeros(2, 16, 576, dtype=torch.bfloat16)
+    cache = torch.zeros(4, 64, 576, dtype=torch.float8_e4m3fn)
+    scheduler = SimpleNamespace(
+        tile_scheduler_metadata=torch.zeros(1, 8, dtype=torch.int32),
+        num_splits=torch.zeros(3, dtype=torch.int32),
+    )
+    metadata = SimpleNamespace(
+        max_seq_len=128,
+        decode=SimpleNamespace(
+            scheduler_metadata=scheduler,
+            block_table=torch.zeros(2, 2, dtype=torch.int32),
+            seq_lens=torch.full((2,), 128, dtype=torch.int32),
+        ),
+    )
+    layer = SimpleNamespace(_k_scale=torch.ones(1, dtype=torch.float32))
+
+    output, lse = impl._forward_fp8_q16(q, cache, metadata, layer)
+
+    assert len(calls) == 1
+    assert calls[0]["q"].shape == (2, 1, 16, 576)
+    assert output.shape == (2, 16, 512)
+    assert lse.shape == (2, 16)
+
+
+def test_fp8_q16_flashmla_context_prefill_uses_native_operator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.mla.flashmla as flashmla
+
+    calls = []
+
+    def fake_native(**kwargs):
+        calls.append(kwargs)
+        q = kwargs["q"]
+        return (
+            torch.ones(q.shape[0], q.shape[1], q.shape[2], 512, dtype=q.dtype),
+            torch.zeros(q.shape[0], q.shape[2], q.shape[1], dtype=torch.float32),
+        )
+
+    monkeypatch.setattr(flashmla, "flash_mla_with_kvcache_fp8_q16", fake_native)
+    monkeypatch.setattr(
+        flashmla.current_platform, "fp8_dtype", lambda: torch.float8_e4m3fn
+    )
+    monkeypatch.setattr(
+        flashmla,
+        "get_mla_metadata_dense_fp8",
+        lambda *_args: (
+            torch.zeros(1, 8, dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+        ),
+    )
+    impl = object.__new__(flashmla.FlashMLAImpl)
+    impl._fp8_cache_only = True
+    impl.kv_lora_rank = 512
+    impl.scale = 576**-0.5
+    q = torch.zeros(5, 16, 576, dtype=torch.bfloat16)
+    cache = torch.zeros(4, 64, 576, dtype=torch.float8_e4m3fn)
+    prefill = SimpleNamespace(
+        query_lens_cpu=torch.tensor([2, 3], dtype=torch.int32),
+        block_table=torch.zeros(2, 2, dtype=torch.int32),
+        chunked_context=SimpleNamespace(
+            context_lens=torch.tensor([0, 32], dtype=torch.int32),
+            context_lens_list=[0, 32],
+        ),
+    )
+
+    output, lse = impl._forward_fp8_q16_prefill_context(
+        q, cache, prefill, torch.ones(1, dtype=torch.float32)
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["q"].shape == (1, 3, 16, 576)
+    assert torch.count_nonzero(output[:2]) == 0
+    assert torch.isneginf(lse[:2]).all()
+    assert torch.all(output[2:] == 1)
+    assert output.shape == (5, 16, 512)
+    assert lse.shape == (5, 16)
 
 
 def test_cubic8_mla_decode_selector_is_shape_and_device_aware() -> None:
@@ -614,7 +783,9 @@ def test_cubic8_mla_backend_dispatch_with_locked_workspace(monkeypatch) -> None:
 
         flash_impl = object.__new__(FlashMLAImpl)
         flash_impl.kv_cache_dtype = "cubic8"
+        flash_impl._fp8_cache_only = False
         flash_impl._cubic8_cache = True
+        flash_impl._native_cubic8_cache = False
         flash_impl.kv_lora_rank = latent_dim
         flash_impl.scale = triton_impl.scale
         flash_impl._sm_count = triton_impl._sm_count

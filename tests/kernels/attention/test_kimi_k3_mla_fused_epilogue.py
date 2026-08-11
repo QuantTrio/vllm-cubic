@@ -8,6 +8,7 @@ import torch
 from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_decode_q_concat_kv_cache_insert,
     fused_mla_key_concat_ds_mla_insert,
+    fused_mla_key_concat_kv_cache_fp8_q16_insert,
     fused_mla_key_concat_kv_cache_insert,
     fused_mla_qkv_quant_kv_cache_fp8_insert,
 )
@@ -66,7 +67,7 @@ def _assert_fp8_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     )
 
 
-@pytest.mark.parametrize("cache_kind", ["bf16", "fp8", "fp8_ds_mla"])
+@pytest.mark.parametrize("cache_kind", ["bf16", "fp8", "fp8_q16", "fp8_ds_mla"])
 @torch.inference_mode()
 def test_prefill_epilogue_fuses_gptj_rope(cache_kind: str) -> None:
     torch.manual_seed(0)
@@ -105,29 +106,45 @@ def test_prefill_epilogue_fuses_gptj_rope(cache_kind: str) -> None:
         torch.testing.assert_close(q_actual, q_expected)
         torch.testing.assert_close(k_actual, k_expected)
         torch.testing.assert_close(_cache_rows(cache, slots), cache_expected)
-    elif cache_kind == "fp8":
+    elif cache_kind in ("fp8", "fp8_q16"):
         cache = torch.zeros(
             2, _BLOCK_SIZE, 576, device="cuda", dtype=torch.float8_e4m3fn
         )
         one = torch.ones(1, device="cuda", dtype=torch.float32)
-        q_actual, k_actual, v_actual = fused_mla_qkv_quant_kv_cache_fp8_insert(
-            q,
-            k_nope,
-            k_pe,
-            kv_c,
-            v,
-            cache,
-            slots,
-            one,
-            one,
-            one,
-            one,
-            positions,
-            cos_sin_cache,
-        )
-        _assert_fp8_close(q_actual, q_expected)
-        _assert_fp8_close(k_actual, k_expected)
-        _assert_fp8_close(v_actual, v)
+        if cache_kind == "fp8":
+            q_actual, k_actual, v_actual = fused_mla_qkv_quant_kv_cache_fp8_insert(
+                q,
+                k_nope,
+                k_pe,
+                kv_c,
+                v,
+                cache,
+                slots,
+                one,
+                one,
+                one,
+                one,
+                positions,
+                cos_sin_cache,
+            )
+            _assert_fp8_close(q_actual, q_expected)
+            _assert_fp8_close(k_actual, k_expected)
+            _assert_fp8_close(v_actual, v)
+        else:
+            q_actual = q.clone()
+            k_actual = fused_mla_key_concat_kv_cache_fp8_q16_insert(
+                q_actual,
+                k_nope,
+                k_pe,
+                kv_c,
+                cache,
+                slots,
+                one,
+                positions,
+                cos_sin_cache,
+            )
+            torch.testing.assert_close(q_actual, q_expected)
+            torch.testing.assert_close(k_actual, k_expected)
         _assert_fp8_close(_cache_rows(cache, slots), cache_expected)
     else:
         cache = torch.zeros(2, _BLOCK_SIZE, 656, device="cuda", dtype=torch.uint8)
@@ -148,7 +165,7 @@ def test_prefill_epilogue_fuses_gptj_rope(cache_kind: str) -> None:
         torch.testing.assert_close(rope_cache, k_pe_expected)
 
 
-@pytest.mark.parametrize("cache_kind", ["bf16", "fp8", "fp8_ds_mla"])
+@pytest.mark.parametrize("cache_kind", ["bf16", "fp8", "fp8_q16", "fp8_ds_mla"])
 @torch.inference_mode()
 def test_decode_epilogue_fuses_gptj_rope(cache_kind: str) -> None:
     torch.manual_seed(1)
@@ -173,7 +190,7 @@ def test_decode_epilogue_fuses_gptj_rope(cache_kind: str) -> None:
         )
         torch.testing.assert_close(q_actual, q_expected)
         torch.testing.assert_close(_cache_rows(cache, slots), cache_expected)
-    elif cache_kind == "fp8":
+    elif cache_kind in ("fp8", "fp8_q16"):
         cache = torch.zeros(
             2, _BLOCK_SIZE, 576, device="cuda", dtype=torch.float8_e4m3fn
         )
@@ -185,11 +202,14 @@ def test_decode_epilogue_fuses_gptj_rope(cache_kind: str) -> None:
             k_pe,
             cache,
             slots,
-            q_scale_inv=one,
+            q_scale_inv=one if cache_kind == "fp8" else None,
             cache_scale_inv=one,
             **kwargs,
         )
-        _assert_fp8_close(q_actual, q_expected)
+        if cache_kind == "fp8":
+            _assert_fp8_close(q_actual, q_expected)
+        else:
+            torch.testing.assert_close(q_actual, q_expected)
         _assert_fp8_close(_cache_rows(cache, slots), cache_expected)
     else:
         cache = torch.zeros(2, _BLOCK_SIZE, 656, device="cuda", dtype=torch.uint8)
