@@ -1008,6 +1008,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # only in this block; SM12x has separate NVFP4 matmul/MoE kernels above.
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
     cuda_archs_loose_intersection(FP4_SM100_ARCHS "10.0f;10.7f;11.0f" "${CUDA_ARCHS}")
+    # SM103 lacks the e2m1x2 conversion used by these NVFP4 sources.
+    list(FILTER FP4_SM100_ARCHS EXCLUDE REGEX "^10\\.3")
   else()
     cuda_archs_loose_intersection(FP4_SM100_ARCHS "10.0a;10.1a;10.3a" "${CUDA_ARCHS}")
   endif()
