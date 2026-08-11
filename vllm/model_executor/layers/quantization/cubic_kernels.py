@@ -4625,6 +4625,7 @@ def _cubic_moe_w1_w8_fused_sum_a8_kernel(
         "N",
         "NUM_GROUPS",
         "GROUP_SIZE",
+        "GROUP_OUT",
         "ROUTE_CTAS",
         "MUL_ROUTED_WEIGHT",
         "TOP_K",
@@ -4659,6 +4660,7 @@ def _cubic_moe_situ_gemv_2bit_a8_dp4a_kernel(
     stride_osm,
     stride_osg,
     GROUP_SIZE: tl.constexpr,
+    GROUP_OUT: tl.constexpr,
     ACTIVATION_GROUP_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ROUTE_CTAS: tl.constexpr,
@@ -4716,16 +4718,25 @@ def _cubic_moe_situ_gemv_2bit_a8_dp4a_kernel(
                     gate_carriers, activation_word[None, :], gate_dot
                 )
                 up_dot = _cubic_dp4a(up_carriers, activation_word[None, :], up_dot)
-            metadata_offsets = (
-                expert_id * stride_se + offs_n * stride_sn + group * stride_sg
-            )
+            if GROUP_OUT == 1:
+                metadata_offsets = (
+                    expert_id * stride_se + offs_n * stride_sn + group * stride_sg
+                )
+                up_metadata_offset = N * stride_sn
+            else:
+                metadata_offsets = (
+                    expert_id * stride_se
+                    + (offs_n // GROUP_OUT) * stride_sn
+                    + group * stride_sg
+                )
+                up_metadata_offset = (N // GROUP_OUT) * stride_sn
             gate_scale = tl.load(
                 scale_ptr + metadata_offsets,
                 mask=n_mask,
                 other=0.0,
             ).to(tl.float32)
             up_scale = tl.load(
-                scale_ptr + metadata_offsets + N * stride_sn,
+                scale_ptr + metadata_offsets + up_metadata_offset,
                 mask=n_mask,
                 other=0.0,
             ).to(tl.float32)
@@ -5315,6 +5326,7 @@ def _cubic_moe_grouped2_situ_gemv_2bit_a8_dp4a_kernel(
     stride_osm,
     stride_osg,
     GROUP_SIZE: tl.constexpr,
+    GROUP_OUT: tl.constexpr,
     ACTIVATION_GROUP_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ROUTE_CTAS: tl.constexpr,
@@ -5367,16 +5379,25 @@ def _cubic_moe_grouped2_situ_gemv_2bit_a8_dp4a_kernel(
                     mask=n_mask[:, None],
                     other=0,
                 ).to(tl.int32)
-                metadata_offsets = (
-                    expert_id * stride_se + offs_n * stride_sn + group * stride_sg
-                )
+                if GROUP_OUT == 1:
+                    metadata_offsets = (
+                        expert_id * stride_se + offs_n * stride_sn + group * stride_sg
+                    )
+                    up_metadata_offset = N * stride_sn
+                else:
+                    metadata_offsets = (
+                        expert_id * stride_se
+                        + (offs_n // GROUP_OUT) * stride_sn
+                        + group * stride_sg
+                    )
+                    up_metadata_offset = (N // GROUP_OUT) * stride_sn
                 gate_scale = tl.load(
                     scale_ptr + metadata_offsets,
                     mask=n_mask,
                     other=0.0,
                 ).to(tl.float32)
                 up_scale = tl.load(
-                    scale_ptr + metadata_offsets + N * stride_sn,
+                    scale_ptr + metadata_offsets + up_metadata_offset,
                     mask=n_mask,
                     other=0.0,
                 ).to(tl.float32)
@@ -5475,6 +5496,7 @@ def _cubic_moe_pair_situ_gemv_2bit_a8_dp4a_kernel(
     stride_osm,
     stride_osg,
     GROUP_SIZE: tl.constexpr,
+    GROUP_OUT: tl.constexpr,
     ACTIVATION_GROUP_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ROUTE_CTAS: tl.constexpr,
@@ -5528,16 +5550,27 @@ def _cubic_moe_pair_situ_gemv_2bit_a8_dp4a_kernel(
                         mask=n_mask[:, None],
                         other=0,
                     ).to(tl.int32)
-                    metadata_offsets = (
-                        expert_id * stride_se + offs_n * stride_sn + group * stride_sg
-                    )
+                    if GROUP_OUT == 1:
+                        metadata_offsets = (
+                            expert_id * stride_se
+                            + offs_n * stride_sn
+                            + group * stride_sg
+                        )
+                        up_metadata_offset = N * stride_sn
+                    else:
+                        metadata_offsets = (
+                            expert_id * stride_se
+                            + (offs_n // GROUP_OUT) * stride_sn
+                            + group * stride_sg
+                        )
+                        up_metadata_offset = (N // GROUP_OUT) * stride_sn
                     gate_scale = tl.load(
                         scale_ptr + metadata_offsets,
                         mask=n_mask,
                         other=0.0,
                     ).to(tl.float32)
                     up_scale = tl.load(
-                        scale_ptr + metadata_offsets + N * stride_sn,
+                        scale_ptr + metadata_offsets + up_metadata_offset,
                         mask=n_mask,
                         other=0.0,
                     ).to(tl.float32)
@@ -5703,16 +5736,27 @@ def _cubic_moe_pair_situ_gemv_2bit_a8_dp4a_kernel(
                         mask=n_mask[:, None],
                         other=0,
                     ).to(tl.int32)
-                    metadata_offsets = (
-                        expert_id * stride_se + offs_n * stride_sn + group * stride_sg
-                    )
+                    if GROUP_OUT == 1:
+                        metadata_offsets = (
+                            expert_id * stride_se
+                            + offs_n * stride_sn
+                            + group * stride_sg
+                        )
+                        up_metadata_offset = N * stride_sn
+                    else:
+                        metadata_offsets = (
+                            expert_id * stride_se
+                            + (offs_n // GROUP_OUT) * stride_sn
+                            + group * stride_sg
+                        )
+                        up_metadata_offset = (N // GROUP_OUT) * stride_sn
                     gate_scale = tl.load(
                         scale_ptr + metadata_offsets,
                         mask=n_mask,
                         other=0.0,
                     ).to(tl.float32)
                     up_scale = tl.load(
-                        scale_ptr + metadata_offsets + N * stride_sn,
+                        scale_ptr + metadata_offsets + up_metadata_offset,
                         mask=n_mask,
                         other=0.0,
                     ).to(tl.float32)
@@ -5807,7 +5851,15 @@ def _cubic_moe_pair_situ_gemv_2bit_a8_dp4a_kernel(
 
 @triton.autotune(
     configs=_CUBIC_MOE_2BIT_A16_CONFIGS,
-    key=["N", "K", "GROUP_SIZE", "ROUTE_CTAS", "TOP_K", "HAS_LINEAR_BETA"],
+    key=[
+        "N",
+        "K",
+        "GROUP_SIZE",
+        "GROUP_OUT",
+        "ROUTE_CTAS",
+        "TOP_K",
+        "HAS_LINEAR_BETA",
+    ],
     cache_results=True,
 )
 @triton.jit
@@ -5835,6 +5887,7 @@ def _cubic_moe_situ_gemv_2bit_kernel(
     stride_om,
     stride_on,
     GROUP_SIZE: tl.constexpr,
+    GROUP_OUT: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ROUTE_CTAS: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
@@ -5880,16 +5933,25 @@ def _cubic_moe_situ_gemv_2bit_kernel(
                 mask=n_mask[:, None],
                 other=0,
             ).to(tl.int32)
-            metadata_offsets = (
-                expert_id * stride_se + offs_n * stride_sn + group * stride_sg
-            )
+            if GROUP_OUT == 1:
+                metadata_offsets = (
+                    expert_id * stride_se + offs_n * stride_sn + group * stride_sg
+                )
+                up_metadata_offset = N * stride_sn
+            else:
+                metadata_offsets = (
+                    expert_id * stride_se
+                    + (offs_n // GROUP_OUT) * stride_sn
+                    + group * stride_sg
+                )
+                up_metadata_offset = (N // GROUP_OUT) * stride_sn
             gate_scale = tl.load(
                 scale_ptr + metadata_offsets,
                 mask=n_mask,
                 other=0.0,
             ).to(tl.float32)
             up_scale = tl.load(
-                scale_ptr + metadata_offsets + N * stride_sn,
+                scale_ptr + metadata_offsets + up_metadata_offset,
                 mask=n_mask,
                 other=0.0,
             ).to(tl.float32)
@@ -8069,6 +8131,7 @@ def _launch_cubic_moe_situ_gemv_2bit(
     *,
     logical_k: int,
     group_size: int,
+    group_out: int = 1,
     top_k: int,
     multiply_routed_weight: bool,
     beta: float,
@@ -8077,6 +8140,16 @@ def _launch_cubic_moe_situ_gemv_2bit(
     route_ctas: int | None = None,
     grouped_routes: int = 1,
 ) -> None:
+    if output.shape[-1] % group_out:
+        raise ValueError(
+            f"Cubic SiTU output size must be divisible by group_out={group_out}."
+        )
+    expected_output_groups = packed.shape[1] // group_out
+    if scale.shape[1] != expected_output_groups:
+        raise ValueError(
+            "Cubic SiTU metadata output groups do not match the packed weight: "
+            f"expected {expected_output_groups}, got {scale.shape[1]}."
+        )
     if dynamic_a8:
         kernel_inputs, input_scale = per_token_quant_int8(inputs.contiguous())
     else:
@@ -8154,6 +8227,7 @@ def _launch_cubic_moe_situ_gemv_2bit(
                 output.stride(-2),
                 output.stride(-1),
                 GROUP_SIZE=group_size,
+                GROUP_OUT=group_out,
                 ACTIVATION_GROUP_SIZE=16,
                 ROUTE_CTAS=route_ctas,
                 MUL_ROUTED_WEIGHT=multiply_routed_weight,
@@ -8196,6 +8270,7 @@ def _launch_cubic_moe_situ_gemv_2bit(
             output.stride(-2),
             output.stride(-1),
             GROUP_SIZE=group_size,
+            GROUP_OUT=group_out,
             ACTIVATION_GROUP_SIZE=16,
             ROUTE_CTAS=route_ctas,
             MUL_ROUTED_WEIGHT=multiply_routed_weight,
@@ -8235,6 +8310,7 @@ def _launch_cubic_moe_situ_gemv_2bit(
         output.stride(-2),
         output.stride(-1),
         GROUP_SIZE=group_size,
+        GROUP_OUT=group_out,
         ROUTE_CTAS=route_ctas,
         MUL_ROUTED_WEIGHT=multiply_routed_weight,
         TOP_K=top_k,
@@ -8258,6 +8334,7 @@ def _launch_cubic_moe_gate_up_gemv_2bit(
     *,
     logical_k: int,
     group_size: int,
+    group_out: int = 1,
     top_k: int,
     multiply_routed_weight: bool,
 ) -> None:
@@ -8292,6 +8369,7 @@ def _launch_cubic_moe_gate_up_gemv_2bit(
         output.stride(-2),
         output.stride(-1),
         GROUP_SIZE=group_size,
+        GROUP_OUT=group_out,
         ROUTE_CTAS=route_ctas,
         MUL_ROUTED_WEIGHT=multiply_routed_weight,
         TOP_K=top_k,
@@ -10749,7 +10827,6 @@ def cubic_fused_moe(
         and num_bits == 2
         and activation == MoEActivation.SITU
         and group_size in (128, 256, 512)
-        and group_out == 1
         and hidden_size % group_size == 0
     )
     if fused_2bit_situ:
@@ -10765,6 +10842,7 @@ def cubic_fused_moe(
             padded_count,
             logical_k=hidden_size,
             group_size=group_size,
+            group_out=group_out,
             top_k=top_k,
             multiply_routed_weight=apply_router_weight_on_input,
             beta=activation_situ_beta,
@@ -11211,6 +11289,7 @@ def cubic_fused_moe_dynamic_a8(
                 padded_count,
                 logical_k=hidden_size,
                 group_size=group_size,
+                group_out=group_out,
                 top_k=top_k,
                 multiply_routed_weight=apply_router_weight_on_input,
                 beta=activation_situ_beta,

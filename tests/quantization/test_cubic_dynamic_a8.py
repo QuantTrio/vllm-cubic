@@ -1139,6 +1139,120 @@ def test_cubic_w8_precomputed_carrier_matches_dynamic_a8(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("grouped_routes", (1, 2, 4))
+@pytest.mark.parametrize("group_out", (1, 32, 128))
+def test_cubic_dynamic_a8_situ_w2_supports_group_out(
+    group_out: int, grouped_routes: int
+) -> None:
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        _launch_cubic_moe_situ_gemv_2bit,
+        per_token_quant_int8,
+    )
+
+    device = torch.device("cuda")
+    tokens, hidden, intermediate = 4, 256, 128
+    codes = _make_codes((1, 2 * intermediate, hidden), 2).to(device)
+    packed = pack_cubic_codes(codes, 2)
+    scale = torch.linspace(
+        0.01,
+        0.04,
+        2 * intermediate // group_out,
+        device=device,
+        dtype=torch.float32,
+    ).reshape(1, 2 * intermediate // group_out, 1)
+    inputs = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
+    topk_weights = torch.ones(tokens, 1, device=device)
+    sorted_token_ids = torch.arange(tokens, device=device, dtype=torch.int32)
+    expert_ids = torch.zeros(
+        math.ceil(tokens / grouped_routes), device=device, dtype=torch.int32
+    )
+    count = torch.tensor([tokens], device=device, dtype=torch.int32)
+    output = torch.empty(tokens, 1, intermediate, device=device, dtype=torch.bfloat16)
+
+    _launch_cubic_moe_situ_gemv_2bit(
+        inputs,
+        packed,
+        scale,
+        output,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        count,
+        logical_k=hidden,
+        group_size=hidden,
+        group_out=group_out,
+        top_k=1,
+        multiply_routed_weight=False,
+        beta=4.0,
+        linear_beta=25.0,
+        dynamic_a8=True,
+        grouped_routes=grouped_routes,
+    )
+
+    quantized, input_scale = per_token_quant_int8(inputs.contiguous())
+    expanded_scale = scale.repeat_interleave(group_out, dim=1)
+    weight = codes.float() * expanded_scale
+    gate_up = torch.einsum("tk,eok->teo", quantized.float(), weight)
+    gate_up *= input_scale.reshape(tokens, 1, 1)
+    gate, up = gate_up.chunk(2, dim=-1)
+    gate = gate.to(torch.bfloat16).float()
+    up = up.to(torch.bfloat16).float()
+    expected = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
+    expected *= 25.0 * torch.tanh(up / 25.0)
+
+    torch.testing.assert_close(
+        output[:, 0].float(), expected[:, 0], rtol=0.02, atol=0.02
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dynamic_a8", (False, True))
+def test_cubic_situ_warmup_accepts_legacy_scalar_group_size(
+    monkeypatch: pytest.MonkeyPatch, dynamic_a8: bool
+) -> None:
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    device = torch.device("cuda")
+    tokens, hidden, intermediate = 4, 256, 128
+    codes = _make_codes((1, 2 * intermediate, hidden), 2).to(device)
+    packed = pack_cubic_codes(codes, 2)
+    scale = torch.full(
+        (1, 2 * intermediate, 1), 0.02, device=device, dtype=torch.float32
+    )
+    coefficients = torch.empty_like(scale, dtype=torch.float16)
+    inputs = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
+    topk_weights = torch.ones(tokens, 1, device=device)
+    topk_ids = torch.zeros(tokens, 1, device=device, dtype=torch.int32)
+
+    def do_bench(function, **_kwargs) -> float:
+        function()
+        torch.cuda.synchronize()
+        return 1.0
+
+    monkeypatch.setattr(cubic_kernels.triton.testing, "do_bench", do_bench)
+    cubic_kernels.calibrate_cubic_moe_route_ctas(
+        inputs,
+        packed,
+        scale,
+        coefficients,
+        coefficients,
+        topk_weights,
+        topk_ids,
+        None,
+        dynamic_a8=dynamic_a8,
+        global_num_experts=1,
+        logical_k=hidden,
+        num_bits=2,
+        group_size=hidden,
+        top_k=1,
+        multiply_routed_weight=False,
+        grouped_routes=1,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("expert_parallel", (False, True))
 @pytest.mark.parametrize("group_size", GROUP_SIZES)
 @pytest.mark.parametrize("bits", range(1, 9))

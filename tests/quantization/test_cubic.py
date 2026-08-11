@@ -583,10 +583,10 @@ def test_cubic_fused_moe_kernel_supports_kimi_situ(bits: int, tokens: int):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("bits", (4, 5, 6, 8))
+@pytest.mark.parametrize("bits", (2, 4, 5, 6, 8))
 @pytest.mark.parametrize(
     ("group_out", "group_size"),
-    ((1, 128), (128, 1), (32, 64)),
+    ((1, 128), (128, 1), (32, 64), (32, 128)),
 )
 @pytest.mark.parametrize("tokens", (1, 16))
 def test_cubic_a16_moe_supports_two_dimensional_groups(
