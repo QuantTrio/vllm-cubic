@@ -2005,12 +2005,31 @@ def _auto_fit_max_model_len(
     """
     original_max = vllm_config.model_config.max_model_len
 
+    def log_result(result: str, effective_max: int, memory: int | None) -> None:
+        memory_line = (
+            f"limiting KV cache memory: {format_gib(memory)} GiB\n"
+            f"effective --kv-cache-memory-bytes: {memory}\n"
+            if memory is not None
+            else ""
+        )
+        logger.info_once(
+            "\n"
+            "######## auto-fit max_model_len ########\n"
+            "%s\n"
+            "effective max_model_len: %d\n"
+            "%s"
+            "########################################",
+            result,
+            effective_max,
+            memory_line,
+        )
+
     if all(not groups for groups in projected_groups_per_worker):
         # All workers have empty specs (attention-free model)
-        logger.info_once(
-            "Auto-fit max_model_len: attention-free model, "
-            "using derived max_model_len=%d",
+        log_result(
+            f"attention-free model; using derived maximum {original_max}",
             original_max,
+            None,
         )
         return
 
@@ -2033,20 +2052,19 @@ def _auto_fit_max_model_len(
 
     if auto_fit_max >= original_max:
         # The model's full context length fits in memory
-        logger.info_once(
-            "Auto-fit max_model_len: full model context length %d fits in "
-            "available GPU memory",
+        log_result(
+            f"full model context length {original_max} fits in available GPU memory",
             original_max,
+            limiting_worker_mem,
         )
     else:
         # Need to reduce max_model_len to fit in memory
         vllm_config.model_config.max_model_len = auto_fit_max
-        logger.info_once(
-            "Auto-fit max_model_len: reduced from %d to %d to fit in "
-            "available GPU memory (%s GiB available for KV cache)",
-            original_max,
+        log_result(
+            f"reduced from {original_max} to {auto_fit_max} to fit in available "
+            "GPU memory",
             auto_fit_max,
-            format_gib(limiting_worker_mem),
+            limiting_worker_mem,
         )
 
 

@@ -2570,8 +2570,14 @@ def test_request_with_prompt_embeds_and_mm_inputs(hash_fn: Callable[[Any], bytes
     assert block_hashes[1] == expected_hash2
 
 
-def test_auto_fit_max_model_len():
+def test_auto_fit_max_model_len(monkeypatch: pytest.MonkeyPatch):
     """Test that max_model_len=-1 auto-fits to available GPU memory."""
+    messages = []
+    monkeypatch.setattr(
+        kv_cache_utils.logger,
+        "info_once",
+        lambda message, *args: messages.append(message % args),
+    )
     # Create config with original_max_model_len=-1 to trigger auto-fit
     model_config = ModelConfig(max_model_len=1024)
     # Simulate the user passing -1 by setting original_max_model_len
@@ -2590,6 +2596,7 @@ def test_auto_fit_max_model_len():
         vllm_config, [kv_cache_specs], [large_available_memory]
     )
     assert vllm_config.model_config.max_model_len == 1024
+    assert any("effective max_model_len: 1024" in message for message in messages)
 
     # Reset for next test
     model_config = ModelConfig(max_model_len=1024)
@@ -2606,6 +2613,14 @@ def test_auto_fit_max_model_len():
     # Should be reduced to fit in memory
     assert vllm_config.model_config.max_model_len < 1024
     assert vllm_config.model_config.max_model_len > 0
+    auto_fit_messages = [
+        message for message in messages if "######## auto-fit max_model_len" in message
+    ]
+    assert (
+        f"effective max_model_len: {vllm_config.model_config.max_model_len}"
+        in auto_fit_messages[-1]
+    )
+    assert "effective --kv-cache-memory-bytes:" in auto_fit_messages[-1]
 
 
 def test_auto_fit_max_model_len_with_hybrid():
