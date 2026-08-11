@@ -583,7 +583,7 @@ def test_cubic_fused_moe_kernel_supports_kimi_situ(bits: int, tokens: int):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("bits", (2, 4, 5, 6, 8))
+@pytest.mark.parametrize("bits", range(1, 9))
 @pytest.mark.parametrize(
     ("group_out", "group_size"),
     ((1, 128), (128, 1), (32, 64), (32, 128)),
@@ -606,15 +606,26 @@ def test_cubic_a16_moe_supports_two_dimensional_groups(
     )
 
     def make_weight(shape: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
-        magnitude_max = (1 << (bits - 1)) - 1
-        codes = torch.randint(
-            -magnitude_max,
-            magnitude_max + 1,
-            shape,
-            generator=generator,
-            device=device,
-            dtype=torch.int16,
-        )
+        if bits == 1:
+            codes = torch.randint(
+                0,
+                2,
+                shape,
+                generator=generator,
+                device=device,
+                dtype=torch.int16,
+            )
+            codes = codes * 2 - 1
+        else:
+            magnitude_max = (1 << (bits - 1)) - 1
+            codes = torch.randint(
+                -magnitude_max,
+                magnitude_max + 1,
+                shape,
+                generator=generator,
+                device=device,
+                dtype=torch.int16,
+            )
         packed = pack_cubic_codes(codes, bits)
         metadata_shape = (
             shape[0],
