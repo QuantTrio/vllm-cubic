@@ -21,13 +21,11 @@ from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
     UnquantizedLinearMethod,
+    register_weight_loader_v2_supported_method,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.parameter import (
-    GroupQuantScaleParameter,
-    PackedvLLMParameter,
-)
+from vllm.model_executor.parameter import PackedvLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 
 CUBIC_FORMAT = "cubic-pack-quantized"
@@ -91,6 +89,31 @@ class CubicQuantizedTensor:
     group_size: int
     group_out: int
     loss: torch.Tensor
+
+
+class CubicLinearMetadataParameter(PackedvLLMParameter):
+    """Cubic metadata sharded in weight-group coordinates."""
+
+    def __init__(
+        self,
+        *,
+        input_size_per_partition: int,
+        input_group_size: int,
+        **kwargs: Any,
+    ) -> None:
+        self.input_size_per_partition = input_size_per_partition
+        self.input_group_size = input_group_size
+        super().__init__(**kwargs)
+
+    def load_row_parallel_weight(self, loaded_weight: torch.Tensor) -> None:
+        shard_size = self.data.shape[self.input_dim]
+        input_offset = self.tp_rank * self.input_size_per_partition
+        group_offset = input_offset // self.input_group_size
+        loaded_weight = loaded_weight.narrow(
+            self.input_dim, group_offset, shard_size
+        )
+        assert self.data.shape == loaded_weight.shape
+        self.data.copy_(loaded_weight)
 
 
 def cubic_levels(
@@ -620,6 +643,7 @@ class CubicConfig(QuantizationConfig):
         return None
 
 
+@register_weight_loader_v2_supported_method
 class CubicLinearMethod(LinearMethodBase):
     def __init__(self, scheme: CubicScheme, *, dynamic_a8: bool = False) -> None:
         self.scheme = scheme
@@ -642,6 +666,17 @@ class CubicLinearMethod(LinearMethodBase):
                 "Cubic linear output size must be divisible by group_out="
                 f"{self.scheme.group_out}."
             )
+        tp_size = getattr(layer, "tp_size", 1)
+        if (
+            tp_size > 1
+            and input_size_per_partition % self.scheme.group_size
+            and self.scheme.group_size % input_size_per_partition
+        ):
+            raise ValueError(
+                "Cubic linear input groups must align with TP shard boundaries; "
+                f"local input size {input_size_per_partition} and group_in "
+                f"{self.scheme.group_size} do not divide each other."
+            )
         packed_input = math.ceil(input_size_per_partition * self.scheme.num_bits / 8)
         num_groups = math.ceil(input_size_per_partition / self.scheme.group_size)
         output_groups = output_size_per_partition // self.scheme.group_out
@@ -659,16 +694,20 @@ class CubicLinearMethod(LinearMethodBase):
             "input_dim": 1,
             "output_dim": 0,
             "weight_loader": weight_loader,
+            "packed_dim": 0,
+            "packed_factor": self.scheme.group_out,
+            "input_size_per_partition": input_size_per_partition,
+            "input_group_size": self.scheme.group_size,
         }
-        scale = GroupQuantScaleParameter(
+        scale = CubicLinearMetadataParameter(
             data=torch.empty(output_groups, num_groups, dtype=torch.float32),
             **metadata_args,
         )
-        a = GroupQuantScaleParameter(
+        a = CubicLinearMetadataParameter(
             data=torch.empty(output_groups, num_groups, dtype=torch.float16),
             **metadata_args,
         )
-        b = GroupQuantScaleParameter(
+        b = CubicLinearMetadataParameter(
             data=torch.empty(output_groups, num_groups, dtype=torch.float16),
             **metadata_args,
         )
@@ -704,7 +743,7 @@ class CubicLinearMethod(LinearMethodBase):
             or layer.weight_b.dtype != torch.float16
         ):
             raise ValueError("Cubic linear a/b must remain FP16 at runtime.")
-        if self.dynamic_a8 and self.scheme.num_bits == 8 and self.scheme.group_out == 1:
+        if self.dynamic_a8 and self.scheme.num_bits == 8:
             from vllm.model_executor.layers.quantization.cubic_kernels import (
                 cubic_w8_precompute_carrier,
             )
@@ -715,6 +754,7 @@ class CubicLinearMethod(LinearMethodBase):
                 layer.weight_b,
                 group_size=self.scheme.group_size,
                 input_size=layer.input_size_per_partition,
+                group_out=self.scheme.group_out,
             )
 
     def dequantize(self, layer: torch.nn.Module) -> torch.Tensor:
@@ -760,6 +800,7 @@ class CubicLinearMethod(LinearMethodBase):
                         layer.weight_b,
                         self.scheme.num_bits,
                         self.scheme.group_size,
+                        self.scheme.group_out,
                         layer.input_size_per_partition,
                     )
                 else:
@@ -771,6 +812,7 @@ class CubicLinearMethod(LinearMethodBase):
                         layer.weight_b,
                         num_bits=self.scheme.num_bits,
                         group_size=self.scheme.group_size,
+                        group_out=self.scheme.group_out,
                         input_size=layer.input_size_per_partition,
                     )
                 return output if bias is None else output + bias
@@ -783,6 +825,7 @@ class CubicLinearMethod(LinearMethodBase):
                     layer.weight_b,
                     self.scheme.num_bits,
                     self.scheme.group_size,
+                    self.scheme.group_out,
                     layer.input_size_per_partition,
                 )
             else:
@@ -794,6 +837,7 @@ class CubicLinearMethod(LinearMethodBase):
                     layer.weight_b,
                     num_bits=self.scheme.num_bits,
                     group_size=self.scheme.group_size,
+                    group_out=self.scheme.group_out,
                     input_size=layer.input_size_per_partition,
                 )
             return output if bias is None else output + bias

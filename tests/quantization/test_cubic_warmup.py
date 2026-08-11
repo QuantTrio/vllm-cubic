@@ -156,5 +156,8 @@ def test_cubic_calibration_keeps_large_linear_buckets_beyond_capture_sizes():
         (1, 2, 4, 8, 16, 32, 64, 128, 256, 512),
     )
 
+    assert 32 in buckets
+    assert 128 in buckets
+    assert 512 in buckets
     assert 1024 in buckets
     assert 8192 in buckets

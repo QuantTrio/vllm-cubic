@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import itertools
 import math
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -49,6 +50,12 @@ _CUBIC_MOE_EXECUTION_TACTICS: dict[
 ] = {}
 _CUBIC_LINEAR_EXECUTION_TACTICS: dict[
     tuple[int, bool, int, int, int, int, int, int], bool
+] = {}
+_CUBIC_LINEAR_BLOCK_K_TACTICS: dict[
+    tuple[int, bool, int, int, int, int, int, int], int
+] = {}
+_CUBIC_LINEAR_TILE_TACTICS: dict[
+    tuple[int, bool, int, int, int, int, int, int], tuple[int, int, int, int]
 ] = {}
 _CUBIC_MOE_DENSE_BLOCK_TACTICS: dict[
     tuple[int, bool, int, int, int, int, int, int, int], int
@@ -201,7 +208,9 @@ _CUBIC_MOE_2BIT_A16_CONFIGS = [
 ]
 
 _CUBIC_MOE_DENSE_N_CONFIGS = [
+    triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=1),
     triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_N": 64}, num_warps=4, num_stages=1),
     triton.Config({"BLOCK_N": 64}, num_warps=4, num_stages=2),
     triton.Config({"BLOCK_N": 64}, num_warps=8, num_stages=2),
     triton.Config({"BLOCK_N": 128}, num_warps=8, num_stages=2),
@@ -454,6 +463,82 @@ def _cubic_linear_use_gemv(
     return min(matching, key=lambda item: item[0])[1] if matching else fallback
 
 
+def _cubic_linear_block_k(
+    *,
+    dynamic_a8: bool,
+    num_bits: int,
+    n: int,
+    k: int,
+    group_size: int,
+    group_out: int,
+    m: int,
+    fallback: int,
+) -> int:
+    device = torch.accelerator.current_device_index()
+    exact = (device, dynamic_a8, num_bits, n, k, group_size, group_out, m)
+    if exact in _CUBIC_LINEAR_BLOCK_K_TACTICS:
+        return _CUBIC_LINEAR_BLOCK_K_TACTICS[exact]
+    matching = [
+        (abs(tokens - m), block_k)
+        for (
+            dev,
+            a8,
+            bits,
+            nn,
+            kk,
+            group,
+            output_group,
+            tokens,
+        ), block_k in _CUBIC_LINEAR_BLOCK_K_TACTICS.items()
+        if dev == device
+        and a8 == dynamic_a8
+        and bits == num_bits
+        and nn == n
+        and kk == k
+        and group == group_size
+        and output_group == group_out
+    ]
+    return min(matching, key=lambda item: item[0])[1] if matching else fallback
+
+
+def _cubic_linear_tile(
+    *,
+    dynamic_a8: bool,
+    num_bits: int,
+    n: int,
+    k: int,
+    group_size: int,
+    group_out: int,
+    m: int,
+    fallback: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    device = torch.accelerator.current_device_index()
+    exact = (device, dynamic_a8, num_bits, n, k, group_size, group_out, m)
+    if exact in _CUBIC_LINEAR_TILE_TACTICS:
+        return _CUBIC_LINEAR_TILE_TACTICS[exact]
+    matching = [
+        (abs(tokens - m), tile)
+        for (
+            dev,
+            a8,
+            bits,
+            nn,
+            kk,
+            group,
+            output_group,
+            tokens,
+        ), tile in _CUBIC_LINEAR_TILE_TACTICS.items()
+        if dev == device
+        and a8 == dynamic_a8
+        and bits == num_bits
+        and nn == n
+        and kk == k
+        and group == group_size
+        and output_group == group_out
+    ]
+    return min(matching, key=lambda item: item[0])[1] if matching else fallback
+
+
 def _cubic_moe_dense_block_m(
     *,
     dynamic_a8: bool,
@@ -562,6 +647,31 @@ def _cubic_moe_route_ctas(
         and routes_per_token == top_k
     ]
     return min(matching, key=lambda item: item[0])[1] if matching else fallback
+
+
+def _expected_cubic_moe_route_blocks(
+    mean_routes: float, local_experts: int, grouped_routes: int
+) -> float:
+    """Estimate grouped route blocks after per-expert padding."""
+    if mean_routes <= 0 or local_experts <= 0:
+        return 0.0
+    if grouped_routes == 1:
+        return mean_routes
+    mean_per_expert = mean_routes / local_experts
+    probability = math.exp(-mean_per_expert)
+    expected_blocks_per_expert = 0.0
+    cumulative_probability = probability
+    route_count = 0
+    while cumulative_probability < 1 - 1e-10:
+        route_count += 1
+        probability *= mean_per_expert / route_count
+        expected_blocks_per_expert += (
+            math.ceil(route_count / grouped_routes) * probability
+        )
+        cumulative_probability += probability
+        if route_count >= 1024:
+            break
+    return local_experts * expected_blocks_per_expert
 
 
 def _cubic_w2_a8_situ_tactic(
@@ -1288,8 +1398,8 @@ def cubic_linear(
     *,
     num_bits: int,
     group_size: int,
-    group_out: int = 1,
     input_size: int,
+    group_out: int = 1,
 ) -> torch.Tensor:
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     output = torch.empty(x_2d.shape[0], packed.shape[0], device=x.device, dtype=x.dtype)
@@ -1411,7 +1521,7 @@ def cubic_linear(
 
 @triton.autotune(
     configs=_CUBIC_LINEAR_DENSE_CONFIGS,
-    key=["M", "N", "K", "NUM_BITS", "GROUP_SIZE", "BLOCK_K"],
+    key=["M", "N", "K", "NUM_BITS", "GROUP_SIZE", "GROUP_OUT", "BLOCK_K"],
     cache_results=True,
 )
 @triton.jit
@@ -1438,6 +1548,7 @@ def _cubic_linear_dynamic_a8_kernel(
     stride_on,
     NUM_BITS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    GROUP_OUT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -1481,7 +1592,7 @@ def _cubic_linear_dynamic_a8_kernel(
         raw = ((low >> shifts) | (high << (8 - shifts))) & ((1 << NUM_BITS) - 1)
 
         group = (k_block * BLOCK_K) // GROUP_SIZE
-        metadata_offsets = offs_n * stride_sn + group * stride_sg
+        metadata_offsets = (offs_n // GROUP_OUT) * stride_sn + group * stride_sg
         metadata_mask = (offs_n_raw < N) & (group < NUM_GROUPS)
         weight_scale = tl.load(
             scale_ptr + metadata_offsets,
@@ -1586,7 +1697,7 @@ def _cubic_dynamic_a8_carrier_lut(
 
 @triton.autotune(
     configs=_CUBIC_LINEAR_GEMV_CONFIGS,
-    key=["M", "N", "K", "NUM_BITS", "GROUP_SIZE", "BLOCK_K"],
+    key=["M", "N", "K", "NUM_BITS", "GROUP_SIZE", "GROUP_OUT", "BLOCK_K"],
     cache_results=True,
 )
 @triton.jit
@@ -1613,6 +1724,7 @@ def _cubic_linear_dynamic_a8_gemv_kernel(
     stride_on,
     NUM_BITS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    GROUP_OUT: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -1653,7 +1765,7 @@ def _cubic_linear_dynamic_a8_gemv_kernel(
             ).to(tl.int32)
         raw = ((low >> shifts) | (high << (8 - shifts))) & ((1 << NUM_BITS) - 1)
         group = (k_block * BLOCK_K) // GROUP_SIZE
-        metadata_offsets = offs_n * stride_sn + group * stride_sg
+        metadata_offsets = (offs_n // GROUP_OUT) * stride_sn + group * stride_sg
         metadata_mask = n_mask & (group < NUM_GROUPS)
         weight_scale = tl.load(
             scale_ptr + metadata_offsets,
@@ -1705,6 +1817,7 @@ def cubic_linear_dynamic_a8(
     num_bits: int,
     group_size: int,
     input_size: int,
+    group_out: int = 1,
 ) -> torch.Tensor:
     """Apply Cubic Linear with runtime per-token INT8 activations."""
     if num_bits not in range(1, 9):
@@ -1717,6 +1830,11 @@ def cubic_linear_dynamic_a8(
         )
     if scale.dtype != torch.float32:
         raise ValueError("Cubic Dynamic A8 weight scales must remain FP32.")
+    if packed.shape[0] % group_out:
+        raise ValueError("Cubic Dynamic A8 output size must divide group_out.")
+    expected_metadata_rows = packed.shape[0] // group_out
+    if scale.shape[0] != expected_metadata_rows:
+        raise ValueError("Cubic Dynamic A8 metadata has an invalid output-group count.")
 
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     x_q, x_scale = per_token_quant_int8(x_2d)
@@ -1732,7 +1850,7 @@ def cubic_linear_dynamic_a8(
         n=packed.shape[0],
         k=input_size,
         group_size=group_size,
-        group_out=1,
+        group_out=group_out,
         m=x_2d.shape[0],
         fallback=packed.shape[0] == 1 or x_2d.shape[0] <= 8,
     )
@@ -1765,6 +1883,7 @@ def cubic_linear_dynamic_a8(
             output.stride(1),
             NUM_BITS=num_bits,
             GROUP_SIZE=group_size,
+            GROUP_OUT=group_out,
             BLOCK_K=block_k,
         )
         return output.reshape(*x.shape[:-1], packed.shape[0])
@@ -1796,17 +1915,13 @@ def cubic_linear_dynamic_a8(
         output.stride(1),
         NUM_BITS=num_bits,
         GROUP_SIZE=group_size,
+        GROUP_OUT=group_out,
         BLOCK_K=block_k,
     )
     return output.reshape(*x.shape[:-1], packed.shape[0])
 
 
-@triton.autotune(
-    configs=_CUBIC_LINEAR_DENSE_CONFIGS,
-    key=["M", "N", "K", "GROUP_SIZE", "BLOCK_K"],
-    cache_results=True,
-)
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _cubic_linear_precomputed_a8_kernel(
     activation_ptr,
     activation_scale_ptr,
@@ -1826,6 +1941,7 @@ def _cubic_linear_precomputed_a8_kernel(
     stride_om,
     stride_on,
     GROUP_SIZE: tl.constexpr,
+    GROUP_OUT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -1859,7 +1975,7 @@ def _cubic_linear_precomputed_a8_kernel(
         partial = tl.dot(activation, weight, out_dtype=tl.int32)
         group = (k_block * BLOCK_K) // GROUP_SIZE
         weight_scale = tl.load(
-            weight_scale_ptr + offs_n * stride_sn + group * stride_sg,
+            weight_scale_ptr + (offs_n // GROUP_OUT) * stride_sn + group * stride_sg,
             mask=(offs_n < N) & (group < NUM_GROUPS),
             other=0.0,
         ).to(tl.float32)[None, :]
@@ -1874,12 +1990,7 @@ def _cubic_linear_precomputed_a8_kernel(
     )
 
 
-@triton.autotune(
-    configs=_CUBIC_LINEAR_GEMV_CONFIGS,
-    key=["M", "N", "K", "GROUP_SIZE", "BLOCK_K"],
-    cache_results=True,
-)
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _cubic_linear_precomputed_a8_gemv_kernel(
     activation_ptr,
     activation_scale_ptr,
@@ -1899,6 +2010,7 @@ def _cubic_linear_precomputed_a8_gemv_kernel(
     stride_om,
     stride_on,
     GROUP_SIZE: tl.constexpr,
+    GROUP_OUT: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -1927,7 +2039,7 @@ def _cubic_linear_precomputed_a8_gemv_kernel(
         partial = tl.sum(weight * activation[None, :], axis=1)
         group = (k_block * BLOCK_K) // GROUP_SIZE
         weight_scale = tl.load(
-            weight_scale_ptr + offs_n * stride_sn + group * stride_sg,
+            weight_scale_ptr + (offs_n // GROUP_OUT) * stride_sn + group * stride_sg,
             mask=(offs_n < N) & (group < NUM_GROUPS),
             other=0.0,
         ).to(tl.float32)
@@ -1949,15 +2061,19 @@ def cubic_w8_precompute_carrier(
     *,
     group_size: int,
     input_size: int,
+    group_out: int = 1,
 ) -> torch.Tensor:
     """Materialize the deterministic W8 INT8 carrier once during loading."""
     if packed.shape[1] != input_size or packed.dtype != torch.uint8:
         raise ValueError("Cubic W8 carrier requires one packed byte per weight.")
     codes = packed.view(torch.int8).to(torch.float32)
     codes = torch.where(codes == -128, 0.0, codes)
+    if packed.shape[0] % group_out or a.shape[0] != packed.shape[0] // group_out:
+        raise ValueError("Cubic W8 carrier metadata has an invalid output shape.")
     groups = torch.arange(input_size, device=packed.device) // group_size
-    coefficient_a = a[:, groups].to(torch.float32)
-    coefficient_b = b[:, groups].to(torch.float32)
+    output_groups = torch.arange(packed.shape[0], device=packed.device) // group_out
+    coefficient_a = a[output_groups[:, None], groups[None, :]].to(torch.float32)
+    coefficient_b = b[output_groups[:, None], groups[None, :]].to(torch.float32)
     t = codes.abs() * (1.0 / 127.0)
     normalized = t * (
         coefficient_a + t * (coefficient_b + t * (1.0 - coefficient_a - coefficient_b))
@@ -1977,11 +2093,14 @@ def cubic_linear_dynamic_a8_precomputed(
     num_bits: int,
     group_size: int,
     input_size: int,
+    group_out: int = 1,
 ) -> torch.Tensor:
     """Apply Dynamic-A8 using a load-time W8 carrier."""
     del a, b
     if num_bits != 8 or carrier.dtype != torch.int8:
         raise ValueError("Precomputed Cubic Linear requires an INT8 W8 carrier.")
+    if carrier.shape[0] % group_out or scale.shape[0] != carrier.shape[0] // group_out:
+        raise ValueError("Precomputed Cubic Linear metadata has an invalid shape.")
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     x_q, x_scale = per_token_quant_int8(x_2d)
     output = torch.empty(
@@ -1993,16 +2112,33 @@ def cubic_linear_dynamic_a8_precomputed(
         n=carrier.shape[0],
         k=input_size,
         group_size=group_size,
-        group_out=1,
+        group_out=group_out,
         m=x_2d.shape[0],
         fallback=x_2d.shape[0] <= 8,
     )
-    block_k = min(group_size, 128)
+    block_k = _cubic_linear_block_k(
+        dynamic_a8=True,
+        num_bits=num_bits,
+        n=carrier.shape[0],
+        k=input_size,
+        group_size=group_size,
+        group_out=group_out,
+        m=x_2d.shape[0],
+        fallback=min(group_size, 128),
+    )
+    default_tile = (1, 16, 4, 1) if use_gemv else (32, 64, 8, 3)
+    block_m, block_n, num_warps, num_stages = _cubic_linear_tile(
+        dynamic_a8=True,
+        num_bits=num_bits,
+        n=carrier.shape[0],
+        k=input_size,
+        group_size=group_size,
+        group_out=group_out,
+        m=x_2d.shape[0],
+        fallback=default_tile,
+    )
     if use_gemv:
-        grid = lambda meta: (
-            triton.cdiv(carrier.shape[0], meta["BLOCK_N"]),
-            x_2d.shape[0],
-        )
+        grid = (triton.cdiv(carrier.shape[0], block_n), x_2d.shape[0])
         _cubic_linear_precomputed_a8_gemv_kernel[grid](
             x_q,
             x_scale,
@@ -2022,12 +2158,16 @@ def cubic_linear_dynamic_a8_precomputed(
             output.stride(0),
             output.stride(1),
             GROUP_SIZE=group_size,
+            GROUP_OUT=group_out,
+            BLOCK_N=block_n,
             BLOCK_K=block_k,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
     else:
-        grid = lambda meta: (
-            triton.cdiv(x_2d.shape[0], meta["BLOCK_M"]),
-            triton.cdiv(carrier.shape[0], meta["BLOCK_N"]),
+        grid = (
+            triton.cdiv(x_2d.shape[0], block_m),
+            triton.cdiv(carrier.shape[0], block_n),
         )
         _cubic_linear_precomputed_a8_kernel[grid](
             x_q,
@@ -2048,7 +2188,12 @@ def cubic_linear_dynamic_a8_precomputed(
             output.stride(0),
             output.stride(1),
             GROUP_SIZE=group_size,
+            GROUP_OUT=group_out,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
             BLOCK_K=block_k,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
     return output.reshape(*x.shape[:-1], carrier.shape[0])
 
@@ -2085,62 +2230,107 @@ def calibrate_cubic_linear_execution(
         func = cubic_linear_dynamic_a8_precomputed
     else:
         func = cubic_linear_dynamic_a8 if dynamic_a8 else cubic_linear
-    candidates = (
+    execution_candidates = (
         (True, False) if dynamic_a8 or input_size % group_size == 0 else (False,)
     )
+    block_k_candidates = (
+        tuple(sorted({min(group_size, 128), group_size}))
+        if precomputed_carrier
+        else (None,)
+    )
     reference: torch.Tensor | None = None
-    scores: list[tuple[float, bool]] = []
-    for use_gemv in candidates:
-        _CUBIC_LINEAR_EXECUTION_TACTICS[key] = use_gemv
+    scores: list[
+        tuple[float, bool, int | None, tuple[int, int, int, int] | None, int]
+    ] = []
+    for use_gemv in execution_candidates:
+        configs = (
+            _CUBIC_LINEAR_GEMV_CONFIGS if use_gemv else _CUBIC_LINEAR_DENSE_CONFIGS
+        )
+        tile_candidates: tuple[triton.Config | None, ...] = (
+            tuple(configs) if precomputed_carrier else (None,)
+        )
+        for block_k, config in itertools.product(block_k_candidates, tile_candidates):
+            _CUBIC_LINEAR_EXECUTION_TACTICS[key] = use_gemv
+            if block_k is not None:
+                _CUBIC_LINEAR_BLOCK_K_TACTICS[key] = block_k
+            tile: tuple[int, int, int, int] | None = None
+            if config is not None:
+                tile = (
+                    1 if use_gemv else int(config.kwargs["BLOCK_M"]),
+                    int(config.kwargs["BLOCK_N"]),
+                    config.num_warps,
+                    config.num_stages,
+                )
+                _CUBIC_LINEAR_TILE_TACTICS[key] = tile
 
-        def launch() -> torch.Tensor:
-            kwargs: dict[str, Any] = dict(
-                num_bits=num_bits,
-                group_size=group_size,
-                input_size=input_size,
-            )
-            if not dynamic_a8:
+            def launch() -> torch.Tensor:
+                kwargs: dict[str, Any] = dict(
+                    num_bits=num_bits,
+                    group_size=group_size,
+                    input_size=input_size,
+                )
                 kwargs["group_out"] = group_out
-            return func(x, packed, scale, a, b, **kwargs)
+                return func(x, packed, scale, a, b, **kwargs)
 
-        try:
-            output = launch()
-            torch.accelerator.synchronize()
-            if reference is None:
-                reference = output
-            else:
-                torch.testing.assert_close(output, reference, rtol=0.02, atol=0.02)
-            large = x.reshape(-1, x.shape[-1]).shape[0] > 256
-            score = triton.testing.do_bench(
-                launch,
-                warmup=5 if large else 10,
-                rep=10 if large else 30,
-            )
-            scores.append((score, use_gemv))
-        except (RuntimeError, AssertionError) as error:
-            from vllm.logger import init_logger
+            try:
+                output = launch()
+                torch.accelerator.synchronize()
+                if reference is None:
+                    reference = output
+                else:
+                    torch.testing.assert_close(output, reference, rtol=0.02, atol=0.02)
+                large = x.reshape(-1, x.shape[-1]).shape[0] > 256
+                score = triton.testing.do_bench(
+                    launch,
+                    warmup=5 if large else 10,
+                    rep=10 if large else 30,
+                )
+                scores.append(
+                    (
+                        score,
+                        use_gemv,
+                        block_k,
+                        tile,
+                        tile_candidates.index(config),
+                    )
+                )
+            except (
+                RuntimeError,
+                AssertionError,
+                triton.runtime.errors.OutOfResources,
+            ) as error:
+                from vllm.logger import init_logger
 
-            init_logger(__name__).warning(
-                "Skipping Cubic Linear %s W%d %s N=%d K=%d M=%d: %s",
-                "A8" if dynamic_a8 else "A16",
-                num_bits,
-                "GEMV" if use_gemv else "dense",
-                packed.shape[0],
-                input_size,
-                x.reshape(-1, x.shape[-1]).shape[0],
-                error,
-            )
+                init_logger(__name__).warning(
+                    "Skipping Cubic Linear %s W%d %s N=%d K=%d M=%d: %s",
+                    "A8" if dynamic_a8 else "A16",
+                    num_bits,
+                    "GEMV" if use_gemv else "dense",
+                    packed.shape[0],
+                    input_size,
+                    x.reshape(-1, x.shape[-1]).shape[0],
+                    error,
+                )
     if not scores:
         _CUBIC_LINEAR_EXECUTION_TACTICS.pop(key, None)
+        _CUBIC_LINEAR_BLOCK_K_TACTICS.pop(key, None)
+        _CUBIC_LINEAR_TILE_TACTICS.pop(key, None)
         return None
-    measured_best = min(score for score, _ in scores)
+    measured_best = min(score for score, *_ in scores)
     near_best = [item for item in scores if item[0] <= measured_best * 1.01]
-    best_score, best_use_gemv = min(near_best, key=lambda item: not item[1])
+    best_score, best_use_gemv, best_block_k, best_tile, _ = min(
+        near_best,
+        key=lambda item: (not item[1], -(item[2] or 0), item[4]),
+    )
     _CUBIC_LINEAR_EXECUTION_TACTICS[key] = best_use_gemv
+    if best_block_k is not None:
+        _CUBIC_LINEAR_BLOCK_K_TACTICS[key] = best_block_k
+    if best_tile is not None:
+        _CUBIC_LINEAR_TILE_TACTICS[key] = best_tile
     from vllm.logger import init_logger
 
     init_logger(__name__).info(
-        "Cubic Linear %s: W%d N=%d K=%d G=%d M=%d %s (%.4f ms)",
+        "Cubic Linear %s: W%d N=%d K=%d G=%d M=%d %s BK=%s tile=%s (%.4f ms)",
         "A8-carrier" if precomputed_carrier else ("A8" if dynamic_a8 else "A16"),
         num_bits,
         packed.shape[0],
@@ -2148,6 +2338,8 @@ def calibrate_cubic_linear_execution(
         group_size,
         x.reshape(-1, x.shape[-1]).shape[0],
         "GEMV" if best_use_gemv else "dense",
+        best_block_k,
+        best_tile,
         best_score,
     )
     return best_score
@@ -2207,6 +2399,7 @@ def _cubic_linear_dynamic_a8_custom_op(
     b: torch.Tensor,
     num_bits: int,
     group_size: int,
+    group_out: int,
     input_size: int,
 ) -> torch.Tensor:
     return cubic_linear_dynamic_a8(
@@ -2217,6 +2410,7 @@ def _cubic_linear_dynamic_a8_custom_op(
         b,
         num_bits=num_bits,
         group_size=group_size,
+        group_out=group_out,
         input_size=input_size,
     )
 
@@ -2229,6 +2423,7 @@ def _cubic_linear_dynamic_a8_custom_op_fake(
     b: torch.Tensor,
     num_bits: int,
     group_size: int,
+    group_out: int,
     input_size: int,
 ) -> torch.Tensor:
     return x.new_empty((*x.shape[:-1], packed.shape[0]))
@@ -2250,6 +2445,7 @@ def _cubic_linear_dynamic_a8_precomputed_custom_op(
     b: torch.Tensor,
     num_bits: int,
     group_size: int,
+    group_out: int,
     input_size: int,
 ) -> torch.Tensor:
     return cubic_linear_dynamic_a8_precomputed(
@@ -2260,6 +2456,7 @@ def _cubic_linear_dynamic_a8_precomputed_custom_op(
         b,
         num_bits=num_bits,
         group_size=group_size,
+        group_out=group_out,
         input_size=input_size,
     )
 
@@ -2272,9 +2469,10 @@ def _cubic_linear_dynamic_a8_precomputed_custom_op_fake(
     b: torch.Tensor,
     num_bits: int,
     group_size: int,
+    group_out: int,
     input_size: int,
 ) -> torch.Tensor:
-    del scale, a, b, num_bits, group_size, input_size
+    del scale, a, b, num_bits, group_size, group_out, input_size
     return x.new_empty((*x.shape[:-1], carrier.shape[0]))
 
 
@@ -2942,6 +3140,39 @@ def _cubic_moe_gemv_3bit_kernel(
             route_sum,
             mask=n_mask,
         )
+
+
+@triton.jit
+def _cubic_packed_lut_carrier(raw, carrier_lut_base, SIGN_BIT: tl.constexpr):
+    signed = tl.where(raw >= SIGN_BIT, raw - 2 * SIGN_BIT, raw)
+    signed = tl.where(signed == -SIGN_BIT, 0, signed)
+    carrier = tl.load(carrier_lut_base + tl.abs(signed))
+    return tl.where(signed < 0, -carrier, carrier)
+
+
+@triton.jit
+def _cubic_interleave4(value0, value1, value2, value3):
+    return tl.interleave(
+        tl.interleave(value0, value2),
+        tl.interleave(value1, value3),
+    )
+
+
+@triton.jit
+def _cubic_interleave8(
+    value0,
+    value1,
+    value2,
+    value3,
+    value4,
+    value5,
+    value6,
+    value7,
+):
+    return tl.interleave(
+        _cubic_interleave4(value0, value2, value4, value6),
+        _cubic_interleave4(value1, value3, value5, value7),
+    )
 
 
 @triton.autotune(
@@ -7049,7 +7280,7 @@ def _cubic_moe_gemv_3bit_groupwise_a8_dp4a_kernel(
     ],
     cache_results=True,
 )
-@triton.jit
+@triton.jit(do_not_specialize=["EM", "num_valid_tokens"])
 def _cubic_moe_dynamic_a8_kernel(
     input_ptr,
     input_scale_ptr,
@@ -7176,28 +7407,300 @@ def _cubic_moe_dynamic_a8_kernel(
                 mask=token_mask[:, None] & k_mask[None, :],
                 other=0,
             )
-            bit_positions = global_k[:, None] * NUM_BITS
-            byte_indices = bit_positions // 8
-            shifts = bit_positions % 8
-            packed_ptrs = (
-                weight_ptr
-                + expert_id * stride_we
-                + offs_n[None, :] * stride_wn
-                + byte_indices * stride_wp
-            )
             weight_mask = k_mask[:, None] & (offs_n_raw[None, :] < N)
-            low = tl.load(packed_ptrs, mask=weight_mask, other=0).to(tl.int32)
-            if 8 % NUM_BITS == 0:
-                high = 0
-            else:
-                high = tl.load(
-                    packed_ptrs + stride_wp,
-                    mask=weight_mask & (byte_indices + 1 < PACKED_K),
+            if NUM_BITS == 1 and BLOCK_K >= 8:
+                packed_k = tl.arange(0, BLOCK_K // 8)
+                packed_byte = (
+                    group * (GROUP_SIZE // 8)
+                    + group_k_block * (BLOCK_K // 8)
+                    + packed_k
+                )
+                packed = tl.load(
+                    weight_ptr
+                    + expert_id * stride_we
+                    + offs_n[:, None] * stride_wn
+                    + packed_byte[None, :] * stride_wp,
+                    mask=(offs_n_raw[:, None] < N) & (packed_byte[None, :] < PACKED_K),
                     other=0,
                 ).to(tl.int32)
-            raw = ((low >> shifts) | (high << (8 - shifts))) & ((1 << NUM_BITS) - 1)
+                raw = tl.trans(
+                    _cubic_interleave8(
+                        packed & 1,
+                        (packed >> 1) & 1,
+                        (packed >> 2) & 1,
+                        (packed >> 3) & 1,
+                        (packed >> 4) & 1,
+                        (packed >> 5) & 1,
+                        (packed >> 6) & 1,
+                        packed >> 7,
+                    )
+                )
+            elif NUM_BITS == 2 and BLOCK_K >= 4:
+                packed_k = tl.arange(0, BLOCK_K // 4)
+                packed_byte = (
+                    group * (GROUP_SIZE // 4)
+                    + group_k_block * (BLOCK_K // 4)
+                    + packed_k
+                )
+                packed = tl.load(
+                    weight_ptr
+                    + expert_id * stride_we
+                    + offs_n[:, None] * stride_wn
+                    + packed_byte[None, :] * stride_wp,
+                    mask=(offs_n_raw[:, None] < N) & (packed_byte[None, :] < PACKED_K),
+                    other=0,
+                ).to(tl.int32)
+                raw = tl.trans(
+                    _cubic_interleave4(
+                        packed & 3,
+                        (packed >> 2) & 3,
+                        (packed >> 4) & 3,
+                        packed >> 6,
+                    )
+                )
+            elif NUM_BITS == 3 and BLOCK_K >= 8:
+                packed_k = tl.arange(0, BLOCK_K // 8)
+                packed_byte = (
+                    group * (GROUP_SIZE * 3 // 8)
+                    + group_k_block * (BLOCK_K * 3 // 8)
+                    + packed_k * 3
+                )
+                packed_ptrs = (
+                    weight_ptr
+                    + expert_id * stride_we
+                    + offs_n[:, None] * stride_wn
+                    + packed_byte[None, :] * stride_wp
+                )
+                packed_mask = (offs_n_raw[:, None] < N) & (
+                    packed_byte[None, :] < PACKED_K
+                )
+                byte0 = tl.load(packed_ptrs, mask=packed_mask, other=0).to(tl.int32)
+                byte1 = tl.load(packed_ptrs + stride_wp, mask=packed_mask, other=0).to(
+                    tl.int32
+                )
+                byte2 = tl.load(
+                    packed_ptrs + 2 * stride_wp, mask=packed_mask, other=0
+                ).to(tl.int32)
+                raw = tl.trans(
+                    _cubic_interleave8(
+                        byte0 & 7,
+                        (byte0 >> 3) & 7,
+                        (byte0 >> 6) | ((byte1 & 1) << 2),
+                        (byte1 >> 1) & 7,
+                        (byte1 >> 4) & 7,
+                        (byte1 >> 7) | ((byte2 & 3) << 1),
+                        (byte2 >> 2) & 7,
+                        byte2 >> 5,
+                    )
+                )
+            elif NUM_BITS == 4 and BLOCK_K >= 2:
+                packed_k = tl.arange(0, BLOCK_K // 2)
+                packed_byte = (
+                    group * (GROUP_SIZE // 2)
+                    + group_k_block * (BLOCK_K // 2)
+                    + packed_k
+                )
+                packed = tl.load(
+                    weight_ptr
+                    + expert_id * stride_we
+                    + offs_n[:, None] * stride_wn
+                    + packed_byte[None, :] * stride_wp,
+                    mask=(offs_n_raw[:, None] < N) & (packed_byte[None, :] < PACKED_K),
+                    other=0,
+                ).to(tl.int32)
+                raw_low = packed & 0xF
+                raw_high = packed >> 4
+                raw = tl.trans(tl.interleave(raw_low, raw_high))
+            elif (NUM_BITS == 5 or NUM_BITS == 7) and BLOCK_K >= 8:
+                values_per_period: tl.constexpr = 8
+                bytes_per_period: tl.constexpr = NUM_BITS
+                packed_k = tl.arange(0, BLOCK_K // values_per_period)
+                packed_byte = (
+                    group * (GROUP_SIZE * NUM_BITS // 8)
+                    + group_k_block * (BLOCK_K * NUM_BITS // 8)
+                    + packed_k * bytes_per_period
+                )
+                packed_ptrs = (
+                    weight_ptr
+                    + expert_id * stride_we
+                    + offs_n[:, None] * stride_wn
+                    + packed_byte[None, :] * stride_wp
+                )
+                packed_mask = (offs_n_raw[:, None] < N) & (
+                    packed_byte[None, :] < PACKED_K
+                )
+                byte0 = tl.load(packed_ptrs, mask=packed_mask, other=0).to(tl.int32)
+                byte1 = tl.load(packed_ptrs + stride_wp, mask=packed_mask, other=0).to(
+                    tl.int32
+                )
+                byte2 = tl.load(
+                    packed_ptrs + 2 * stride_wp, mask=packed_mask, other=0
+                ).to(tl.int32)
+                byte3 = tl.load(
+                    packed_ptrs + 3 * stride_wp, mask=packed_mask, other=0
+                ).to(tl.int32)
+                byte4 = tl.load(
+                    packed_ptrs + 4 * stride_wp, mask=packed_mask, other=0
+                ).to(tl.int32)
+                if NUM_BITS == 5:
+                    raw0 = byte0 & 0x1F
+                    raw1 = (byte0 >> 5) | ((byte1 & 0x03) << 3)
+                    raw2 = (byte1 >> 2) & 0x1F
+                    raw3 = (byte1 >> 7) | ((byte2 & 0x0F) << 1)
+                    raw4 = (byte2 >> 4) | ((byte3 & 0x01) << 4)
+                    raw5 = (byte3 >> 1) & 0x1F
+                    raw6 = (byte3 >> 6) | ((byte4 & 0x07) << 2)
+                    raw7 = byte4 >> 3
+                else:
+                    byte5 = tl.load(
+                        packed_ptrs + 5 * stride_wp,
+                        mask=packed_mask,
+                        other=0,
+                    ).to(tl.int32)
+                    byte6 = tl.load(
+                        packed_ptrs + 6 * stride_wp,
+                        mask=packed_mask,
+                        other=0,
+                    ).to(tl.int32)
+                    raw0 = byte0 & 0x7F
+                    raw1 = (byte0 >> 7) | ((byte1 & 0x3F) << 1)
+                    raw2 = (byte1 >> 6) | ((byte2 & 0x1F) << 2)
+                    raw3 = (byte2 >> 5) | ((byte3 & 0x0F) << 3)
+                    raw4 = (byte3 >> 4) | ((byte4 & 0x07) << 4)
+                    raw5 = (byte4 >> 3) | ((byte5 & 0x03) << 5)
+                    raw6 = (byte5 >> 2) | ((byte6 & 0x01) << 6)
+                    raw7 = byte6 >> 1
+                raw = tl.trans(
+                    _cubic_interleave8(
+                        raw0,
+                        raw1,
+                        raw2,
+                        raw3,
+                        raw4,
+                        raw5,
+                        raw6,
+                        raw7,
+                    )
+                )
+            elif NUM_BITS == 6 and BLOCK_K >= 4:
+                packed_k = tl.arange(0, BLOCK_K // 4)
+                packed_byte = (
+                    group * (GROUP_SIZE * 3 // 4)
+                    + group_k_block * (BLOCK_K * 3 // 4)
+                    + packed_k * 3
+                )
+                packed_ptrs = (
+                    weight_ptr
+                    + expert_id * stride_we
+                    + offs_n[:, None] * stride_wn
+                    + packed_byte[None, :] * stride_wp
+                )
+                packed_mask = (offs_n_raw[:, None] < N) & (
+                    packed_byte[None, :] < PACKED_K
+                )
+                byte0 = tl.load(packed_ptrs, mask=packed_mask, other=0).to(tl.int32)
+                byte1 = tl.load(packed_ptrs + stride_wp, mask=packed_mask, other=0).to(
+                    tl.int32
+                )
+                byte2 = tl.load(
+                    packed_ptrs + 2 * stride_wp, mask=packed_mask, other=0
+                ).to(tl.int32)
+                raw0 = byte0 & 0x3F
+                raw1 = (byte0 >> 6) | ((byte1 & 0x0F) << 2)
+                raw2 = (byte1 >> 4) | ((byte2 & 0x03) << 4)
+                raw3 = byte2 >> 2
+                raw = tl.trans(_cubic_interleave4(raw0, raw1, raw2, raw3))
+            else:
+                bit_positions = global_k[:, None] * NUM_BITS
+                byte_indices = bit_positions // 8
+                shifts = bit_positions % 8
+                packed_ptrs = (
+                    weight_ptr
+                    + expert_id * stride_we
+                    + offs_n[None, :] * stride_wn
+                    + byte_indices * stride_wp
+                )
+                low = tl.load(packed_ptrs, mask=weight_mask, other=0).to(tl.int32)
+                if 8 % NUM_BITS == 0:
+                    high = 0
+                else:
+                    high = tl.load(
+                        packed_ptrs + stride_wp,
+                        mask=weight_mask & (byte_indices + 1 < PACKED_K),
+                        other=0,
+                    ).to(tl.int32)
+                raw = ((low >> shifts) | (high << (8 - shifts))) & ((1 << NUM_BITS) - 1)
 
-            if NUM_BITS == 1:
+            if PRECOMPUTED_CARRIER_LUT and (
+                (NUM_BITS == 4 and BLOCK_K >= 2)
+                or ((NUM_BITS == 5 or NUM_BITS == 7) and BLOCK_K >= 8)
+                or (NUM_BITS == 6 and BLOCK_K >= 4)
+            ):
+                if GROUP_OUT >= BLOCK_N and GROUP_OUT % BLOCK_N == 0:
+                    carrier_lut_base = carrier_lut_ptr + metadata_offsets * (
+                        1 << (NUM_BITS - 1)
+                    )
+                else:
+                    carrier_lut_base = carrier_lut_ptr + metadata_offsets[:, None] * (
+                        1 << (NUM_BITS - 1)
+                    )
+                if NUM_BITS == 4:
+                    carrier_low = _cubic_packed_lut_carrier(
+                        raw_low, carrier_lut_base, 8
+                    )
+                    carrier_high = _cubic_packed_lut_carrier(
+                        raw_high, carrier_lut_base, 8
+                    )
+                    carrier = tl.trans(tl.interleave(carrier_low, carrier_high)).to(
+                        tl.int8
+                    )
+                elif NUM_BITS == 6:
+                    carrier0 = _cubic_packed_lut_carrier(raw0, carrier_lut_base, 32)
+                    carrier1 = _cubic_packed_lut_carrier(raw1, carrier_lut_base, 32)
+                    carrier2 = _cubic_packed_lut_carrier(raw2, carrier_lut_base, 32)
+                    carrier3 = _cubic_packed_lut_carrier(raw3, carrier_lut_base, 32)
+                    carrier = tl.trans(
+                        _cubic_interleave4(carrier0, carrier1, carrier2, carrier3)
+                    ).to(tl.int8)
+                else:
+                    lut_sign_bit: tl.constexpr = 1 << (NUM_BITS - 1)
+                    carrier0 = _cubic_packed_lut_carrier(
+                        raw0, carrier_lut_base, lut_sign_bit
+                    )
+                    carrier1 = _cubic_packed_lut_carrier(
+                        raw1, carrier_lut_base, lut_sign_bit
+                    )
+                    carrier2 = _cubic_packed_lut_carrier(
+                        raw2, carrier_lut_base, lut_sign_bit
+                    )
+                    carrier3 = _cubic_packed_lut_carrier(
+                        raw3, carrier_lut_base, lut_sign_bit
+                    )
+                    carrier4 = _cubic_packed_lut_carrier(
+                        raw4, carrier_lut_base, lut_sign_bit
+                    )
+                    carrier5 = _cubic_packed_lut_carrier(
+                        raw5, carrier_lut_base, lut_sign_bit
+                    )
+                    carrier6 = _cubic_packed_lut_carrier(
+                        raw6, carrier_lut_base, lut_sign_bit
+                    )
+                    carrier7 = _cubic_packed_lut_carrier(
+                        raw7, carrier_lut_base, lut_sign_bit
+                    )
+                    carrier = tl.trans(
+                        _cubic_interleave8(
+                            carrier0,
+                            carrier1,
+                            carrier2,
+                            carrier3,
+                            carrier4,
+                            carrier5,
+                            carrier6,
+                            carrier7,
+                        )
+                    ).to(tl.int8)
+            elif NUM_BITS == 1:
                 carrier = (raw * 254 - 127).to(tl.int8)
             else:
                 sign_bit: tl.constexpr = 1 << (NUM_BITS - 1)
@@ -9101,8 +9604,75 @@ def calibrate_cubic_moe_route_ctas(
         topk_ids.shape[0],
         top_k,
     )
+    local_expert_fraction = packed.shape[0] / global_num_experts
+    expected_local_routes = topk_ids.shape[0] * top_k * local_expert_fraction
+    ep_size = max(1, global_num_experts // packed.shape[0])
+    nominal_blocks = expert_ids.numel()
+    tail_blocks = nominal_blocks
+    nominal_sorted_ids = sorted_ids
+    nominal_expert_ids = expert_ids
+    nominal_count = count
+    tail_sorted_ids = sorted_ids
+    tail_expert_ids = expert_ids
+    tail_count = count
+    burst_blocks = tail_blocks
+    burst_sorted_ids = sorted_ids
+    burst_expert_ids = expert_ids
+    burst_count = count
+    if ep_size > 1 and expected_local_routes >= 8:
+        route_variance = (
+            topk_ids.shape[0]
+            * top_k
+            * local_expert_fraction
+            * (1 - local_expert_fraction)
+        )
+        tail_routes = expected_local_routes + math.sqrt(
+            2 * route_variance * math.log(ep_size)
+        )
+        nominal_blocks = max(
+            1,
+            round(
+                _expected_cubic_moe_route_blocks(
+                    expected_local_routes, packed.shape[0], grouped_routes
+                )
+            ),
+        )
+        tail_blocks = max(
+            nominal_blocks,
+            math.ceil(
+                _expected_cubic_moe_route_blocks(
+                    tail_routes, packed.shape[0], grouped_routes
+                )
+            ),
+        )
+
+        def synthetic_routes(
+            blocks: int,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            route_count = blocks * grouped_routes
+            synthetic_sorted_ids = torch.arange(
+                route_count, device=sorted_ids.device, dtype=torch.int32
+            ).remainder_(topk_weights.numel())
+            synthetic_expert_ids = (
+                torch.arange(blocks, device=expert_ids.device, dtype=torch.int64)
+                * packed.shape[0]
+                // blocks
+            ).to(torch.int32)
+            synthetic_count = torch.full_like(count, route_count)
+            return synthetic_sorted_ids, synthetic_expert_ids, synthetic_count
+
+        nominal_sorted_ids, nominal_expert_ids, nominal_count = synthetic_routes(
+            nominal_blocks
+        )
+        tail_sorted_ids, tail_expert_ids, tail_count = synthetic_routes(tail_blocks)
+        burst_blocks = max(tail_blocks, 2 * nominal_blocks)
+        burst_sorted_ids, burst_expert_ids, burst_count = synthetic_routes(burst_blocks)
+    max_route_ctas = max(1, tail_blocks)
     candidates = tuple(
-        dict.fromkeys(min(sorted_ids.numel(), value) for value in (8, 16, 32, 64, 128))
+        dict.fromkeys(
+            min(max(max_route_ctas, burst_blocks), value)
+            for value in (8, 16, 24, 32, 48, 64, 128)
+        )
     )
     groupwise_carrier = (
         _quantize_cubic_groupwise_a8(inputs.contiguous(), group_size)
@@ -9115,7 +9685,7 @@ def calibrate_cubic_moe_route_ctas(
         else None
     )
     reference: torch.Tensor | None = None
-    scores: list[tuple[float, int]] = []
+    scores: list[tuple[float, float, float, int]] = []
     for route_ctas in candidates:
         _CUBIC_MOE_ROUTE_CTA_TACTICS[key] = route_ctas
         output_size = packed.shape[1] // 2 if situ_beta is not None else packed.shape[1]
@@ -9127,7 +9697,13 @@ def calibrate_cubic_moe_route_ctas(
             dtype=inputs.dtype,
         )
 
-        def launch(output=output, route_ctas=route_ctas) -> None:
+        def launch(
+            launch_sorted_ids: torch.Tensor = sorted_ids,
+            launch_expert_ids: torch.Tensor = expert_ids,
+            launch_count: torch.Tensor = count,
+            output=output,
+            route_ctas=route_ctas,
+        ) -> None:
             if situ_beta is not None:
                 _launch_cubic_moe_situ_gemv_2bit(
                     inputs,
@@ -9135,9 +9711,9 @@ def calibrate_cubic_moe_route_ctas(
                     scale,
                     output,
                     topk_weights,
-                    sorted_ids,
-                    expert_ids,
-                    count,
+                    launch_sorted_ids,
+                    launch_expert_ids,
+                    launch_count,
                     logical_k=logical_k,
                     group_size=group_size,
                     group_out=group_out,
@@ -9158,9 +9734,9 @@ def calibrate_cubic_moe_route_ctas(
                     b,
                     output,
                     topk_weights,
-                    sorted_ids,
-                    expert_ids,
-                    count,
+                    launch_sorted_ids,
+                    launch_expert_ids,
+                    launch_count,
                     logical_k=logical_k,
                     num_bits=num_bits,
                     group_size=group_size,
@@ -9180,9 +9756,9 @@ def calibrate_cubic_moe_route_ctas(
                     b,
                     output,
                     topk_weights,
-                    sorted_ids,
-                    expert_ids,
-                    count,
+                    launch_sorted_ids,
+                    launch_expert_ids,
+                    launch_count,
                     logical_k=logical_k,
                     num_bits=num_bits,
                     group_size=group_size,
@@ -9204,9 +9780,9 @@ def calibrate_cubic_moe_route_ctas(
                     b,
                     output,
                     topk_weights,
-                    sorted_ids,
-                    expert_ids,
-                    count,
+                    launch_sorted_ids,
+                    launch_expert_ids,
+                    launch_count,
                     logical_k=logical_k,
                     num_bits=num_bits,
                     group_size=group_size,
@@ -9224,8 +9800,30 @@ def calibrate_cubic_moe_route_ctas(
                 reference = output.clone()
             else:
                 torch.testing.assert_close(output, reference, rtol=0.02, atol=0.02)
-            score = triton.testing.do_bench(launch, warmup=10, rep=30)
-            scores.append((score, route_ctas))
+
+            def launch_nominal() -> None:
+                launch(nominal_sorted_ids, nominal_expert_ids, nominal_count)
+
+            nominal_score = triton.testing.do_bench(launch_nominal, warmup=10, rep=30)
+
+            def launch_tail() -> None:
+                launch(tail_sorted_ids, tail_expert_ids, tail_count)
+
+            tail_score = (
+                triton.testing.do_bench(launch_tail, warmup=10, rep=30)
+                if tail_blocks > nominal_blocks
+                else nominal_score
+            )
+
+            def launch_burst() -> None:
+                launch(burst_sorted_ids, burst_expert_ids, burst_count)
+
+            burst_score = (
+                triton.testing.do_bench(launch_burst, warmup=10, rep=30)
+                if burst_blocks > tail_blocks
+                else tail_score
+            )
+            scores.append((burst_score, tail_score, nominal_score, route_ctas))
         except (RuntimeError, AssertionError) as error:
             from vllm.logger import init_logger
 
@@ -9242,15 +9840,18 @@ def calibrate_cubic_moe_route_ctas(
     if not scores:
         _CUBIC_MOE_ROUTE_CTA_TACTICS.pop(key, None)
         return
-    measured_best = min(score for score, _ in scores)
+    measured_best = min(burst_score for burst_score, _, _, _ in scores)
     near_best = [item for item in scores if item[0] <= measured_best * 1.01]
-    best_score, best_route_ctas = min(near_best, key=lambda item: item[1])
+    best_burst_score, best_score, best_nominal_score, best_route_ctas = min(
+        near_best, key=lambda item: (item[1], item[2], item[3])
+    )
     _CUBIC_MOE_ROUTE_CTA_TACTICS[key] = best_route_ctas
     from vllm.logger import init_logger
 
     init_logger(__name__).info(
         "Cubic %s route CTA: W%d N=%d K=%d G=%d M=%d top_k=%d grouped=%d "
-        "ctas=%d (%.4f ms)",
+        "ctas=%d nominal=%.4f ms tail=%.4f ms burst=%.4f ms "
+        "blocks=%d/%d/%d",
         "Online A8" if groupwise_a8 else "A8" if dynamic_a8 else "A16",
         num_bits,
         packed.shape[1],
@@ -9260,7 +9861,12 @@ def calibrate_cubic_moe_route_ctas(
         top_k,
         grouped_routes,
         best_route_ctas,
+        best_nominal_score,
         best_score,
+        best_burst_score,
+        nominal_blocks,
+        tail_blocks,
+        burst_blocks,
     )
 
 
@@ -9915,6 +10521,10 @@ def calibrate_cubic_moe_execution(
     _CUBIC_MOE_DENSE_BLOCK_TACTICS[key] = best_block_m
     from vllm.logger import init_logger
 
+    candidate_scores = ", ".join(
+        f"{'GEMV' if use_gemv else f'GEMM/B{block_m}'}={score:.4f}ms"
+        for score, use_gemv, block_m in scores
+    )
     init_logger(__name__).info(
         "Cubic %s execution: W%d H=%d I=%d G=%d M=%d %s (%.4f ms)",
         "A8" if dynamic_a8 else "A16",
@@ -9923,7 +10533,8 @@ def calibrate_cubic_moe_execution(
         intermediate_size,
         group_size,
         hidden_states.shape[0],
-        "GEMV" if best_use_gemv else f"GEMM/B{best_block_m}",
+        f"candidates=[{candidate_scores}], selected="
+        + ("GEMV" if best_use_gemv else f"GEMM/B{best_block_m}"),
         best_score,
     )
 
@@ -10446,13 +11057,6 @@ def cubic_fused_moe_dynamic_a8(
             num_tokens=num_tokens,
             fallback=grouped_routes,
         )
-    if use_gemv and group_out > 1 and group_size >= 128 and 4 <= num_bits <= 8:
-        if num_tokens >= 256:
-            grouped_routes = 8
-        elif num_tokens >= 16:
-            grouped_routes = 4
-        else:
-            grouped_routes = 1
     # Dense W3 with precomputed carriers is weight-decode limited.  A 32-row
     # expert tile reuses every decoded carrier across twice as many routes and
     # reaches a substantially better INT8 tensor-core tile.  Keep alignment

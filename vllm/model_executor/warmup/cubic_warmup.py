@@ -31,7 +31,7 @@ from vllm.model_executor.layers.quantization.cubic import (
 
 logger = init_logger(__name__)
 
-_CUBIC_TACTIC_CACHE_SCHEMA = 13
+_CUBIC_TACTIC_CACHE_SCHEMA = 15
 _CUBIC_TACTIC_CACHE_FILENAME = "cubic_tactics.json"
 _CUBIC_TACTIC_REGISTRY_NAMES = (
     "_CUBIC_W2_A8_SITU_TACTICS",
@@ -40,6 +40,8 @@ _CUBIC_TACTIC_REGISTRY_NAMES = (
     "_CUBIC_A8_MOE_GROUPING_TACTICS",
     "_CUBIC_MOE_EXECUTION_TACTICS",
     "_CUBIC_LINEAR_EXECUTION_TACTICS",
+    "_CUBIC_LINEAR_BLOCK_K_TACTICS",
+    "_CUBIC_LINEAR_TILE_TACTICS",
     "_CUBIC_MOE_DENSE_BLOCK_TACTICS",
     "_CUBIC_MOE_ROUTE_CTA_TACTICS",
     "_CUBIC8_W2_BLOCK_N_TACTICS",
@@ -475,7 +477,10 @@ def _merge_cubic_tactics(
             registry = registries[name]
             for key, value in entries:
                 local_key = (device, *key[1:])
-                if name == "_CUBIC_W2_A8_SITU_TACTICS":
+                if name in (
+                    "_CUBIC_W2_A8_SITU_TACTICS",
+                    "_CUBIC_LINEAR_TILE_TACTICS",
+                ):
                     value = tuple(value)
                 registry[local_key] = value
 
@@ -501,7 +506,10 @@ def _load_cubic_tactic_cache(cache_key: str) -> bool:
                 if not key:
                     raise ValueError("Cubic tactic cache has an empty tactic key.")
                 key_tuple = (torch.accelerator.current_device_index(), *key[1:])
-                if name == "_CUBIC_W2_A8_SITU_TACTICS":
+                if name in (
+                    "_CUBIC_W2_A8_SITU_TACTICS",
+                    "_CUBIC_LINEAR_TILE_TACTICS",
+                ):
                     value = tuple(value)
                 values[key_tuple] = value
             decoded[name] = values
@@ -562,7 +570,7 @@ def _cubic_w2_a8_situ_specs(
 def _calibration_token_buckets(
     max_tokens: int, capture_sizes: tuple[int, ...]
 ) -> tuple[int, ...]:
-    targets = (1, 8, 16, 64, 256, 1024, max_tokens)
+    targets = (1, 8, 16, 32, 64, 128, 256, 512, 1024, max_tokens)
     available = tuple(
         sorted({value for value in capture_sizes if 0 < value <= max_tokens})
     )
@@ -705,10 +713,9 @@ def _warmup_cubic_linear_families(
                 kwargs = dict(
                     num_bits=bits,
                     group_size=group_size,
+                    group_out=group_out,
                     input_size=k,
                 )
-                if not dynamic_a8:
-                    kwargs["group_out"] = group_out
                 output = func(
                     x,
                     weight,

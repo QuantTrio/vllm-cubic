@@ -10,6 +10,7 @@ import torch
 from vllm.model_executor.layers.quantization.cubic import (
     CUBIC_FORMAT,
     CubicConfig,
+    CubicLinearMetadataParameter,
     CubicLinearMethod,
     CubicScheme,
     cubic_is_strictly_monotonic,
@@ -19,6 +20,33 @@ from vllm.model_executor.layers.quantization.cubic import (
     quantize_cubic,
     unpack_cubic_codes,
 )
+
+
+def test_cubic_metadata_row_loader_uses_global_group_coordinates(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    parameter = CubicLinearMetadataParameter(
+        data=torch.zeros(2, 1),
+        input_dim=1,
+        output_dim=0,
+        packed_dim=0,
+        packed_factor=128,
+        input_size_per_partition=256,
+        input_group_size=512,
+        weight_loader=lambda *_args, **_kwargs: None,
+    )
+    parameter.tp_rank = 5
+    loaded = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    parameter.load_row_parallel_weight(loaded)
+
+    torch.testing.assert_close(parameter, loaded[:, 2:3])
 
 
 @pytest.mark.parametrize("bits", range(1, 9))

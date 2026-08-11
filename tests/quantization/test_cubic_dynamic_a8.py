@@ -76,6 +76,74 @@ def test_cubic_a8_moe_grouping_keeps_small_input_groups_singleton() -> None:
     )
 
 
+def test_expected_cubic_moe_route_blocks_accounts_for_expert_padding() -> None:
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        _expected_cubic_moe_route_blocks,
+    )
+
+    assert _expected_cubic_moe_route_blocks(48, 32, 1) == 48
+    assert _expected_cubic_moe_route_blocks(48, 32, 2) == pytest.approx(
+        31.6017, abs=1e-4
+    )
+    assert _expected_cubic_moe_route_blocks(61.2, 32, 2) == pytest.approx(
+        38.4255, abs=1e-4
+    )
+
+
+def test_cubic_a8_moe_grouping_prefers_calibrated_tactic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 7)
+    monkeypatch.setattr(
+        cubic_kernels,
+        "_CUBIC_A8_MOE_GROUPING_TACTICS",
+        {(7, 4, 4096, 2048, 512, 128, 32, 64): 1},
+    )
+
+    assert (
+        cubic_kernels._cubic_a8_moe_grouping(
+            num_bits=4,
+            hidden_size=4096,
+            intermediate_size=2048,
+            group_size=512,
+            group_out=128,
+            local_experts=32,
+            num_tokens=64,
+            fallback=8,
+        )
+        == 1
+    )
+
+
+def test_cubic_linear_tile_reuses_nearest_calibrated_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 7)
+    monkeypatch.setattr(
+        cubic_kernels,
+        "_CUBIC_LINEAR_TILE_TACTICS",
+        {
+            (7, True, 8, 4096, 1024, 512, 128, 64): (16, 64, 4, 3),
+            (7, True, 8, 4096, 1024, 512, 128, 256): (32, 64, 8, 3),
+        },
+    )
+
+    assert cubic_kernels._cubic_linear_tile(
+        dynamic_a8=True,
+        num_bits=8,
+        n=4096,
+        k=1024,
+        group_size=512,
+        group_out=128,
+        m=96,
+        fallback=(8, 32, 4, 2),
+    ) == (16, 64, 4, 3)
+
+
 def _reference_carriers(
     codes: torch.Tensor,
     a: torch.Tensor,
@@ -975,8 +1043,59 @@ def test_cubic_dynamic_a8_linear_matches_pytorch_reference(bits: int, group_size
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("tokens", (1, 16))
+def test_cubic_dynamic_a8_linear_supports_output_groups(tokens: int):
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        cubic_linear_dynamic_a8,
+    )
+
+    bits, group_out, group_size = 8, 128, 512
+    outputs, input_size = 256, 1024
+    device = torch.device("cuda")
+    codes = _make_codes((outputs, input_size), bits).to(device)
+    packed = pack_cubic_codes(codes, bits)
+    metadata_shape = (outputs // group_out, input_size // group_size)
+    scale = torch.linspace(
+        0.01, 0.04, math.prod(metadata_shape), device=device
+    ).reshape(metadata_shape)
+    a = torch.full(metadata_shape, 0.5, device=device, dtype=torch.float16)
+    b = torch.full(metadata_shape, 0.25, device=device, dtype=torch.float16)
+    x = torch.randn(tokens, input_size, device=device, dtype=torch.bfloat16)
+    expanded_scale = scale.repeat_interleave(group_out, dim=0)
+    expanded_a = a.repeat_interleave(group_out, dim=0)
+    expanded_b = b.repeat_interleave(group_out, dim=0)
+
+    expected = _reference_dynamic_a8_linear(
+        x,
+        packed,
+        expanded_scale,
+        expanded_a,
+        expanded_b,
+        bits,
+        group_size,
+    )
+    actual = cubic_linear_dynamic_a8(
+        x,
+        packed,
+        scale,
+        a,
+        b,
+        num_bits=bits,
+        group_size=group_size,
+        group_out=group_out,
+        input_size=input_size,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("tokens", (1, 16, 256))
-def test_cubic_w8_precomputed_carrier_matches_dynamic_a8(tokens: int) -> None:
+@pytest.mark.parametrize("group_out", (1, 32))
+def test_cubic_w8_precomputed_carrier_matches_dynamic_a8(
+    tokens: int, group_out: int
+) -> None:
     from vllm.model_executor.layers.quantization import cubic_kernels
 
     bits, group_size, outputs, input_size = 8, 128, 64, 256
@@ -984,9 +1103,10 @@ def test_cubic_w8_precomputed_carrier_matches_dynamic_a8(tokens: int) -> None:
     codes = _make_codes((outputs, input_size), bits).to(device)
     packed = pack_cubic_codes(codes, bits)
     groups = input_size // group_size
-    scale = torch.rand(outputs, groups, device=device, dtype=torch.float32) * 0.1
-    a = torch.full((outputs, groups), 0.5, device=device, dtype=torch.float16)
-    b = torch.full((outputs, groups), 0.25, device=device, dtype=torch.float16)
+    metadata_shape = (outputs // group_out, groups)
+    scale = torch.rand(*metadata_shape, device=device, dtype=torch.float32) * 0.1
+    a = torch.full(metadata_shape, 0.5, device=device, dtype=torch.float16)
+    b = torch.full(metadata_shape, 0.25, device=device, dtype=torch.float16)
     x = torch.randn(tokens, input_size, device=device, dtype=torch.bfloat16)
     carrier = cubic_kernels.cubic_w8_precompute_carrier(
         packed,
@@ -994,13 +1114,21 @@ def test_cubic_w8_precomputed_carrier_matches_dynamic_a8(tokens: int) -> None:
         b,
         group_size=group_size,
         input_size=input_size,
+        group_out=group_out,
     )
-    expected_carrier = _reference_carriers(codes, a, b, bits, group_size)
+    expected_carrier = _reference_carriers(
+        codes,
+        a.repeat_interleave(group_out, dim=0),
+        b.repeat_interleave(group_out, dim=0),
+        bits,
+        group_size,
+    )
     torch.testing.assert_close(carrier, expected_carrier, rtol=0, atol=0)
 
     kwargs = {
         "num_bits": bits,
         "group_size": group_size,
+        "group_out": group_out,
         "input_size": input_size,
     }
     expected = cubic_kernels.cubic_linear_dynamic_a8(x, packed, scale, a, b, **kwargs)
