@@ -14,6 +14,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import Future, InvalidStateError
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum, auto
 from functools import partial
 from multiprocessing.connection import Connection
@@ -38,6 +39,7 @@ from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_pp_group,
     get_tp_group,
+    get_world_group,
     model_parallel_is_initialized,
 )
 from vllm.envs import enable_envs_cache
@@ -800,6 +802,21 @@ class WorkerProc:
         self.worker.shutdown()
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
+        if torch.distributed.is_initialized():
+            try:
+                world_group = get_world_group()
+                if world_group.world_size > 1:
+                    torch.distributed.monitored_barrier(
+                        group=world_group.cpu_group,
+                        timeout=timedelta(
+                            seconds=envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS
+                        ),
+                        wait_all_ranks=True,
+                    )
+            except Exception as e:
+                # A failed rank must not prevent the remaining workers from
+                # releasing their process groups.
+                logger.debug("Process-group shutdown barrier failed: %s", e)
         destroy_model_parallel()
         destroy_distributed_environment()
 

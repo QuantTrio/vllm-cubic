@@ -217,6 +217,11 @@ class CoreEngineProcManager:
         """Shutdown engine core processes with configurable timeout."""
         self.manager_stopped.set()
         if self._finalizer.detach() is not None:
+            # ``shutdown_timeout`` controls request draining. Even when it is
+            # zero, EngineCore still needs time to tear down worker process
+            # groups before its TCPStore disappears.
+            if timeout is not None:
+                timeout += envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS + 4
             shutdown(self.processes, timeout=timeout)
 
     def monitor_engine_liveness(self) -> None:

@@ -3,6 +3,7 @@
 
 import os
 import socket
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -19,6 +20,7 @@ from vllm.v1.engine.core import EngineCoreActorMixin
 from vllm.v1.engine.core_client import BackgroundResources
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
+    CoreEngineProcManager,
     EngineZmqAddresses,
     get_engine_zmq_addresses,
     launch_core_engines,
@@ -110,6 +112,31 @@ def test_background_resources_passes_worker_shutdown_timeout(
     resources = BackgroundResources(ctx=None, engine_manager=engine_manager)
     resources()
     engine_manager.shutdown.assert_called_once_with(timeout=timeout)
+
+
+@pytest.mark.parametrize(
+    ("request_timeout", "expected_process_timeout"),
+    [(0, 11), (3, 14), (11, 22), (None, None)],
+)
+def test_engine_process_shutdown_preserves_cleanup_grace(
+    monkeypatch: pytest.MonkeyPatch,
+    request_timeout: int | None,
+    expected_process_timeout: int | None,
+) -> None:
+    monkeypatch.setenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "7")
+    shutdown = Mock()
+    monkeypatch.setattr("vllm.v1.engine.utils.shutdown", shutdown)
+
+    manager = CoreEngineProcManager.__new__(CoreEngineProcManager)
+    manager.processes = []
+    manager.manager_stopped = threading.Event()
+    manager._finalizer = Mock()
+    manager._finalizer.detach.return_value = object()
+
+    manager.shutdown(timeout=request_timeout)
+
+    assert manager.manager_stopped.is_set()
+    shutdown.assert_called_once_with([], timeout=expected_process_timeout)
 
 
 def _make_vllm_config() -> SimpleNamespace:

@@ -1346,12 +1346,18 @@ class EngineCoreProc(EngineCore):
                 engine_core._send_engine_dead()
             raise e
         finally:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
-            if signal_callback is not None:
-                signal_callback.stop()
-            if engine_core is not None:
-                engine_core.shutdown()
+            try:
+                if engine_core is not None:
+                    engine_core.shutdown()
+            finally:
+                # Keep shutdown signals idempotent until distributed workers
+                # and their TCPStore have been torn down. Restoring the default
+                # handlers earlier lets a duplicate parent signal kill the
+                # EngineCore in the middle of process-group cleanup.
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+                if signal_callback is not None:
+                    signal_callback.stop()
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
