@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+    fused_inv_rope_bf16,
     fused_inv_rope_fp8_quant,
 )
 from vllm.platforms import current_platform
@@ -45,6 +46,33 @@ def deep_gemm_fp8_o_proj(
     Shared by the FlashMLA and FlashInfer CUDA backends. ``einsum_recipe`` /
     ``tma_aligned_scales`` come from ``compute_fp8_einsum_recipe``.
     """
+    weight = getattr(wo_a, "weight", None)
+    if weight is None or weight.dtype != torch.float8_e4m3fn:
+        grouped_o = fused_inv_rope_bf16(
+            o,
+            positions,
+            cos_sin_cache,
+            n_groups=n_groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+        )
+
+        if n_groups == 1:
+            z = wo_a(grouped_o[:, 0])
+            if isinstance(z, tuple):
+                z = z[0]
+            return wo_b(z)
+
+        quant_method = getattr(wo_a, "quant_method", None)
+        if quant_method is not None and hasattr(quant_method, "dequantize"):
+            weight = quant_method.dequantize(wo_a)
+        else:
+            weight = wo_a.weight
+        weight = weight.reshape(n_groups, o_lora_rank, grouped_o.shape[-1])
+        z = torch.einsum("bgi,gri->bgr", grouped_o, weight)
+        return wo_b(z.flatten(1))
+
     o_fp8, o_scale = fused_inv_rope_fp8_quant(
         o,
         positions,

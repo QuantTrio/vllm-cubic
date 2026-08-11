@@ -85,6 +85,16 @@ def _compile_combine_topk_swa_indices_kernel(
     _COMBINE_TOPK_SWA_INDICES_KERNEL.warmup(vllm_config)
 
 
+def _compile_global_topk_indices_kernel(vllm_config: "VllmConfig") -> None:
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        warmup_compute_global_topk_indices_and_lens,
+    )
+
+    topk = int(getattr(vllm_config.model_config.hf_config, "index_topk", 0) or 0)
+    if topk > 0:
+        warmup_compute_global_topk_indices_and_lens(topk)
+
+
 def sparse_mla_triton_warmup(worker: "Worker") -> None:
     runner = worker.model_runner
     if runner.is_pooling_model:
@@ -101,6 +111,7 @@ def sparse_mla_triton_warmup(worker: "Worker") -> None:
             _compile_sparse_swa_prefill_metadata_kernel(vllm_config)
             _compile_prefill_chunk_metadata_kernel(vllm_config)
             _compile_combine_topk_swa_indices_kernel(vllm_config)
+            _compile_global_topk_indices_kernel(vllm_config)
         elif _has_attention_backend(runner, _GENERIC_SPARSE_MLA_BACKENDS):
             _compile_sparse_swa_prefill_metadata_kernel(vllm_config)
             _compile_prefill_chunk_metadata_kernel(vllm_config)

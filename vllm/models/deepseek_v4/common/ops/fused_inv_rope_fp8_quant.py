@@ -15,6 +15,175 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 
 @triton.jit(do_not_specialize=["num_tokens"])
+def _fused_inv_rope_bf16_per_head(
+    o_ptr,
+    positions_ptr,
+    cos_sin_cache_ptr,
+    output_ptr,
+    num_tokens,
+    heads_per_group: tl.constexpr,
+    o_stride_token,
+    o_stride_head,
+    cache_stride_pos,
+    output_stride_token,
+    output_stride_group,
+    output_stride_k,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    ROPE_START: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    grouped_head = tl.program_id(1).to(tl.int64)
+    group = grouped_head // heads_per_group
+    head_in_group = grouped_head % heads_per_group
+    offsets = tl.arange(0, BLOCK_DIM)
+    mask = offsets < HEAD_DIM
+    input_base = o_ptr + token * o_stride_token + grouped_head * o_stride_head
+    values = tl.load(input_base + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    rope_local = offsets - ROPE_START
+    is_rope = mask & (rope_local >= 0)
+    partner = tl.load(
+        input_base + (offsets ^ 1),
+        mask=is_rope,
+        other=0.0,
+    ).to(tl.float32)
+    position = tl.load(positions_ptr + token)
+    cache_base = cos_sin_cache_ptr + position * cache_stride_pos
+    cache_offset = tl.maximum(rope_local >> 1, 0)
+    cosine = tl.load(cache_base + cache_offset, mask=is_rope, other=1.0)
+    sine = tl.load(
+        cache_base + HALF_ROPE + cache_offset,
+        mask=is_rope,
+        other=0.0,
+    )
+    add = values * cosine + partner * sine
+    sub = values * cosine - partner * sine
+    rotated = tl.where((rope_local & 1) == 0, add, sub)
+    values = tl.where(is_rope, rotated, values)
+
+    output_base = (
+        output_ptr
+        + token * output_stride_token
+        + group * output_stride_group
+        + head_in_group * HEAD_DIM * output_stride_k
+    )
+    tl.store(output_base + offsets * output_stride_k, values, mask=mask)
+
+
+def fused_inv_rope_bf16(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+) -> torch.Tensor:
+    """Apply inverse RoPE and emit grouped BF16 attention output."""
+    num_tokens, num_heads, head_dim = o.shape
+    if num_heads != n_groups * heads_per_group:
+        raise ValueError("Attention heads do not match the requested groups.")
+    if head_dim != nope_dim + rope_dim or rope_dim % 2:
+        raise ValueError("Inverse RoPE dimensions are inconsistent.")
+    if cos_sin_cache.shape[-1] != rope_dim:
+        raise ValueError("Inverse RoPE cache has an invalid width.")
+    if not o.is_cuda:
+        rope = o[..., nope_dim:]
+        cos_sin = cos_sin_cache[positions]
+        half_rope = rope_dim // 2
+        cos = cos_sin[..., :half_rope].unsqueeze(-2)
+        sin = cos_sin[..., half_rope:].unsqueeze(-2)
+        even = rope[..., 0::2].float()
+        odd = rope[..., 1::2].float()
+        inv_rope = torch.stack(
+            (even * cos + odd * sin, odd * cos - even * sin), dim=-1
+        ).flatten(-2)
+        grouped = torch.cat((o[..., :nope_dim].float(), inv_rope), dim=-1)
+        return grouped.to(o.dtype).reshape(
+            num_tokens, n_groups, heads_per_group * head_dim
+        )
+    return torch.ops.vllm.fused_inv_rope_bf16_kernel(
+        o,
+        positions,
+        cos_sin_cache,
+        heads_per_group,
+        n_groups,
+        nope_dim,
+        rope_dim,
+    )
+
+
+def _fused_inv_rope_bf16_kernel_impl(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    heads_per_group: int,
+    n_groups: int,
+    nope_dim: int,
+    rope_dim: int,
+) -> torch.Tensor:
+    num_tokens, _, head_dim = o.shape
+    output = torch.empty(
+        num_tokens,
+        n_groups,
+        heads_per_group * head_dim,
+        dtype=o.dtype,
+        device=o.device,
+    )
+    block_dim = triton.next_power_of_2(head_dim)
+    _fused_inv_rope_bf16_per_head[(num_tokens, n_groups * heads_per_group)](
+        o,
+        positions,
+        cos_sin_cache,
+        output,
+        num_tokens,
+        heads_per_group=heads_per_group,
+        o_stride_token=o.stride(0),
+        o_stride_head=o.stride(1),
+        cache_stride_pos=cos_sin_cache.stride(0),
+        output_stride_token=output.stride(0),
+        output_stride_group=output.stride(1),
+        output_stride_k=output.stride(2),
+        HEAD_DIM=head_dim,
+        BLOCK_DIM=block_dim,
+        ROPE_START=nope_dim,
+        HALF_ROPE=rope_dim // 2,
+        num_warps=4,
+        num_stages=1,
+    )
+    return output
+
+
+def _fused_inv_rope_bf16_kernel_fake(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    heads_per_group: int,
+    n_groups: int,
+    nope_dim: int,
+    rope_dim: int,
+) -> torch.Tensor:
+    del positions, cos_sin_cache, nope_dim, rope_dim
+    return torch.empty(
+        o.shape[0],
+        n_groups,
+        heads_per_group * o.shape[2],
+        dtype=o.dtype,
+        device=o.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="fused_inv_rope_bf16_kernel",
+    op_func=_fused_inv_rope_bf16_kernel_impl,
+    fake_impl=_fused_inv_rope_bf16_kernel_fake,
+)
+
+
+@triton.jit(do_not_specialize=["num_tokens"])
 def _fused_inv_rope_fp8_quant_per_head(
     o_ptr,
     positions_ptr,

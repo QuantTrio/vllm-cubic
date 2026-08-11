@@ -68,8 +68,6 @@ def _find_first_mhc_layer(model: torch.nn.Module) -> torch.nn.Module | None:
         if all(
             hasattr(module, attr)
             for attr in (
-                "hc_pre",
-                "hc_post",
                 "hc_attn_fn",
                 "hc_attn_scale",
                 "hc_attn_base",
@@ -102,6 +100,28 @@ def _warmup_layer_mhc(
     hidden_size = int(layer.hidden_size)
     hc_mult = int(layer.hc_mult)
     device = layer.hc_attn_fn.device
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+
+    def split_count(k: int, tokens: int) -> int:
+        grid_size = (tokens + 63) // 64
+        split_k = min(num_sms // grid_size, ((k + 63) // 64) // 4)
+        return max(split_k, 1)
+
+    compile_shapes: dict[tuple[int, int, int], int] = {}
+    for tokens in range(1, max_tokens + 1):
+        broadcast_split = split_count(hidden_size, tokens)
+        if tokens <= 16:
+            fused_split = 8 if tokens < 8 and hidden_size <= 4096 else 4
+            tile_n = 2 if tokens < 8 else 3
+        else:
+            fused_split = split_count(hc_mult * hidden_size, tokens)
+            tile_n = 0
+        compile_shapes.setdefault(
+            (broadcast_split, fused_split, tile_n),
+            tokens,
+        )
+    token_sizes = sorted(compile_shapes.values())
+    logger.info("Resolved DeepSeek V4 mHC compile shapes: %s", token_sizes)
     residual = torch.zeros(
         max_tokens,
         hc_mult,
@@ -109,20 +129,69 @@ def _warmup_layer_mhc(
         dtype=torch.bfloat16,
         device=device,
     )
+    broadcast_fn = getattr(layer, "hc_attn_fn_broadcast", None)
+    attn_norm = getattr(layer, "attn_norm", None)
+    x = torch.zeros(
+        max_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
 
     for size in token_sizes:
         residual_slice = residual[:size]
-        for fn, scale, base in (
-            (layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base),
-            (layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base),
-        ):
-            layer_input, post_mix, comb_mix = layer.hc_pre(
-                residual_slice,
-                fn,
-                scale,
-                base,
+        if hasattr(layer, "hc_pre") and hasattr(layer, "hc_post"):
+            for fn, scale, base in (
+                (layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base),
+                (layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base),
+            ):
+                layer_input, post_mix, comb_mix = layer.hc_pre(
+                    residual_slice,
+                    fn,
+                    scale,
+                    base,
+                )
+                layer.hc_post(layer_input, residual_slice, post_mix, comb_mix)
+        if broadcast_fn is None or attn_norm is None:
+            continue
+
+        from vllm.model_executor.kernels.mhc.tilelang import (
+            mhc_fused_post_pre_tilelang,
+            mhc_pre_broadcast_tilelang,
+        )
+
+        broadcast_residual, post_mix, comb_mix, layer_input = (
+            mhc_pre_broadcast_tilelang(
+                x[:size],
+                layer.hc_attn_fn,
+                layer.hc_attn_scale,
+                layer.hc_attn_base,
+                layer.rms_norm_eps,
+                layer.hc_eps,
+                layer.hc_eps,
+                layer.hc_post_alpha,
+                layer.hc_sinkhorn_iters,
+                norm_weight=attn_norm.weight.data,
+                norm_eps=attn_norm.variance_epsilon,
+                fn_broadcast=broadcast_fn,
             )
-            layer.hc_post(layer_input, residual_slice, post_mix, comb_mix)
+        )
+        mhc_fused_post_pre_tilelang(
+            layer_input,
+            broadcast_residual,
+            post_mix,
+            comb_mix,
+            layer.hc_attn_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+            layer.rms_norm_eps,
+            layer.hc_eps,
+            layer.hc_eps,
+            layer.hc_post_alpha,
+            layer.hc_sinkhorn_iters,
+            norm_weight=attn_norm.weight.data,
+            norm_eps=attn_norm.variance_epsilon,
+        )
 
 
 def _warmup_hc_head(
@@ -194,7 +263,7 @@ def deepseek_v4_mhc_warmup(
 
     started = time.perf_counter()
     logger.info(
-        "Warming up DeepSeek V4 mHC TileLang kernels for token sizes: %s",
+        "Warming up DeepSeek V4 mHC TileLang kernels from candidates: %s",
         token_sizes,
     )
     with torch.inference_mode():

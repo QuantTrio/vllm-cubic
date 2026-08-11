@@ -474,7 +474,14 @@ def compute_global_topk_indices_and_lens(
     return global_topk_indices, topk_lens
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "global_topk_indices_stride",
+        "topk_indices_stride",
+        "block_table_stride",
+        "block_size",
+    ]
+)
 def _compute_global_topk_indices_and_lens_kernel(
     global_topk_indices_ptr,
     global_topk_indices_stride,
@@ -523,6 +530,29 @@ def _compute_global_topk_indices_and_lens_kernel(
 
     # Zero out length for padding tokens.
     tl.store(topk_lens_ptr + token_idx, tl.where(is_valid_token, count, 0))
+
+
+def warmup_compute_global_topk_indices_and_lens(topk: int) -> None:
+    """Compile the sparse-attention index mapping kernel before inference."""
+    warmup = getattr(_compute_global_topk_indices_and_lens_kernel, "warmup", None)
+    assert warmup is not None
+    for aligned in (True, False):
+        int32_ptr = TritonWarmupTensor(torch.int32)
+        warmup(
+            int32_ptr,
+            1,
+            int32_ptr,
+            int32_ptr,
+            1,
+            topk,
+            TritonWarmupTensor(torch.int32, aligned=aligned),
+            int32_ptr,
+            1,
+            64,
+            TritonWarmupTensor(torch.bool, aligned=aligned),
+            TRITON_BLOCK_SIZE=1024,
+            grid=(1,),
+        )
 
 
 # FlashMLA sparse prefill asserts `params.topk % B_TOPK == 0` (see
