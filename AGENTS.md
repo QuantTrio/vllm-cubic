@@ -42,6 +42,14 @@ If work is duplicate/trivial busywork, **do not proceed**. Return a short explan
 
 - **Never use system `python3` or bare `pip`/`pip install`.** All Python commands must go through `uv` and `.venv/bin/python`.
 
+### Upstream synchronization
+
+Before merging or rebasing an upstream vLLM ref, create a named backup ref for
+the current commit and record the upstream target. After resolving the sync,
+run `uv run --no-project --python 3.12 tools/check_cubic_downstream.py` and its
+pytest wrapper. A failed downstream contract blocks the sync commit and push;
+restore or deliberately replace the missing behavior and its regression test.
+
 ### Environment setup
 
 ```bash
