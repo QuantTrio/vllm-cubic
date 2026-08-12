@@ -450,7 +450,7 @@ def test_cubic_linear_kernel_reads_native_packed_width(bits: int):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("bits", (4, 5, 6, 8))
+@pytest.mark.parametrize("bits", range(1, 9))
 @pytest.mark.parametrize(
     ("group_out", "group_size"),
     ((1, 128), (128, 1), (32, 64)),
@@ -469,15 +469,26 @@ def test_cubic_a16_linear_supports_two_dimensional_groups(
     )
     device = torch.device("cuda")
     outputs = inputs = 128
-    magnitude_max = (1 << (bits - 1)) - 1
-    codes = torch.randint(
-        -magnitude_max,
-        magnitude_max + 1,
-        (outputs, inputs),
-        generator=generator,
-        device=device,
-        dtype=torch.int16,
-    )
+    if bits == 1:
+        codes = torch.randint(
+            0,
+            2,
+            (outputs, inputs),
+            generator=generator,
+            device=device,
+            dtype=torch.int16,
+        )
+        codes = codes * 2 - 1
+    else:
+        magnitude_max = (1 << (bits - 1)) - 1
+        codes = torch.randint(
+            -magnitude_max,
+            magnitude_max + 1,
+            (outputs, inputs),
+            generator=generator,
+            device=device,
+            dtype=torch.int16,
+        )
     packed = pack_cubic_codes(codes, bits)
     metadata_shape = (outputs // group_out, inputs // group_size)
     scale = torch.rand(

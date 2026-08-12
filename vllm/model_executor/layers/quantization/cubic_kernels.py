@@ -16,6 +16,11 @@ from vllm.model_executor.layers.fused_moe.activation import (
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
+from vllm.model_executor.layers.quantization.cubic_policy import (
+    CUBIC_ALIGNED_BITS,
+    CUBIC_SUPPORTED_BITS,
+    cubic_token_bucket,
+)
 from vllm.model_executor.layers.quantization.utils.int8_utils import (
     per_token_quant_int8,
     round_int8,
@@ -55,6 +60,9 @@ _CUBIC_LINEAR_TILE_TACTICS: dict[
     tuple[int, bool, int, int, int, int, int, int], tuple[int, int, int, int]
 ] = {}
 _CUBIC_MOE_DENSE_BLOCK_TACTICS: dict[
+    tuple[int, bool, int, int, int, int, int, int, int], int
+] = {}
+_CUBIC_MOE_DENSE_BLOCK_K_TACTICS: dict[
     tuple[int, bool, int, int, int, int, int, int, int], int
 ] = {}
 _CUBIC_MOE_ROUTE_CTA_TACTICS: dict[
@@ -185,6 +193,9 @@ _CUBIC_LINEAR_DENSE_CONFIGS = [
     triton.Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=8, num_stages=3),
     triton.Config({"BLOCK_M": 16, "BLOCK_N": 128}, num_warps=8, num_stages=3),
 ]
 
@@ -338,9 +349,22 @@ def _cubic_a8_moe_grouping(
     local_experts: int,
     num_tokens: int,
     fallback: int,
+    precomputed_3bit_levels: bool = False,
+    fp16_curve: bool = False,
 ) -> int:
-    if group_size < 256:
-        return 1
+    candidates = _cubic_a8_moe_grouping_candidates(
+        num_bits=num_bits,
+        group_size=group_size,
+        group_out=group_out,
+        precomputed_3bit_levels=precomputed_3bit_levels,
+        fp16_curve=fp16_curve,
+    )
+
+    def supported(grouped_routes: int) -> bool:
+        return grouped_routes in candidates
+
+    if not supported(fallback):
+        fallback = 1
     device = torch.accelerator.current_device_index()
     exact = (
         device,
@@ -350,12 +374,13 @@ def _cubic_a8_moe_grouping(
         group_size,
         group_out,
         local_experts,
-        num_tokens,
+        cubic_token_bucket(num_tokens),
     )
     if exact in _CUBIC_A8_MOE_GROUPING_TACTICS:
-        return _CUBIC_A8_MOE_GROUPING_TACTICS[exact]
+        selected = _CUBIC_A8_MOE_GROUPING_TACTICS[exact]
+        return selected if supported(selected) else 1
     matching = [
-        (abs(tokens - num_tokens), grouped)
+        (abs(tokens - cubic_token_bucket(num_tokens)), grouped)
         for (
             dev,
             bits,
@@ -374,7 +399,39 @@ def _cubic_a8_moe_grouping(
         and out_group == group_out
         and experts == local_experts
     ]
-    return min(matching, key=lambda item: item[0])[1] if matching else fallback
+    if matching:
+        selected = min(matching, key=lambda item: item[0])[1]
+        return selected if supported(selected) else 1
+    return fallback
+
+
+def _cubic_a8_moe_grouping_candidates(
+    *,
+    num_bits: int,
+    group_size: int,
+    group_out: int,
+    precomputed_3bit_levels: bool,
+    fp16_curve: bool,
+) -> tuple[int, ...]:
+    """Return complete-layer route groupings with an exact consumer."""
+    if num_bits == 2:
+        return (1, 2, 4) if group_out == 1 and group_size in (256, 512) else (1,)
+    if num_bits == 3:
+        return (
+            (1, 2)
+            if group_out == 1
+            and group_size in (128, 256, 512)
+            and precomputed_3bit_levels
+            else (1,)
+        )
+    if (
+        4 <= num_bits <= 8
+        and group_size in (128, 256, 512)
+        and group_size / (1 << (num_bits - 1)) >= 2
+        and fp16_curve
+    ):
+        return (1, 2, 4, 8)
+    return (1,)
 
 
 def _cubic_moe_use_gemv(
@@ -399,12 +456,12 @@ def _cubic_moe_use_gemv(
         group_size,
         group_out,
         local_experts,
-        num_tokens,
+        cubic_token_bucket(num_tokens),
     )
     if exact in _CUBIC_MOE_EXECUTION_TACTICS:
         return _CUBIC_MOE_EXECUTION_TACTICS[exact]
     matching = [
-        (abs(tokens - num_tokens), use_gemv)
+        (abs(tokens - cubic_token_bucket(num_tokens)), use_gemv)
         for (
             dev,
             a8,
@@ -440,11 +497,20 @@ def _cubic_linear_use_gemv(
     fallback: bool,
 ) -> bool:
     device = torch.accelerator.current_device_index()
-    exact = (device, dynamic_a8, num_bits, n, k, group_size, group_out, m)
+    exact = (
+        device,
+        dynamic_a8,
+        num_bits,
+        n,
+        k,
+        group_size,
+        group_out,
+        cubic_token_bucket(m),
+    )
     if exact in _CUBIC_LINEAR_EXECUTION_TACTICS:
         return _CUBIC_LINEAR_EXECUTION_TACTICS[exact]
     matching = [
-        (abs(tokens - m), use_gemv)
+        (abs(tokens - cubic_token_bucket(m)), use_gemv)
         for (
             dev,
             a8,
@@ -478,11 +544,20 @@ def _cubic_linear_block_k(
     fallback: int,
 ) -> int:
     device = torch.accelerator.current_device_index()
-    exact = (device, dynamic_a8, num_bits, n, k, group_size, group_out, m)
+    exact = (
+        device,
+        dynamic_a8,
+        num_bits,
+        n,
+        k,
+        group_size,
+        group_out,
+        cubic_token_bucket(m),
+    )
     if exact in _CUBIC_LINEAR_BLOCK_K_TACTICS:
         return _CUBIC_LINEAR_BLOCK_K_TACTICS[exact]
     matching = [
-        (abs(tokens - m), block_k)
+        (abs(tokens - cubic_token_bucket(m)), block_k)
         for (
             dev,
             a8,
@@ -516,11 +591,20 @@ def _cubic_linear_tile(
     fallback: tuple[int, int, int, int],
 ) -> tuple[int, int, int, int]:
     device = torch.accelerator.current_device_index()
-    exact = (device, dynamic_a8, num_bits, n, k, group_size, group_out, m)
+    exact = (
+        device,
+        dynamic_a8,
+        num_bits,
+        n,
+        k,
+        group_size,
+        group_out,
+        cubic_token_bucket(m),
+    )
     if exact in _CUBIC_LINEAR_TILE_TACTICS:
         return _CUBIC_LINEAR_TILE_TACTICS[exact]
     matching = [
-        (abs(tokens - m), tile)
+        (abs(tokens - cubic_token_bucket(m)), tile)
         for (
             dev,
             a8,
@@ -564,12 +648,12 @@ def _cubic_moe_dense_block_m(
         group_size,
         group_out,
         local_experts,
-        num_tokens,
+        cubic_token_bucket(num_tokens),
     )
     if exact in _CUBIC_MOE_DENSE_BLOCK_TACTICS:
         return _CUBIC_MOE_DENSE_BLOCK_TACTICS[exact]
     matching = [
-        (abs(tokens - num_tokens), block_m)
+        (abs(tokens - cubic_token_bucket(num_tokens)), block_m)
         for (
             dev,
             a8,
@@ -581,6 +665,57 @@ def _cubic_moe_dense_block_m(
             experts,
             tokens,
         ), block_m in _CUBIC_MOE_DENSE_BLOCK_TACTICS.items()
+        if dev == device
+        and a8 == dynamic_a8
+        and bits == num_bits
+        and hidden == hidden_size
+        and intermediate == intermediate_size
+        and group == group_size
+        and output_group == group_out
+        and experts == local_experts
+    ]
+    return min(matching, key=lambda item: item[0])[1] if matching else fallback
+
+
+def _cubic_moe_dense_block_k(
+    *,
+    dynamic_a8: bool,
+    num_bits: int,
+    hidden_size: int,
+    intermediate_size: int,
+    group_size: int,
+    group_out: int,
+    local_experts: int,
+    num_tokens: int,
+    fallback: int,
+) -> int:
+    device = torch.accelerator.current_device_index()
+    exact = (
+        device,
+        dynamic_a8,
+        num_bits,
+        hidden_size,
+        intermediate_size,
+        group_size,
+        group_out,
+        local_experts,
+        cubic_token_bucket(num_tokens),
+    )
+    if exact in _CUBIC_MOE_DENSE_BLOCK_K_TACTICS:
+        return _CUBIC_MOE_DENSE_BLOCK_K_TACTICS[exact]
+    matching = [
+        (abs(tokens - cubic_token_bucket(num_tokens)), block_k)
+        for (
+            dev,
+            a8,
+            bits,
+            hidden,
+            intermediate,
+            group,
+            output_group,
+            experts,
+            tokens,
+        ), block_k in _CUBIC_MOE_DENSE_BLOCK_K_TACTICS.items()
         if dev == device
         and a8 == dynamic_a8
         and bits == num_bits
@@ -618,13 +753,13 @@ def _cubic_moe_route_ctas(
         group_out,
         local_experts,
         grouped_routes,
-        input_rows,
+        cubic_token_bucket(input_rows),
         top_k,
     )
     if exact in _CUBIC_MOE_ROUTE_CTA_TACTICS:
         return _CUBIC_MOE_ROUTE_CTA_TACTICS[exact]
     matching = [
-        (abs(rows - input_rows), route_ctas)
+        (abs(rows - cubic_token_bucket(input_rows)), route_ctas)
         for (
             dev,
             a8,
@@ -1113,7 +1248,7 @@ def _decode_cubic_lut(
 @triton.autotune(
     configs=_CUBIC_LINEAR_DENSE_CONFIGS,
     key=[
-        "M",
+        "M_BUCKET",
         "N",
         "K",
         "NUM_BITS",
@@ -1124,7 +1259,7 @@ def _decode_cubic_lut(
     ],
     cache_results=True,
 )
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _cubic_linear_kernel(
     a_ptr,
     b_ptr,
@@ -1145,6 +1280,7 @@ def _cubic_linear_kernel(
     stride_sg,
     stride_om,
     stride_on,
+    M_BUCKET: tl.constexpr,
     NUM_BITS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     GROUP_OUT: tl.constexpr,
@@ -1214,7 +1350,7 @@ def _cubic_linear_kernel(
                 cubic_a,
                 cubic_b,
                 NUM_BITS,
-            ).to(activation.dtype)
+            ).to(a_ptr.dtype.element_ty)
         else:
             groups = global_k[:, None] // GROUP_SIZE
             metadata_ptrs = (
@@ -1244,8 +1380,20 @@ def _cubic_linear_kernel(
                 cubic_a,
                 cubic_b,
                 NUM_BITS,
-            ).to(activation.dtype)
-        accumulator = tl.dot(activation, weight, acc=accumulator)
+            ).to(a_ptr.dtype.element_ty)
+        if GROUP_SIZE == 1 and NUM_BITS <= 2:
+            accumulator += tl.sum(
+                activation[:, :, None].to(tl.float32)
+                * weight[None, :, :].to(tl.float32),
+                axis=1,
+            )
+        else:
+            accumulator = tl.dot(
+                activation,
+                weight,
+                acc=accumulator,
+                out_dtype=tl.float32,
+            )
 
     output_offsets = (
         output_ptr + offs_m[:, None] * stride_om + offs_n_raw[None, :] * stride_on
@@ -1259,10 +1407,10 @@ def _cubic_linear_kernel(
 
 @triton.autotune(
     configs=_CUBIC_LINEAR_GEMV_CONFIGS,
-    key=["M", "N", "K", "NUM_BITS", "GROUP_SIZE"],
+    key=["M_BUCKET", "N", "K", "NUM_BITS", "GROUP_SIZE"],
     cache_results=True,
 )
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _cubic_linear_gemv_power2_kernel(
     input_ptr,
     weight_ptr,
@@ -1282,6 +1430,7 @@ def _cubic_linear_gemv_power2_kernel(
     stride_sg,
     stride_om,
     stride_on,
+    M_BUCKET: tl.constexpr,
     NUM_BITS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -1359,10 +1508,18 @@ def _cubic_linear_gemv_power2_kernel(
 
 @triton.autotune(
     configs=_CUBIC_LINEAR_GEMV_CONFIGS,
-    key=["M", "N", "K", "NUM_BITS", "GROUP_SIZE", "GROUP_OUT", "BLOCK_K"],
+    key=[
+        "M_BUCKET",
+        "N",
+        "K",
+        "NUM_BITS",
+        "GROUP_SIZE",
+        "GROUP_OUT",
+        "BLOCK_K",
+    ],
     cache_results=True,
 )
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _cubic_linear_gemv_kernel(
     input_ptr,
     weight_ptr,
@@ -1383,6 +1540,7 @@ def _cubic_linear_gemv_kernel(
     stride_sg,
     stride_om,
     stride_on,
+    M_BUCKET: tl.constexpr,
     NUM_BITS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     GROUP_OUT: tl.constexpr,
@@ -1491,7 +1649,7 @@ def cubic_linear(
     if (
         use_gemv
         and group_out == 1
-        and num_bits in (1, 2, 4, 8)
+        and num_bits in CUBIC_ALIGNED_BITS
         and group_size in (128, 256, 512)
     ):
         packed_words = packed.view(torch.int32)
@@ -1518,6 +1676,7 @@ def cubic_linear(
             scale.stride(1),
             output.stride(0),
             output.stride(1),
+            M_BUCKET=cubic_token_bucket(x_2d.shape[0]),
             NUM_BITS=num_bits,
             GROUP_SIZE=group_size,
         )
@@ -1548,6 +1707,7 @@ def cubic_linear(
             scale.stride(1),
             output.stride(0),
             output.stride(1),
+            M_BUCKET=cubic_token_bucket(x_2d.shape[0]),
             NUM_BITS=num_bits,
             GROUP_SIZE=group_size,
             GROUP_OUT=group_out,
@@ -1580,6 +1740,7 @@ def cubic_linear(
         scale.stride(1),
         output.stride(-2),
         output.stride(1),
+        M_BUCKET=cubic_token_bucket(x_2d.shape[0]),
         NUM_BITS=num_bits,
         GROUP_SIZE=group_size,
         GROUP_OUT=group_out,
@@ -1591,10 +1752,18 @@ def cubic_linear(
 
 @triton.autotune(
     configs=_CUBIC_LINEAR_DENSE_CONFIGS,
-    key=["M", "N", "K", "NUM_BITS", "GROUP_SIZE", "GROUP_OUT", "BLOCK_K"],
+    key=[
+        "M_BUCKET",
+        "N",
+        "K",
+        "NUM_BITS",
+        "GROUP_SIZE",
+        "GROUP_OUT",
+        "BLOCK_K",
+    ],
     cache_results=True,
 )
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _cubic_linear_dynamic_a8_kernel(
     a_ptr,
     a_scale_ptr,
@@ -1616,6 +1785,7 @@ def _cubic_linear_dynamic_a8_kernel(
     stride_sg,
     stride_om,
     stride_on,
+    M_BUCKET: tl.constexpr,
     NUM_BITS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     GROUP_OUT: tl.constexpr,
@@ -1661,47 +1831,57 @@ def _cubic_linear_dynamic_a8_kernel(
             ).to(tl.int32)
         raw = ((low >> shifts) | (high << (8 - shifts))) & ((1 << NUM_BITS) - 1)
 
-        group = (k_block * BLOCK_K) // GROUP_SIZE
-        metadata_offsets = (offs_n // GROUP_OUT) * stride_sn + group * stride_sg
-        metadata_mask = (offs_n_raw < N) & (group < NUM_GROUPS)
+        if GROUP_SIZE == 1:
+            groups = global_k[:, None]
+            metadata_offsets = (
+                offs_n[None, :] // GROUP_OUT
+            ) * stride_sn + groups * stride_sg
+            metadata_mask = weight_mask & (groups < NUM_GROUPS)
+        else:
+            group = (k_block * BLOCK_K) // GROUP_SIZE
+            metadata_offsets = (offs_n // GROUP_OUT) * stride_sn + group * stride_sg
+            metadata_mask = (offs_n_raw < N) & (group < NUM_GROUPS)
         weight_scale = tl.load(
             scale_ptr + metadata_offsets,
             mask=metadata_mask,
             other=0.0,
-        ).to(tl.float32)[None, :]
-        if NUM_BITS == 1:
-            carrier = (raw * 254 - 127).to(tl.int8)
+        ).to(tl.float32)
+        if GROUP_SIZE != 1:
+            weight_scale = weight_scale[None, :]
+        if NUM_BITS > 2:
+            cubic_a = tl.load(
+                cubic_a_ptr + metadata_offsets,
+                mask=metadata_mask,
+                other=1.0,
+            ).to(tl.float32)
+            cubic_b = tl.load(
+                cubic_b_ptr + metadata_offsets,
+                mask=metadata_mask,
+                other=0.0,
+            ).to(tl.float32)
+            if GROUP_SIZE != 1:
+                cubic_a = cubic_a[None, :]
+                cubic_b = cubic_b[None, :]
         else:
-            sign_bit: tl.constexpr = 1 << (NUM_BITS - 1)
-            signed = tl.where(raw >= sign_bit, raw - (1 << NUM_BITS), raw)
-            signed = tl.where(signed == -sign_bit, 0, signed)
-            if NUM_BITS == 2:
-                carrier = (signed * 127).to(tl.int8)
-            else:
-                cubic_a = tl.load(
-                    cubic_a_ptr + metadata_offsets,
-                    mask=metadata_mask,
-                    other=1.0,
-                ).to(tl.float32)[None, :]
-                cubic_b = tl.load(
-                    cubic_b_ptr + metadata_offsets,
-                    mask=metadata_mask,
-                    other=0.0,
-                ).to(tl.float32)[None, :]
-                signed_f32 = signed.to(tl.float32)
-                magnitude_max: tl.constexpr = sign_bit - 1
-                t = tl.abs(signed_f32) / magnitude_max
-                normalized = t * (
-                    cubic_a + t * (cubic_b + t * (1.0 - cubic_a - cubic_b))
+            cubic_a = 1.0
+            cubic_b = 0.0
+        carrier = _cubic_dynamic_a8_carrier(raw, cubic_a, cubic_b, NUM_BITS)
+        if GROUP_SIZE == 1:
+            accumulator += (
+                tl.sum(
+                    activation[:, :, None].to(tl.float32)
+                    * carrier[None, :, :].to(tl.float32)
+                    * weight_scale[None, :, :],
+                    axis=1,
                 )
-                normalized = tl.where(signed < 0, -normalized, normalized)
-                carrier_f32 = tl.extra.cuda.libdevice.rint(normalized * 127.0)
-                carrier = tl.maximum(tl.minimum(carrier_f32, 127.0), -127.0).to(tl.int8)
-
-        partial = tl.dot(activation, carrier, out_dtype=tl.int32)
-        accumulator += (
-            partial.to(tl.float32) * activation_scale * weight_scale * (1.0 / 127.0)
-        )
+                * activation_scale
+                * (1.0 / 127.0)
+            )
+        else:
+            partial = tl.dot(activation, carrier, out_dtype=tl.int32)
+            accumulator += (
+                partial.to(tl.float32) * activation_scale * weight_scale * (1.0 / 127.0)
+            )
 
     output_offsets = (
         output_ptr + offs_m[:, None] * stride_om + offs_n_raw[None, :] * stride_on
@@ -1767,10 +1947,18 @@ def _cubic_dynamic_a8_carrier_lut(
 
 @triton.autotune(
     configs=_CUBIC_LINEAR_GEMV_CONFIGS,
-    key=["M", "N", "K", "NUM_BITS", "GROUP_SIZE", "GROUP_OUT", "BLOCK_K"],
+    key=[
+        "M_BUCKET",
+        "N",
+        "K",
+        "NUM_BITS",
+        "GROUP_SIZE",
+        "GROUP_OUT",
+        "BLOCK_K",
+    ],
     cache_results=True,
 )
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _cubic_linear_dynamic_a8_gemv_kernel(
     input_ptr,
     input_scale_ptr,
@@ -1792,6 +1980,7 @@ def _cubic_linear_dynamic_a8_gemv_kernel(
     stride_sg,
     stride_om,
     stride_on,
+    M_BUCKET: tl.constexpr,
     NUM_BITS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     GROUP_OUT: tl.constexpr,
@@ -1890,9 +2079,9 @@ def cubic_linear_dynamic_a8(
     group_out: int,
 ) -> torch.Tensor:
     """Apply Cubic Linear with runtime per-token INT8 activations."""
-    if num_bits not in range(1, 9):
+    if num_bits not in CUBIC_SUPPORTED_BITS:
         raise ValueError(f"Unsupported Cubic bit width: {num_bits}.")
-    if group_size not in (32, 64, 128, 256, 512):
+    if group_size not in (1, 32, 64, 128, 256, 512):
         raise ValueError(f"Unsupported Cubic Dynamic A8 group size: {group_size}.")
     if x.shape[-1] != input_size:
         raise ValueError(
@@ -1924,6 +2113,8 @@ def cubic_linear_dynamic_a8(
         m=x_2d.shape[0],
         fallback=packed.shape[0] == 1 or x_2d.shape[0] <= 8,
     )
+    if group_size == 1:
+        use_gemv = False
     if use_gemv:
         block_k = min(group_size, 128)
         grid = lambda meta: (
@@ -1951,6 +2142,7 @@ def cubic_linear_dynamic_a8(
             scale.stride(1),
             output.stride(0),
             output.stride(1),
+            M_BUCKET=cubic_token_bucket(x_2d.shape[0]),
             NUM_BITS=num_bits,
             GROUP_SIZE=group_size,
             GROUP_OUT=group_out,
@@ -1983,6 +2175,7 @@ def cubic_linear_dynamic_a8(
         scale.stride(1),
         output.stride(0),
         output.stride(1),
+        M_BUCKET=cubic_token_bucket(x_2d.shape[0]),
         NUM_BITS=num_bits,
         GROUP_SIZE=group_size,
         GROUP_OUT=group_out,
@@ -2292,7 +2485,7 @@ def calibrate_cubic_linear_execution(
         input_size,
         group_size,
         group_out,
-        x.reshape(-1, x.shape[-1]).shape[0],
+        cubic_token_bucket(x.reshape(-1, x.shape[-1]).shape[0]),
     )
     func: Callable[..., torch.Tensor]
     if precomputed_carrier:
@@ -6331,6 +6524,7 @@ def _cubic_moe_gemv_kernel(
 @triton.jit
 def _cubic_moe_kernel(
     input_ptr,
+    input_scale_ptr,
     weight_ptr,
     scale_ptr,
     cubic_a_ptr,
@@ -6366,6 +6560,7 @@ def _cubic_moe_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     TOP_K: tl.constexpr,
     USE_GROUP_LUT: tl.constexpr,
+    DYNAMIC_A8: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(EM, BLOCK_M)
@@ -6411,6 +6606,8 @@ def _cubic_moe_kernel(
             mask=token_mask[:, None] & k_mask[None, :],
             other=0.0,
         )
+        if DYNAMIC_A8:
+            activation = activation.to(output_ptr.dtype.element_ty)
         bit_positions = global_k[:, None] * NUM_BITS
         byte_indices = bit_positions // 8
         shifts = bit_positions % 8
@@ -6477,7 +6674,7 @@ def _cubic_moe_kernel(
                 cubic_a,
                 cubic_b,
                 NUM_BITS,
-            ).to(activation.dtype)
+            ).to(output_ptr.dtype.element_ty)
         else:
             groups = global_k[:, None] // GROUP_SIZE
             if GROUP_OUT >= BLOCK_N and GROUP_OUT % BLOCK_N == 0:
@@ -6517,9 +6714,28 @@ def _cubic_moe_kernel(
                 cubic_a,
                 cubic_b,
                 NUM_BITS,
-            ).to(activation.dtype)
-        accumulator = tl.dot(activation, weight, acc=accumulator)
+            ).to(output_ptr.dtype.element_ty)
+        if GROUP_SIZE == 1 and NUM_BITS <= 2:
+            accumulator += tl.sum(
+                activation[:, :, None].to(tl.float32)
+                * weight[None, :, :].to(tl.float32),
+                axis=1,
+            )
+        else:
+            accumulator = tl.dot(
+                activation,
+                weight,
+                acc=accumulator,
+                out_dtype=tl.float32,
+            )
 
+    if DYNAMIC_A8:
+        activation_scale = tl.load(
+            input_scale_ptr + token_ids // TOP_K,
+            mask=token_mask,
+            other=0.0,
+        ).to(tl.float32)
+        accumulator *= activation_scale[:, None]
     if MUL_ROUTED_WEIGHT:
         routed_weight = tl.load(
             topk_weights_ptr + token_ids, mask=token_mask, other=0.0
@@ -8614,6 +8830,7 @@ def _launch_cubic_moe_gemm(
     sum_routes: bool,
     dense_block_m: int = 16,
     route_ctas: int | None = None,
+    input_scale: torch.Tensor | None = None,
     group_out: int,
 ) -> None:
     del route_ctas
@@ -8629,6 +8846,7 @@ def _launch_cubic_moe_gemm(
     grid = lambda meta: (triton.cdiv(em, block_m) * triton.cdiv(n, meta["BLOCK_N"]),)
     _cubic_moe_kernel[grid](
         inputs,
+        inputs if input_scale is None else input_scale,
         packed,
         scale,
         a,
@@ -8663,6 +8881,7 @@ def _launch_cubic_moe_gemm(
         MUL_ROUTED_WEIGHT=multiply_routed_weight,
         TOP_K=top_k,
         USE_GROUP_LUT=use_group_lut and num_bits <= 4,
+        DYNAMIC_A8=input_scale is not None,
     )
 
 
@@ -8689,12 +8908,16 @@ def _launch_cubic_moe_dynamic_a8(
     route_ctas: int | None = None,
     grouped_routes: int = 1,
     dense_block_m: int = 16,
+    dense_block_k: int = 32,
     carrier_lut: torch.Tensor | None = None,
     group_out: int,
 ) -> None:
     if not use_gemv and group_size == 1:
+        if quantized_inputs is None:
+            quantized_inputs = per_token_quant_int8(inputs.contiguous())
+        inputs_q, input_scale = quantized_inputs
         _launch_cubic_moe_gemm(
-            inputs,
+            inputs_q,
             packed,
             scale,
             a,
@@ -8712,6 +8935,7 @@ def _launch_cubic_moe_dynamic_a8(
             multiply_routed_weight=multiply_routed_weight,
             sum_routes=sum_routes,
             dense_block_m=dense_block_m,
+            input_scale=input_scale,
         )
         return
     if quantized_inputs is None:
@@ -9147,9 +9371,16 @@ def _launch_cubic_moe_dynamic_a8(
         return
     if sum_routes:
         raise ValueError("Cubic Dynamic A8 GEMM does not support route-sum fusion.")
-    if dense_block_m not in (16, 32):
+    if dense_block_m not in (16, 32, 64, 128, 256):
         raise ValueError(f"Unsupported Cubic Dynamic A8 BLOCK_M: {dense_block_m}.")
-    block_m, block_k, group_m = dense_block_m, 32, 8
+    if dense_block_k not in (32, 64, 128):
+        raise ValueError(f"Unsupported Cubic Dynamic A8 BLOCK_K: {dense_block_k}.")
+    if group_size % dense_block_k != 0:
+        raise ValueError(
+            f"Cubic Dynamic A8 BLOCK_K={dense_block_k} must divide "
+            f"GROUP_SIZE={group_size}."
+        )
+    block_m, block_k, group_m = dense_block_m, dense_block_k, 8
     n = packed.shape[1]
     em = sorted_token_ids.shape[0]
     dense_grid = lambda meta: (
@@ -9805,7 +10036,7 @@ def calibrate_cubic_moe_route_ctas(
         group_out,
         packed.shape[0],
         grouped_routes,
-        topk_ids.shape[0],
+        cubic_token_bucket(topk_ids.shape[0]),
         top_k,
     )
     local_expert_fraction = packed.shape[0] / global_num_experts
@@ -10028,7 +10259,11 @@ def calibrate_cubic_moe_route_ctas(
                 else tail_score
             )
             scores.append((burst_score, tail_score, nominal_score, route_ctas))
-        except (RuntimeError, AssertionError) as error:
+        except (
+            RuntimeError,
+            AssertionError,
+            triton.runtime.errors.OutOfResources,
+        ) as error:
             from vllm.logger import init_logger
 
             init_logger(__name__).warning(
@@ -10270,6 +10505,96 @@ def calibrate_cubic_a8_moe_backend(
 
 
 @torch.inference_mode()
+def _cubic_ep_route_scenarios(
+    topk_ids: torch.Tensor,
+    *,
+    expert_map: torch.Tensor | None,
+    global_num_experts: int,
+) -> list[tuple[str, torch.Tensor]]:
+    scenarios = [("nominal", topk_ids)]
+    if expert_map is None:
+        return scenarios
+    local_ids = torch.nonzero(expert_map >= 0).flatten()
+    remote_ids = torch.nonzero(expert_map < 0).flatten()
+    if not local_ids.numel() or not remote_ids.numel():
+        return scenarios
+
+    total_routes = topk_ids.numel()
+    local_fraction = local_ids.numel() / global_num_experts
+    mean = total_routes * local_fraction
+    variance = mean * (1.0 - local_fraction)
+    ep_size = max(1, round(global_num_experts / local_ids.numel()))
+    tail_local_routes = min(
+        total_routes,
+        max(1, math.ceil(mean + math.sqrt(2.0 * variance * math.log(ep_size)))),
+    )
+    observed_local_routes = int((expert_map[topk_ids.long()] >= 0).sum().item())
+    if tail_local_routes == observed_local_routes:
+        return scenarios
+
+    flat_ids = remote_ids[
+        torch.arange(total_routes, device=topk_ids.device) % remote_ids.numel()
+    ]
+    local_positions = (
+        torch.arange(tail_local_routes, device=topk_ids.device)
+        * total_routes
+        // tail_local_routes
+    )
+    flat_ids[local_positions] = local_ids[
+        torch.arange(tail_local_routes, device=topk_ids.device) % local_ids.numel()
+    ]
+    scenarios.append(
+        (
+            f"ep_tail_local={tail_local_routes}",
+            flat_ids.view_as(topk_ids).to(topk_ids.dtype),
+        )
+    )
+    return scenarios
+
+
+def _benchmark_cubic_candidate(
+    launch: Callable[[], torch.Tensor],
+    *,
+    cuda_graph_replay: bool,
+    warmup: int,
+    rep: int,
+) -> float:
+    if not cuda_graph_replay:
+        return triton.testing.do_bench(launch, warmup=warmup, rep=rep)
+
+    launch()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = launch()
+    for _ in range(5):
+        graph.replay()
+    torch.accelerator.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(10):
+        graph.replay()
+    end.record()
+    torch.accelerator.synchronize()
+    estimate = max(start.elapsed_time(end) / 10, 1e-6)
+    warmup_replays = min(100, max(1, round(warmup / estimate)))
+    measured_replays = min(100, max(5, round(rep / estimate)))
+    for _ in range(warmup_replays):
+        graph.replay()
+    start.record()
+    for _ in range(measured_replays):
+        graph.replay()
+    end.record()
+    torch.accelerator.synchronize()
+    score = start.elapsed_time(end) / measured_replays
+    graph.reset()
+    del captured_output
+    return score
+
+
+@torch.inference_mode()
 def calibrate_cubic_a8_moe_layer_backends(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -10350,39 +10675,11 @@ def calibrate_cubic_a8_moe_layer_backends(
         ("triton", "cuda"),
         ("triton", "triton"),
     )
-    route_scenarios = [("observed", topk_ids)]
-    if expert_map is not None:
-        local_global_ids = torch.nonzero(expert_map >= 0).flatten()
-        remote_global_ids = torch.nonzero(expert_map < 0).flatten()
-        if local_global_ids.numel() and remote_global_ids.numel():
-            top_k = topk_ids.shape[1]
-            local_fraction = local_global_ids.numel() / global_num_experts
-            mean = top_k * local_fraction
-            stddev = math.sqrt(top_k * local_fraction * (1.0 - local_fraction))
-            high_local_routes = min(top_k, max(1, math.ceil(mean + 3.0 * stddev)))
-            positions = torch.arange(
-                hidden_states.shape[0], device=topk_ids.device, dtype=torch.int64
-            )[:, None]
-            local_offsets = torch.arange(
-                high_local_routes, device=topk_ids.device, dtype=torch.int64
-            )[None, :]
-            remote_offsets = torch.arange(
-                top_k - high_local_routes,
-                device=topk_ids.device,
-                dtype=torch.int64,
-            )[None, :]
-            dense_local_ids = local_global_ids[
-                (positions * high_local_routes + local_offsets)
-                % local_global_ids.numel()
-            ]
-            dense_remote_ids = remote_global_ids[
-                (positions * (top_k - high_local_routes) + remote_offsets)
-                % remote_global_ids.numel()
-            ]
-            high_ids = torch.cat((dense_local_ids, dense_remote_ids), dim=1).to(
-                topk_ids.dtype
-            )
-            route_scenarios.append((f"high_local={high_local_routes}", high_ids))
+    route_scenarios = _cubic_ep_route_scenarios(
+        topk_ids,
+        expert_map=expert_map,
+        global_num_experts=global_num_experts,
+    )
 
     references: dict[str, torch.Tensor] = {}
     scores: list[tuple[float, tuple[str, str]]] = []
@@ -10457,7 +10754,7 @@ def calibrate_cubic_a8_moe_layer_backends(
         intermediate_size,
         group_out,
         group_size,
-        hidden_states.shape[0],
+        cubic_token_bucket(hidden_states.shape[0]),
         [scenario for scenario, _ in route_scenarios],
         candidate_scores,
         best_gate,
@@ -10491,6 +10788,7 @@ def calibrate_cubic_a8_moe_grouping(
     intermediate_size: int,
     activation_situ_beta: float | None,
     activation_situ_linear_beta: float | None,
+    cuda_graph_replay: bool = False,
 ) -> None:
     """Measure route grouping for a complete route-kernel MoE layer."""
     device = torch.accelerator.current_device_index()
@@ -10502,7 +10800,7 @@ def calibrate_cubic_a8_moe_grouping(
         group_size,
         group_out,
         w1.shape[0],
-        hidden_states.shape[0],
+        cubic_token_bucket(hidden_states.shape[0]),
     )
     execution_key = (
         device,
@@ -10513,13 +10811,19 @@ def calibrate_cubic_a8_moe_grouping(
         group_size,
         group_out,
         w1.shape[0],
-        hidden_states.shape[0],
+        cubic_token_bucket(hidden_states.shape[0]),
     )
     had_execution_tactic = execution_key in _CUBIC_MOE_EXECUTION_TACTICS
     previous_execution_tactic = _CUBIC_MOE_EXECUTION_TACTICS.get(execution_key)
     _CUBIC_MOE_EXECUTION_TACTICS[execution_key] = True
-    reference: torch.Tensor | None = None
+    route_scenarios = _cubic_ep_route_scenarios(
+        topk_ids,
+        expert_map=expert_map,
+        global_num_experts=global_num_experts,
+    )
+    references: dict[str, torch.Tensor] = {}
     scores: list[tuple[float, int]] = []
+    score_details: dict[int, list[tuple[str, float]]] = {}
     args = (
         hidden_states,
         w1,
@@ -10531,7 +10835,6 @@ def calibrate_cubic_a8_moe_grouping(
         w2_a,
         w2_b,
         topk_weights,
-        topk_ids,
     )
     kwargs: dict[str, Any] = dict(
         activation=activation,
@@ -10546,22 +10849,64 @@ def calibrate_cubic_a8_moe_grouping(
         activation_situ_beta=activation_situ_beta,
         activation_situ_linear_beta=activation_situ_linear_beta,
     )
-    candidates = (1,) if group_size < 256 else (1, 2, 4, 8) if num_bits >= 4 else (1, 2)
+    candidates = _cubic_a8_moe_grouping_candidates(
+        num_bits=num_bits,
+        group_size=group_size,
+        group_out=group_out,
+        precomputed_3bit_levels=(
+            num_bits == 3
+            and w1_a.dtype == torch.int8
+            and w1_b.dtype == torch.int8
+            and w2_a.dtype == torch.int8
+            and w2_b.dtype == torch.int8
+        ),
+        fp16_curve=(
+            w1_a.dtype == torch.float16
+            and w1_b.dtype == torch.float16
+            and w2_a.dtype == torch.float16
+            and w2_b.dtype == torch.float16
+        ),
+    )
     for grouped_routes in candidates:
         _CUBIC_A8_MOE_GROUPING_TACTICS[key] = grouped_routes
-
-        def launch() -> torch.Tensor:
-            return cubic_fused_moe_dynamic_a8(*args, **kwargs)
-
         try:
-            output = launch()
-            torch.accelerator.synchronize()
-            if reference is None:
-                reference = output
-            else:
-                torch.testing.assert_close(output, reference, rtol=0.02, atol=0.02)
-            score = triton.testing.do_bench(launch, warmup=10, rep=30)
-            scores.append((score, grouped_routes))
+            scenario_scores = []
+            for scenario, scenario_topk_ids in route_scenarios:
+
+                def launch(scenario_topk_ids=scenario_topk_ids) -> torch.Tensor:
+                    return cubic_fused_moe_dynamic_a8(
+                        *args,
+                        scenario_topk_ids,
+                        **kwargs,
+                    )
+
+                output = launch()
+                torch.accelerator.synchronize()
+                if scenario not in references:
+                    references[scenario] = output
+                else:
+                    torch.testing.assert_close(
+                        output,
+                        references[scenario],
+                        rtol=0.02,
+                        atol=0.02,
+                    )
+                scenario_scores.append(
+                    _benchmark_cubic_candidate(
+                        launch,
+                        cuda_graph_replay=cuda_graph_replay,
+                        warmup=10,
+                        rep=30,
+                    )
+                )
+            score_details[grouped_routes] = list(
+                zip(
+                    (scenario for scenario, _ in route_scenarios),
+                    scenario_scores,
+                    strict=True,
+                )
+            )
+            scores.append((max(scenario_scores), grouped_routes))
         except (RuntimeError, AssertionError) as error:
             from vllm.logger import init_logger
 
@@ -10593,17 +10938,25 @@ def calibrate_cubic_a8_moe_grouping(
     from vllm.logger import init_logger
 
     candidate_scores = ", ".join(
-        f"grouped-{grouping}={score:.4f}ms" for score, grouping in scores
+        f"grouped-{grouping}={score:.4f}ms ("
+        + ", ".join(
+            f"{scenario}={scenario_score:.4f}ms"
+            for scenario, scenario_score in score_details[grouping]
+        )
+        + ")"
+        for score, grouping in scores
     )
     init_logger(__name__).info(
         "Cubic A8 route grouping: W%d H=%d I=%d G=%dx%d M=%d "
-        "candidates=[%s], selected=%d (%.4f ms)",
+        "mode=%s routes=%s candidates=[%s], selected=%d (%.4f ms)",
         num_bits,
         hidden_size,
         intermediate_size,
         group_out,
         group_size,
         hidden_states.shape[0],
+        "cuda_graph" if cuda_graph_replay else "eager_cold_l2",
+        [scenario for scenario, _ in route_scenarios],
         candidate_scores,
         best_grouping,
         best_score,
@@ -10647,7 +11000,7 @@ def calibrate_cubic_moe_execution(
         group_size,
         group_out,
         w1.shape[0],
-        hidden_states.shape[0],
+        cubic_token_bucket(hidden_states.shape[0]),
     )
     func = cubic_fused_moe_dynamic_a8 if dynamic_a8 else cubic_fused_moe
     args = (
@@ -10677,11 +11030,37 @@ def calibrate_cubic_moe_execution(
         activation_situ_linear_beta=activation_situ_linear_beta,
     )
     reference: torch.Tensor | None = None
-    scores: list[tuple[float, bool, int]] = []
-    candidates = ((True, 16), (False, 16), (False, 32))
-    for use_gemv, dense_block_m in candidates:
+    scores: list[tuple[float, bool, int, int]] = []
+    candidates: tuple[tuple[bool, int, int], ...] = (
+        (True, 16, 32),
+        (False, 16, 32),
+        (False, 32, 32),
+    )
+    block_ms = (16, 32)
+    block_ks = (32,)
+    if dynamic_a8:
+        block_ms = (16, 32, 64, 128, 256)
+        block_ks = (
+            (32,)
+            if group_size == 1
+            else tuple(
+                block_k for block_k in (32, 64, 128) if group_size % block_k == 0
+            )
+        )
+        initial_block_k = block_ks[-1]
+        candidates = ((True, 16, 32),) + tuple(
+            (False, block_m, initial_block_k) for block_m in block_ms
+        )
+
+    def measure_candidate(
+        use_gemv: bool,
+        dense_block_m: int,
+        dense_block_k: int,
+    ) -> None:
+        nonlocal reference
         _CUBIC_MOE_EXECUTION_TACTICS[key] = use_gemv
         _CUBIC_MOE_DENSE_BLOCK_TACTICS[key] = dense_block_m
+        _CUBIC_MOE_DENSE_BLOCK_K_TACTICS[key] = dense_block_k
 
         def launch() -> torch.Tensor:
             return func(*args, **kwargs)
@@ -10704,37 +11083,65 @@ def calibrate_cubic_moe_execution(
                 warmup=5 if large else 10,
                 rep=10 if large else 30,
             )
-            scores.append((score, use_gemv, dense_block_m))
-        except (RuntimeError, AssertionError) as error:
+            scores.append((score, use_gemv, dense_block_m, dense_block_k))
+        except (
+            RuntimeError,
+            AssertionError,
+            triton.runtime.errors.OutOfResources,
+        ) as error:
             from vllm.logger import init_logger
 
             init_logger(__name__).warning(
                 "Skipping Cubic %s W%d %s for H=%d I=%d M=%d: %s",
                 "A8" if dynamic_a8 else "A16",
                 num_bits,
-                "GEMV" if use_gemv else f"GEMM/B{dense_block_m}",
+                ("GEMV" if use_gemv else f"GEMM/M{dense_block_m}/K{dense_block_k}"),
                 hidden_size,
                 intermediate_size,
                 hidden_states.shape[0],
                 error,
             )
+
+    for candidate in candidates:
+        measure_candidate(*candidate)
+    if dynamic_a8:
+        dense_scores = [item for item in scores if not item[1]]
+        if dense_scores:
+            _, _, selected_block_m, initial_block_k = min(dense_scores)
+            for block_k in block_ks:
+                if block_k != initial_block_k:
+                    measure_candidate(False, selected_block_m, block_k)
+            selected_block_k = min(
+                item for item in scores if not item[1] and item[2] == selected_block_m
+            )[3]
+            if selected_block_k != initial_block_k:
+                measured = {
+                    (use_gemv, block_m, block_k)
+                    for _, use_gemv, block_m, block_k in scores
+                }
+                for block_m in block_ms:
+                    candidate = (False, block_m, selected_block_k)
+                    if candidate not in measured:
+                        measure_candidate(*candidate)
     if not scores:
         _CUBIC_MOE_EXECUTION_TACTICS.pop(key, None)
         _CUBIC_MOE_DENSE_BLOCK_TACTICS.pop(key, None)
+        _CUBIC_MOE_DENSE_BLOCK_K_TACTICS.pop(key, None)
         return
-    measured_best = min(score for score, _, _ in scores)
+    measured_best = min(score for score, _, _, _ in scores)
     near_best = [item for item in scores if item[0] <= measured_best * 1.01]
-    best_score, best_use_gemv, best_block_m = min(
+    best_score, best_use_gemv, best_block_m, best_block_k = min(
         near_best,
-        key=lambda item: (not item[1], item[2]),
+        key=lambda item: (not item[1], item[2], item[3]),
     )
     _CUBIC_MOE_EXECUTION_TACTICS[key] = best_use_gemv
     _CUBIC_MOE_DENSE_BLOCK_TACTICS[key] = best_block_m
+    _CUBIC_MOE_DENSE_BLOCK_K_TACTICS[key] = best_block_k
     from vllm.logger import init_logger
 
     candidate_scores = ", ".join(
-        f"{'GEMV' if use_gemv else f'GEMM/B{block_m}'}={score:.4f}ms"
-        for score, use_gemv, block_m in scores
+        f"{'GEMV' if use_gemv else f'GEMM/M{block_m}/K{block_k}'}={score:.4f}ms"
+        for score, use_gemv, block_m, block_k in scores
     )
     init_logger(__name__).info(
         "Cubic %s execution: W%d H=%d I=%d G=%dx%d M=%d %s (%.4f ms)",
@@ -10746,7 +11153,7 @@ def calibrate_cubic_moe_execution(
         group_size,
         hidden_states.shape[0],
         f"candidates=[{candidate_scores}], selected="
-        + ("GEMV" if best_use_gemv else f"GEMM/B{best_block_m}"),
+        + ("GEMV" if best_use_gemv else f"GEMM/M{best_block_m}/K{best_block_k}"),
         best_score,
     )
 
@@ -11116,7 +11523,7 @@ def cubic_fused_moe_dynamic_a8(
     _pipeline_chunked: bool = False,
 ) -> torch.Tensor:
     """Apply Cubic fused MoE with dynamic per-token INT8 activations."""
-    if num_bits not in range(1, 9):
+    if num_bits not in CUBIC_SUPPORTED_BITS:
         raise ValueError(f"Unsupported Cubic bit width: {num_bits}.")
     if group_size not in (1, 32, 64, 128, 256, 512):
         raise ValueError(f"Unsupported Cubic Dynamic A8 group size: {group_size}.")
@@ -11272,6 +11679,19 @@ def cubic_fused_moe_dynamic_a8(
             local_experts=w1.shape[0],
             num_tokens=num_tokens,
             fallback=grouped_routes,
+            precomputed_3bit_levels=(
+                num_bits == 3
+                and w1_a.dtype == torch.int8
+                and w1_b.dtype == torch.int8
+                and w2_a.dtype == torch.int8
+                and w2_b.dtype == torch.int8
+            ),
+            fp16_curve=(
+                w1_a.dtype == torch.float16
+                and w1_b.dtype == torch.float16
+                and w2_a.dtype == torch.float16
+                and w2_b.dtype == torch.float16
+            ),
         )
     # Dense W3 with precomputed carriers is weight-decode limited.  A 32-row
     # expert tile reuses every decoded carrier across twice as many routes and
@@ -11299,6 +11719,17 @@ def cubic_fused_moe_dynamic_a8(
         local_experts=w1.shape[0],
         num_tokens=num_tokens,
         fallback=dense_block_m,
+    )
+    dense_block_k = _cubic_moe_dense_block_k(
+        dynamic_a8=True,
+        num_bits=num_bits,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        group_size=group_size,
+        group_out=group_out,
+        local_experts=w1.shape[0],
+        num_tokens=num_tokens,
+        fallback=32,
     )
     use_sm120_fallbacks = torch.cuda.get_device_capability(hidden_states.device) == (
         12,
@@ -11471,6 +11902,7 @@ def cubic_fused_moe_dynamic_a8(
             route_ctas=route_ctas,
             grouped_routes=grouped_routes,
             dense_block_m=dense_block_m,
+            dense_block_k=dense_block_k,
         )
     if not fused_2bit_situ and activation == MoEActivation.SITU:
         if activation_situ_beta is None:
@@ -11633,6 +12065,28 @@ def cubic_fused_moe_dynamic_a8(
                     num_tokens=chunk_tokens,
                     fallback=chunk_use_gemv,
                 )
+                chunk_dense_block_m = _cubic_moe_dense_block_m(
+                    dynamic_a8=True,
+                    num_bits=num_bits,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    group_size=group_size,
+                    group_out=group_out,
+                    local_experts=w2.shape[0],
+                    num_tokens=chunk_tokens,
+                    fallback=dense_block_m,
+                )
+                chunk_dense_block_k = _cubic_moe_dense_block_k(
+                    dynamic_a8=True,
+                    num_bits=num_bits,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    group_size=group_size,
+                    group_out=group_out,
+                    local_experts=w2.shape[0],
+                    num_tokens=chunk_tokens,
+                    fallback=dense_block_k,
+                )
                 # An online carrier is only produced after the enclosing
                 # shape selected its route consumer.  A smaller workspace
                 # slice cannot fall through to the dense per-token consumer:
@@ -11670,19 +12124,15 @@ def cubic_fused_moe_dynamic_a8(
                         local_experts=w2.shape[0],
                         num_tokens=chunk_tokens,
                         fallback=chunk_grouped_routes,
+                        precomputed_3bit_levels=(
+                            num_bits == 3
+                            and w2_a.dtype == torch.int8
+                            and w2_b.dtype == torch.int8
+                        ),
+                        fp16_curve=(
+                            w2_a.dtype == torch.float16 and w2_b.dtype == torch.float16
+                        ),
                     )
-                if (
-                    chunk_use_gemv
-                    and group_out > 1
-                    and group_size >= 128
-                    and 4 <= num_bits <= 8
-                ):
-                    if chunk_tokens >= 256:
-                        chunk_grouped_routes = 8
-                    elif chunk_tokens >= 16:
-                        chunk_grouped_routes = 4
-                    else:
-                        chunk_grouped_routes = 1
                 # The exact Cubic8 kernel maps one expert id per valid route;
                 # unlike the pair/quad DP4A kernels it does not interpret an
                 # expert id as covering several aligned routes.
@@ -11810,7 +12260,8 @@ def cubic_fused_moe_dynamic_a8(
                         ),
                         route_ctas=chunk_route_ctas,
                         grouped_routes=chunk_grouped_routes,
-                        dense_block_m=dense_block_m,
+                        dense_block_m=chunk_dense_block_m,
+                        dense_block_k=chunk_dense_block_k,
                     )
                 if use_sm120_fallbacks:
                     torch.sum(
@@ -11981,6 +12432,7 @@ def cubic_fused_moe_dynamic_a8(
             route_ctas=down_route_ctas,
             grouped_routes=grouped_routes,
             dense_block_m=dense_block_m,
+            dense_block_k=dense_block_k,
         )
     if fuse_route_sum:
         return w2_output

@@ -25,11 +25,11 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.cubic_policy import CUBIC_SUPPORTED_BITS
 from vllm.model_executor.parameter import PackedvLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 
 CUBIC_FORMAT = "cubic-pack-quantized"
-CUBIC_SUPPORTED_BITS = tuple(range(1, 9))
 
 
 def _normalize_group_size(value: Any) -> tuple[int, int]:

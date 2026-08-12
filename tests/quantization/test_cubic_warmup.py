@@ -1,10 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from pathlib import Path
+
 import torch
 
 from vllm.model_executor.warmup import cubic_warmup
 from vllm.model_executor.warmup.cubic_warmup import _assign_cubic_tasks
+
+
+def test_cubic_tactic_cache_key_allows_unbundled_native_sources(monkeypatch):
+    original_read_bytes = Path.read_bytes
+
+    def read_installed_source(path: Path) -> bytes:
+        if path.suffix == ".cu":
+            raise FileNotFoundError(path)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_installed_source)
+    monkeypatch.setattr(
+        cubic_warmup, "_cubic_device_fingerprint", lambda: ("cuda", "sm90")
+    )
+    monkeypatch.setattr(cubic_warmup, "_cubic_model_signature", lambda *_: [])
+
+    cache_key = cubic_warmup._cubic_tactic_cache_key(torch.nn.Identity(), (1,))
+
+    assert len(cache_key) == 64
 
 
 def test_cubic_w2_situ_specs_keep_the_normalized_output_group():
@@ -176,8 +197,19 @@ def test_cubic_calibration_keeps_large_linear_buckets_beyond_capture_sizes():
         (1, 2, 4, 8, 16, 32, 64, 128, 256, 512),
     )
 
-    assert 32 in buckets
-    assert 128 in buckets
-    assert 512 in buckets
-    assert 1024 in buckets
-    assert 8192 in buckets
+    assert buckets == (
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+    )

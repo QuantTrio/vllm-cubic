@@ -29,10 +29,14 @@ from vllm.model_executor.layers.quantization.cubic import (
     CubicMoEMethod,
     cubic_carrier_levels,
 )
+from vllm.model_executor.layers.quantization.cubic_policy import (
+    CUBIC_TOKEN_BUCKETS,
+    cubic_token_bucket,
+)
 
 logger = init_logger(__name__)
 
-_CUBIC_TACTIC_CACHE_SCHEMA = 15
+_CUBIC_TACTIC_CACHE_SCHEMA = 20
 _CUBIC_TACTIC_CACHE_FILENAME = "cubic_tactics.json"
 _CUBIC_TACTIC_REGISTRY_NAMES = (
     "_CUBIC_W2_A8_SITU_TACTICS",
@@ -44,6 +48,7 @@ _CUBIC_TACTIC_REGISTRY_NAMES = (
     "_CUBIC_LINEAR_BLOCK_K_TACTICS",
     "_CUBIC_LINEAR_TILE_TACTICS",
     "_CUBIC_MOE_DENSE_BLOCK_TACTICS",
+    "_CUBIC_MOE_DENSE_BLOCK_K_TACTICS",
     "_CUBIC_MOE_ROUTE_CTA_TACTICS",
     "_CUBIC8_W2_BLOCK_N_TACTICS",
     "_CUBIC8_W2_LUT_TACTICS",
@@ -116,6 +121,10 @@ def _cubic_tactic_cache_key(
         / "layers"
         / "quantization"
         / "cubic_kernels.py",
+        Path(__file__).resolve().parents[1]
+        / "layers"
+        / "quantization"
+        / "cubic_policy.py",
         Path(__file__).resolve().parents[3]
         / "csrc"
         / "libtorch_stable"
@@ -138,7 +147,11 @@ def _cubic_tactic_cache_key(
     )
     source_hash = hashlib.sha256()
     for path in source_paths:
-        source_hash.update(path.read_bytes())
+        source_hash.update(path.name.encode())
+        try:
+            source_hash.update(path.read_bytes())
+        except FileNotFoundError:
+            source_hash.update(b"<source-not-packaged>")
     extension_identity: list[Any] = []
     try:
         import vllm._C_stable_libtorch as vllm_extension
@@ -578,18 +591,9 @@ def _cubic_w2_a8_situ_specs(
 def _calibration_token_buckets(
     max_tokens: int, capture_sizes: tuple[int, ...]
 ) -> tuple[int, ...]:
-    targets = (1, 8, 16, 32, 64, 128, 256, 512, 1024, max_tokens)
-    available = tuple(
-        sorted({value for value in capture_sizes if 0 < value <= max_tokens})
-    )
-    if not available:
-        return tuple(sorted({min(max(value, 1), max_tokens) for value in targets}))
-    selected = {
-        min(available, key=lambda value: abs(value - target)) for target in targets[:-1]
-    }
-    selected.add(min(1024, max_tokens))
-    selected.add(max_tokens)
-    return tuple(sorted(selected))
+    del capture_sizes
+    largest_bucket = cubic_token_bucket(max_tokens)
+    return tuple(bucket for bucket in CUBIC_TOKEN_BUCKETS if bucket <= largest_bucket)
 
 
 @torch.inference_mode()
@@ -812,6 +816,7 @@ def _warmup_cubic_moe_families(
     owned_tasks: set[CalibrationTask] | None = None,
     progress: _CalibrationProgress | None = None,
     calibrate: bool = True,
+    graph_capture_sizes: tuple[int, ...] = (),
 ) -> None:
     from vllm.model_executor.layers.quantization.cubic_kernels import (
         _cubic_a8_moe_grouping,
@@ -1002,6 +1007,7 @@ def _warmup_cubic_moe_families(
                     activation_situ_linear_beta=(
                         method.moe.activation_situ_linear_beta
                     ),
+                    cuda_graph_replay=tokens in graph_capture_sizes,
                 )
                 grouped_routes = _cubic_a8_moe_grouping(
                     num_bits=bits,
@@ -1012,6 +1018,19 @@ def _warmup_cubic_moe_families(
                     local_experts=experts,
                     num_tokens=tokens,
                     fallback=grouped_routes,
+                    precomputed_3bit_levels=(
+                        bits == 3
+                        and a8_a.dtype == torch.int8
+                        and a8_b.dtype == torch.int8
+                        and a8_w2_a.dtype == torch.int8
+                        and a8_w2_b.dtype == torch.int8
+                    ),
+                    fp16_curve=(
+                        a8_a.dtype == torch.float16
+                        and a8_b.dtype == torch.float16
+                        and a8_w2_a.dtype == torch.float16
+                        and a8_w2_b.dtype == torch.float16
+                    ),
                 )
             # Singleton routes have a generic Triton competitor for W2-W8;
             # paired W2 additionally has its dedicated Triton pair kernel.
@@ -1318,7 +1337,10 @@ def cubic_kernel_warmup(
         ("MoE", _warmup_cubic_moe_families),
     ):
         try:
-            warmup(model, token_buckets, owned_tasks, progress)
+            warmup_kwargs = (
+                {"graph_capture_sizes": capture_sizes} if family == "MoE" else {}
+            )
+            warmup(model, token_buckets, owned_tasks, progress, **warmup_kwargs)
         except (RuntimeError, AssertionError, ValueError) as error:
             calibration_complete = False
             logger.warning(
@@ -1403,6 +1425,7 @@ def cubic_kernel_warmup(
         model,
         token_buckets,
         calibrate=False,
+        graph_capture_sizes=capture_sizes,
     )
     torch.accelerator.synchronize()
     compatible_complete = all(
