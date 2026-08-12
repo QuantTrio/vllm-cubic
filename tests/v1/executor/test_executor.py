@@ -71,8 +71,8 @@ class _FakeProcess:
 @pytest.mark.parametrize(
     ("timeout", "exits_at", "expected_terminate"),
     [
-        pytest.param(6, 5, False, id="worker-exits-before-timeout"),
-        pytest.param(6, 7, True, id="worker-exceeds-timeout"),
+        pytest.param(6, 9, False, id="worker-exits-during-cleanup-grace"),
+        pytest.param(6, 11, True, id="worker-exceeds-cleanup-grace"),
     ],
 )
 def test_multiproc_executor_worker_termination_timeout(

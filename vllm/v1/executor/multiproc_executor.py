@@ -454,9 +454,12 @@ class MultiprocExecutor(Executor):
             "[shutdown] Executor: waiting for worker exit count=%d",
             initial_count,
         )
-        if wait_for_termination(
-            active_procs(), timeout=envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS
-        ):
+        # A worker may spend the configured timeout in the distributed
+        # shutdown barrier before it can destroy its process groups.  Keep a
+        # separate grace period so the parent does not SIGTERM it at the same
+        # deadline and leave TCPStore heartbeat threads behind.
+        cleanup_timeout = envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS + 4
+        if wait_for_termination(active_procs(), timeout=cleanup_timeout):
             logger.info_once("[shutdown] Executor: all workers exited gracefully")
             return
 
