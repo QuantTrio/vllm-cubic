@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from math import lcm
 from typing import NamedTuple
 
 from vllm import envs
@@ -591,12 +592,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
     @property
     def _cache_hit_alignment_tokens(self) -> int:
         # Fine-grained partial hits may return hash-block-aligned lengths;
-        # otherwise it must stay scheduler-block-aligned.
-        return (
+        # otherwise it must stay scheduler-block-aligned. Recurrent kernels can
+        # impose a coarser arithmetic boundary than either cache block size.
+        alignment = (
             self.hash_block_size
             if self.enable_partial_hash_hits
             else self.scheduler_block_size
         )
+        for group in self.kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, MambaSpec):
+                alignment = lcm(alignment, spec.recurrent_state_alignment)
+        return alignment
 
     def verify_and_split_kv_cache_groups(self) -> None:
         """

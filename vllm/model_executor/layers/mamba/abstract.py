@@ -71,6 +71,9 @@ class MambaBase(AttentionLayerBase):
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         pass
 
+    def get_recurrent_state_alignment(self) -> int:
+        return 1
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         mamba_block_size = vllm_config.cache_config.mamba_block_size
         assert mamba_block_size is not None
@@ -88,6 +91,7 @@ class MambaBase(AttentionLayerBase):
                 if vllm_config.speculative_config
                 else 0,
             ),
+            recurrent_state_alignment=self.get_recurrent_state_alignment(),
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:

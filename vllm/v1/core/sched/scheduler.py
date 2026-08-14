@@ -5,6 +5,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
+from math import lcm
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -53,7 +54,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -298,15 +299,32 @@ class Scheduler(SchedulerInterface):
         # Blocks that async KV loads will overwrite this step, skipped from
         # zeroing since the zeroing could race the out-of-band write.
         self._skip_zero_block_ids: set[int] = set()
-        self.need_mamba_block_aligned_split = (
-            self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+        self.mamba_prefill_alignment = self.cache_config.block_size
+        self.mamba_recurrent_state_alignment = 1
+        has_recurrent_arithmetic_alignment = False
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, MambaSpec):
+                has_recurrent_arithmetic_alignment |= spec.recurrent_state_alignment > 1
+                self.mamba_recurrent_state_alignment = lcm(
+                    self.mamba_recurrent_state_alignment,
+                    spec.recurrent_state_alignment,
+                )
+                self.mamba_prefill_alignment = lcm(
+                    self.mamba_prefill_alignment,
+                    spec.recurrent_state_alignment,
+                )
+        self.need_mamba_block_aligned_split = self.has_mamba_layers and (
+            self.cache_config.mamba_cache_mode == "align"
+            or has_recurrent_arithmetic_alignment
         )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
         # hash boundary, so the split adds that stop.
         self.mamba_partial_cache_hit = (
             self.need_mamba_block_aligned_split
-            and self.hash_block_size < self.block_size
+            and self.cache_config.enable_prefix_caching
+            and self.hash_block_size < self.cache_config.block_size
         )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
@@ -372,7 +390,9 @@ class Scheduler(SchedulerInterface):
         if start >= prefill_end:
             return num_new_tokens
 
-        block_size = self.cache_config.block_size
+        block_size = getattr(
+            self, "mamba_prefill_alignment", self.cache_config.block_size
+        )
         # The last block-aligned position whose state can be cached. This is a
         # property of the prompt, so speculative decoding must not change the
         # fresh-prefill segmentation. EAGLE cache-hit rewind is handled by the
@@ -400,6 +420,9 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit
             else 0
         )
+        state_alignment = getattr(self, "mamba_recurrent_state_alignment", 1)
+        if tail_boundary % state_alignment != 0:
+            tail_boundary = 0
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.

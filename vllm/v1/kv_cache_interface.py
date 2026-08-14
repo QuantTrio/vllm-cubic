@@ -739,6 +739,7 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    recurrent_state_alignment: int = 1
 
     @property
     def page_size_bytes(self) -> int:

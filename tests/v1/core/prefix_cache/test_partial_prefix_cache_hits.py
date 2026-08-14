@@ -149,6 +149,24 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
     assert scheduled_chunks == [384, 128, 384, 128, 276]
 
 
+def test_mamba_align_split_respects_recurrent_arithmetic_alignment():
+    """Fresh and cache-affected prefills use the same recurrent chunk boundary."""
+    mock = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=400),
+        mamba_prefill_alignment=1600,
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=4000),
+        hash_block_size=32,
+        mamba_partial_cache_hit=True,
+    )
+    split = Scheduler._mamba_block_aligned_split
+    req = make_request("0", [0] * 9000, 32, sha256)
+
+    assert split(self=mock, request=req, num_new_tokens=4000) == 3200
+    req.num_computed_tokens = 3200
+    assert split(self=mock, request=req, num_new_tokens=4000) == 3200
+
+
 def test_hybrid_mamba_align_partial_hash_hit():
     hash_block_size = 2
     mamba_block_size = 2 * hash_block_size
@@ -1245,3 +1263,53 @@ def test_hybrid_partial_hit_with_eagle_stays_within_group_blocks():
         len(group) * block_size >= num_computed for group in computed_blocks.blocks
     )
     assert manager.allocate_slots(req1, 4, num_computed, computed_blocks) is not None
+
+
+def test_hybrid_eagle_hits_use_joint_state_alignment():
+    """EAGLE rewind must not expose a sub-state-boundary Mamba hit."""
+    hash_block_size = 2
+    full_block_size = 4
+    mamba_block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=full_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    recurrent_state_alignment=mamba_block_size,
+                ),
+            ),
+        ],
+    )
+
+    eagle = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    plain = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=False,
+    )
+
+    assert eagle.coordinator._cache_hit_alignment_tokens == mamba_block_size
+    assert plain.coordinator._cache_hit_alignment_tokens == mamba_block_size

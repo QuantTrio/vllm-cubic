@@ -349,6 +349,9 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+    def get_recurrent_state_alignment(self) -> int:
+        return FLA_CHUNK_SIZE
+
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -1259,8 +1262,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert spec_token_indx is not None
             assert non_spec_token_indx is not None
             pure_spec_decode = (
-                attn_metadata.num_prefills == 0
-                and attn_metadata.num_decodes == 0
+                attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0
             )
             mixed_qkv_spec, a_spec, b_spec = partition_speculative_token_inputs(
                 (mixed_qkv, a, b),
