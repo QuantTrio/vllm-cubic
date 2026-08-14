@@ -14,6 +14,13 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().all_reduce(input_)
 
 
+def tensor_model_parallel_all_reduce_batch(
+    inputs: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    """All-reduce independent tensors with their message boundaries intact."""
+    return get_tp_group().all_reduce_batch(inputs)
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

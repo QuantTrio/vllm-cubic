@@ -220,6 +220,9 @@ class DeviceCommunicatorBase:
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
+    def all_reduce_batch(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [self.all_reduce(input_) for input_ in inputs]
+
     def checkpoint_prepare(self) -> None:
         """Prepare reclaimable communicator state for checkpoint (default: no-op)."""
 

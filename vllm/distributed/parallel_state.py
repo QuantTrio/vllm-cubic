@@ -161,6 +161,23 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
+def all_reduce_batch(
+    tensors: list[torch.Tensor], group_name: str
+) -> list[torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    assert group.device_communicator is not None
+    return group.device_communicator.all_reduce_batch(tensors)
+
+
+def all_reduce_batch_fake(
+    tensors: list[torch.Tensor], group_name: str
+) -> list[torch.Tensor]:
+    return [torch.empty_like(tensor) for tensor in tensors]
+
+
 def reduce_scatter(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
@@ -353,6 +370,12 @@ direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
     fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="all_reduce_batch",
+    op_func=all_reduce_batch,
+    fake_impl=all_reduce_batch_fake,
 )
 
 direct_register_custom_op(
@@ -682,6 +705,14 @@ class GroupCoordinator:
             return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
         else:
             return self._all_reduce_out_place(input_)
+
+    def all_reduce_batch(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+        if self.world_size == 1:
+            return inputs
+        if self.use_custom_op_call:
+            return torch.ops.vllm.all_reduce_batch(inputs, group_name=self.unique_name)
+        assert self.device_communicator is not None
+        return self.device_communicator.all_reduce_batch(inputs)
 
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:

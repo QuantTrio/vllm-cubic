@@ -23,7 +23,6 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import MambaSpec
 
-
 class GDNAttentionBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
@@ -35,6 +34,10 @@ class GDNAttentionBackend(AttentionBackend):
 
     @classmethod
     def is_ssm(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
         return True
 
 
@@ -185,7 +188,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )
-
         spec_sequence_masks_cpu: torch.Tensor | None = None
         if (
             not self.use_spec_decode

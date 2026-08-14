@@ -11,10 +11,20 @@ import pytest
 import torch
 from utils import skip_unsupported
 
-from vllm.model_executor.layers.batch_invariant import matmul_batch_invariant
+from vllm.model_executor.layers.batch_invariant import (
+    matmul_batch_invariant,
+    use_low_m_batch_invariant,
+)
 from vllm.platforms import current_platform
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_low_m_policy_counts_flattened_token_rows(dtype: torch.dtype) -> None:
+    assert use_low_m_batch_invariant(torch.empty(2, 4, 16, dtype=dtype))
+    assert not use_low_m_batch_invariant(torch.empty(2, 5, 16, dtype=dtype))
+    assert not use_low_m_batch_invariant(torch.empty(1, 9, 16, dtype=dtype))
 
 
 @skip_unsupported

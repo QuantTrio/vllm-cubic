@@ -11,6 +11,10 @@ from vllm.distributed import (
     tensor_model_parallel_gather,
 )
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.layers.batch_invariant import (
+    linear_batch_invariant,
+    use_low_m_batch_invariant,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
@@ -102,6 +106,13 @@ class LogitsProcessor(PluggableLayer):
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor:
         """Project hidden states through the lm_head, honoring head_dtype."""
+        if (
+            isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod)
+            and use_low_m_batch_invariant(hidden_states)
+        ):
+            return linear_batch_invariant(
+                hidden_states, lm_head.weight, embedding_bias
+            )
         if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
             return lm_head.quant_method.apply(
                 lm_head, hidden_states, bias=embedding_bias

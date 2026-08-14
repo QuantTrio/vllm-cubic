@@ -18,11 +18,13 @@ from vllm.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce_batch,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.batch_invariant import (
     linear_batch_invariant,
+    use_low_m_batch_invariant,
 )
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -207,7 +209,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
+        if current_platform.is_cuda_alike() and (
+            envs.VLLM_BATCH_INVARIANT or use_low_m_batch_invariant(x)
+        ):
             return linear_batch_invariant(x, layer.weight, bias)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
@@ -1651,7 +1655,15 @@ class RowParallelLinear(LinearBase):
         output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
+            if use_low_m_batch_invariant(output_parallel):
+                output_2d = output_parallel.reshape(-1, output_parallel.shape[-1])
+                rows = list(output_2d.split(1))
+                reduced_2d = torch.cat(
+                    tensor_model_parallel_all_reduce_batch(rows), dim=0
+                )
+                output = reduced_2d.reshape(output_parallel.shape)
+            else:
+                output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
 
