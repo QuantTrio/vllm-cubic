@@ -61,6 +61,15 @@ CONTRACTS = (
         ),
     ),
     Contract(
+        "low-m-flash-attention-split-invariance",
+        "vllm/v1/attention/backends/flash_attn.py",
+        (
+            "def _get_max_num_splits(",
+            "num_actual_tokens <= LOW_M_BATCH_INVARIANT_LIMIT",
+            "_get_max_num_splits(max_num_splits, num_actual_tokens)",
+        ),
+    ),
+    Contract(
         "low-m-grouped-tp-reduction",
         "vllm/model_executor/layers/linear.py",
         (
@@ -80,7 +89,36 @@ CONTRACTS = (
     Contract(
         "hybrid-speculative-input-partition",
         "vllm/model_executor/layers/mamba/abstract.py",
-        ("def partition_speculative_token_inputs(",),
+        (
+            "def partition_speculative_token_inputs(",
+            "def get_recurrent_state_alignment(",
+            "recurrent_state_alignment=self.get_recurrent_state_alignment()",
+        ),
+    ),
+    Contract(
+        "qwen-gdn-recurrent-state-alignment",
+        "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+        (
+            "def get_recurrent_state_alignment(",
+            "return FLA_CHUNK_SIZE",
+        ),
+    ),
+    Contract(
+        "hybrid-prefix-recurrent-alignment",
+        "vllm/v1/core/kv_cache_coordinator.py",
+        (
+            "spec.recurrent_state_alignment",
+            "alignment = lcm(alignment, spec.recurrent_state_alignment)",
+        ),
+    ),
+    Contract(
+        "hybrid-prefill-recurrent-alignment",
+        "vllm/v1/core/sched/scheduler.py",
+        (
+            "self.mamba_recurrent_state_alignment = 1",
+            "self.mamba_prefill_alignment = lcm(",
+            "tail_boundary % state_alignment != 0",
+        ),
     ),
     Contract(
         "qwen-hybrid-compile-safety-boundary",
