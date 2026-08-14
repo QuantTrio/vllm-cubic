@@ -1290,14 +1290,18 @@ def test_cubic_dynamic_a8_linear_supports_output_only_groups(bits: int):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bits", range(1, 9))
 @pytest.mark.parametrize("tokens", (1, 16, 256))
-@pytest.mark.parametrize("group_out", (1, 32))
-def test_cubic_w8_precomputed_carrier_matches_dynamic_a8(
-    tokens: int, group_out: int
+@pytest.mark.parametrize(("group_out", "group_size"), ((1, 128), (32, 1), (32, 128)))
+def test_cubic_precomputed_carrier_matches_dynamic_a8(
+    bits: int, tokens: int, group_out: int, group_size: int
 ) -> None:
     from vllm.model_executor.layers.quantization import cubic_kernels
+    from vllm.model_executor.layers.quantization.cubic import (
+        materialize_cubic_a8_carrier,
+    )
 
-    bits, group_size, outputs, input_size = 8, 128, 64, 256
+    outputs = input_size = 128
     device = torch.device("cuda")
     codes = _make_codes((outputs, input_size), bits).to(device)
     packed = pack_cubic_codes(codes, bits)
@@ -1307,10 +1311,11 @@ def test_cubic_w8_precomputed_carrier_matches_dynamic_a8(
     a = torch.full(metadata_shape, 0.5, device=device, dtype=torch.float16)
     b = torch.full(metadata_shape, 0.25, device=device, dtype=torch.float16)
     x = torch.randn(tokens, input_size, device=device, dtype=torch.bfloat16)
-    carrier = cubic_kernels.cubic_w8_precompute_carrier(
+    carrier = materialize_cubic_a8_carrier(
         packed,
         a,
         b,
+        num_bits=bits,
         group_size=group_size,
         input_size=input_size,
         group_out=group_out,
@@ -1335,6 +1340,109 @@ def test_cubic_w8_precomputed_carrier_matches_dynamic_a8(
         x, carrier, scale, a, b, **kwargs
     )
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bits", range(1, 9))
+@pytest.mark.parametrize("tokens", (1, 4))
+@pytest.mark.parametrize("group_out", (1, 32))
+def test_cubic_a16_packed_stream_matches_regular_linear(
+    bits: int, tokens: int, group_out: int
+) -> None:
+    from vllm.model_executor.layers.quantization import cubic_kernels
+    from vllm.model_executor.layers.quantization.cubic_policy import (
+        cubic_linear_token_bucket,
+    )
+
+    group_size, outputs, input_size = 128, 64, 128
+    device = torch.device("cuda")
+    codes = _make_codes((outputs, input_size), bits).to(device)
+    packed = pack_cubic_codes(codes, bits)
+    metadata_shape = (outputs // group_out, input_size // group_size)
+    scale = torch.rand(*metadata_shape, device=device, dtype=torch.float32) * 0.1
+    a = torch.full(metadata_shape, 0.5, device=device, dtype=torch.float16)
+    b = torch.full(metadata_shape, 0.25, device=device, dtype=torch.float16)
+    x = torch.randn(tokens, input_size, device=device, dtype=torch.bfloat16)
+    kwargs = {
+        "num_bits": bits,
+        "group_size": group_size,
+        "group_out": group_out,
+        "input_size": input_size,
+    }
+    expected = cubic_kernels.cubic_linear(x, packed, scale, a, b, **kwargs)
+    key = (
+        torch.accelerator.current_device_index(),
+        False,
+        bits,
+        outputs,
+        input_size,
+        group_size,
+        group_out,
+        cubic_linear_token_bucket(tokens),
+    )
+    cubic_kernels._CUBIC_LINEAR_STREAM_TACTICS[key] = (8, 4)
+    try:
+        actual = cubic_kernels.cubic_linear(x, packed, scale, a, b, **kwargs)
+    finally:
+        cubic_kernels._CUBIC_LINEAR_STREAM_TACTICS.pop(key)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bits", range(1, 9))
+@pytest.mark.parametrize(
+    ("group_out", "group_size"),
+    ((1, 128), (128, 1), (32, 64)),
+)
+def test_cubic_low_m_linear_is_batch_invariant(
+    bits: int,
+    group_out: int,
+    group_size: int,
+) -> None:
+    from vllm.model_executor.layers.quantization.cubic import (
+        materialize_cubic_a8_carrier,
+    )
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        cubic_linear,
+        cubic_linear_dynamic_a8,
+        cubic_linear_dynamic_a8_precomputed,
+    )
+
+    outputs = input_size = 128
+    device = torch.device("cuda")
+    codes = _make_codes((outputs, input_size), bits).to(device)
+    packed = pack_cubic_codes(codes, bits)
+    metadata_shape = (outputs // group_out, input_size // group_size)
+    scale = torch.rand(metadata_shape, device=device, dtype=torch.float32) * 0.1
+    a = torch.full(metadata_shape, 0.5, device=device, dtype=torch.float16)
+    b = torch.full(metadata_shape, 0.25, device=device, dtype=torch.float16)
+    x = torch.randn(2, input_size, device=device, dtype=torch.bfloat16)
+    carrier = materialize_cubic_a8_carrier(
+        packed,
+        a,
+        b,
+        num_bits=bits,
+        group_size=group_size,
+        input_size=input_size,
+        group_out=group_out,
+    )
+    kwargs = {
+        "num_bits": bits,
+        "group_size": group_size,
+        "group_out": group_out,
+        "input_size": input_size,
+    }
+
+    for kernel, weight in (
+        (cubic_linear, packed),
+        (cubic_linear_dynamic_a8, packed),
+        (cubic_linear_dynamic_a8_precomputed, carrier),
+    ):
+        batched = kernel(x, weight, scale, a, b, **kwargs)
+        tokenwise = torch.cat(
+            [kernel(row, weight, scale, a, b, **kwargs) for row in x.split(1)]
+        )
+        torch.testing.assert_close(batched, tokenwise, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -48,6 +48,26 @@ def test_cubic_w2_situ_specs_keep_the_normalized_output_group():
     )
 
 
+def test_cubic_linear_calibrates_low_m_once() -> None:
+    from vllm.model_executor.layers.quantization.cubic import (
+        CubicLinearMethod,
+        CubicScheme,
+    )
+
+    layer = torch.nn.Module()
+    method = object.__new__(CubicLinearMethod)
+    method.scheme = CubicScheme(num_bits=5, group_size=512, group_out=128)
+    layer.quant_method = method
+    layer.input_size_per_partition = 5120
+    layer.output_size_per_partition = 4352
+    layer.weight_a = torch.empty(0, device="meta", dtype=torch.float16)
+    layer.weight_b = torch.empty(0, device="meta", dtype=torch.float16)
+
+    tasks = cubic_warmup._cubic_calibration_tasks(layer, (2, 4, 8, 16, 32))
+
+    assert [task[-1] for task in tasks if task[0] == "linear"] == [1, 16, 32]
+
+
 def _linear_task(bits: int) -> tuple[object, ...]:
     return (
         "linear",

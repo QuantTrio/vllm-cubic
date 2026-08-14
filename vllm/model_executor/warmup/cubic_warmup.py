@@ -31,12 +31,13 @@ from vllm.model_executor.layers.quantization.cubic import (
 )
 from vllm.model_executor.layers.quantization.cubic_policy import (
     CUBIC_TOKEN_BUCKETS,
+    cubic_linear_token_bucket,
     cubic_token_bucket,
 )
 
 logger = init_logger(__name__)
 
-_CUBIC_TACTIC_CACHE_SCHEMA = 20
+_CUBIC_TACTIC_CACHE_SCHEMA = 22
 _CUBIC_TACTIC_CACHE_FILENAME = "cubic_tactics.json"
 _CUBIC_TACTIC_REGISTRY_NAMES = (
     "_CUBIC_W2_A8_SITU_TACTICS",
@@ -47,6 +48,7 @@ _CUBIC_TACTIC_REGISTRY_NAMES = (
     "_CUBIC_LINEAR_EXECUTION_TACTICS",
     "_CUBIC_LINEAR_BLOCK_K_TACTICS",
     "_CUBIC_LINEAR_TILE_TACTICS",
+    "_CUBIC_LINEAR_STREAM_TACTICS",
     "_CUBIC_MOE_DENSE_BLOCK_TACTICS",
     "_CUBIC_MOE_DENSE_BLOCK_K_TACTICS",
     "_CUBIC_MOE_ROUTE_CTA_TACTICS",
@@ -250,10 +252,15 @@ def _cubic_calibration_tasks(
     model: torch.nn.Module, token_buckets: tuple[int, ...]
 ) -> tuple[CalibrationTask, ...]:
     tasks: set[CalibrationTask] = set()
+    linear_token_buckets = tuple(
+        sorted({cubic_linear_token_bucket(m) for m in token_buckets})
+    )
     for module in model.modules():
         method = getattr(module, "quant_method", None)
         if isinstance(method, CubicLinearMethod):
-            tasks.update(_linear_task_id(module, method, m) for m in token_buckets)
+            tasks.update(
+                _linear_task_id(module, method, m) for m in linear_token_buckets
+            )
         elif isinstance(method, CubicMoEMethod):
             tasks.update(_moe_task_id(module, method, m) for m in token_buckets)
     tasks.update(("w2_situ", *spec) for spec in _cubic_w2_a8_situ_specs(model))
@@ -494,6 +501,7 @@ def _merge_cubic_tactics(
                 if name in (
                     "_CUBIC_W2_A8_SITU_TACTICS",
                     "_CUBIC_LINEAR_TILE_TACTICS",
+                    "_CUBIC_LINEAR_STREAM_TACTICS",
                 ):
                     value = tuple(value)
                 registry[local_key] = value
@@ -523,6 +531,7 @@ def _load_cubic_tactic_cache(cache_key: str) -> bool:
                 if name in (
                     "_CUBIC_W2_A8_SITU_TACTICS",
                     "_CUBIC_LINEAR_TILE_TACTICS",
+                    "_CUBIC_LINEAR_STREAM_TACTICS",
                 ):
                     value = tuple(value)
                 values[key_tuple] = value
@@ -611,6 +620,7 @@ def _warmup_cubic_linear_families(
         cubic_linear_dynamic_a8_precomputed,
     )
 
+    token_buckets = tuple(sorted({cubic_linear_token_bucket(m) for m in token_buckets}))
     layers: dict[CalibrationTask, tuple[torch.nn.Module, CubicLinearMethod]] = {}
     for module in model.modules():
         method = getattr(module, "quant_method", None)
