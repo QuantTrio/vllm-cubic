@@ -7,6 +7,7 @@ import torch
 from vllm.third_party.flash_linear_attention.ops import (
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
+    fused_sigmoid_gating_delta_rule_update,
 )
 
 
@@ -100,3 +101,75 @@ def test_fused_recurrent_packed_decode_matches_reference(
     valid = ssm_state_indices > 0
     torch.testing.assert_close(out_packed[valid], out_ref[valid], rtol=rtol, atol=atol)
     torch.testing.assert_close(state_packed, state_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_packed_decode_matches_spec_update_exactly(dtype: torch.dtype) -> None:
+    torch.manual_seed(1)
+    batch, num_heads, num_value_heads = 8, 4, 8
+    key_dim = value_dim = 128
+    qkv_dim = 2 * num_heads * key_dim + num_value_heads * value_dim
+    device = torch.device("cuda")
+
+    mixed_qkv = torch.randn(batch, qkv_dim, device=device, dtype=dtype)
+    a = torch.randn(batch, num_value_heads, device=device, dtype=dtype)
+    b = torch.randn_like(a)
+    A_log = torch.randn(num_value_heads, device=device, dtype=dtype)
+    dt_bias = torch.randn_like(A_log)
+    state_indices = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
+    initial = torch.randn(
+        batch + 1,
+        num_value_heads,
+        value_dim,
+        key_dim,
+        device=device,
+        dtype=dtype,
+    )
+    packed_state = initial.clone()
+    spec_state = initial.clone()
+    packed_output = torch.empty(
+        batch,
+        1,
+        num_value_heads,
+        value_dim,
+        device=device,
+        dtype=dtype,
+    )
+    q, k, v = torch.split(
+        mixed_qkv,
+        [num_heads * key_dim, num_heads * key_dim, num_value_heads * value_dim],
+        dim=-1,
+    )
+    q = q.view(batch, 1, num_heads, key_dim)
+    k = k.view(batch, 1, num_heads, key_dim)
+    v = v.view(batch, 1, num_value_heads, value_dim)
+
+    spec_output, _ = fused_sigmoid_gating_delta_rule_update(
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        initial_state=spec_state,
+        inplace_final_state=True,
+        ssm_state_indices=state_indices,
+        use_qk_l2norm_in_kernel=True,
+    )
+    fused_recurrent_gated_delta_rule_packed_decode(
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=key_dim**-0.5,
+        initial_state=packed_state,
+        out=packed_output,
+        ssm_state_indices=state_indices,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    torch.testing.assert_close(packed_output, spec_output, rtol=0, atol=0)
+    torch.testing.assert_close(packed_state, spec_state, rtol=0, atol=0)

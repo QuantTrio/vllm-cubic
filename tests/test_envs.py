@@ -49,6 +49,16 @@ def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch)
     assert envs.VLLM_P2P_SIDE_CHANNEL_PORT == 5799
 
 
+def test_fla_packed_recurrent_decode_default_and_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", raising=False)
+    assert envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
+
+    monkeypatch.setenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "0")
+    assert not envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
+
+
 def test_getattr_with_cache(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HOST_IP", "1.1.1.1")
     monkeypatch.setenv("VLLM_PORT", "1234")
