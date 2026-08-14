@@ -41,6 +41,7 @@ class _QwenGDNWarmupConfig:
     dt_bias: torch.Tensor
     state_stride_token: int
     state_dtype: torch.dtype
+    ssm_state: torch.Tensor
 
     @property
     def conv_dim(self) -> int:
@@ -125,6 +126,7 @@ def _qwen_gdn_warmup_config(
             dt_bias=layer.dt_bias,
             state_stride_token=int(ssm_state.stride(0)),
             state_dtype=ssm_state.dtype,
+            ssm_state=ssm_state,
         )
 
     if found_layer:
@@ -241,6 +243,19 @@ def _warm_fused_sigmoid_gating_delta_rule_update_kernel(
     )
 
 
+def _warm_gather_initial_states_kernel(
+    device: torch.device,
+    config: _QwenGDNWarmupConfig,
+) -> None:
+    from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
+        gather_initial_states,
+    )
+
+    indices = torch.zeros(1, dtype=torch.int32, device=device)
+    has_initial_state = torch.zeros(1, dtype=torch.bool, device=device)
+    gather_initial_states(config.ssm_state, indices, has_initial_state)
+
+
 def _synchronize_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.accelerator.synchronize(device)
@@ -278,4 +293,5 @@ def qwen_triton_warmup(
     _warm_causal_conv1d_fwd_kernel(device, gdn_config)
     _warm_fused_post_conv_kernel(device, gdn_config)
     _warm_fused_sigmoid_gating_delta_rule_update_kernel(device, gdn_config)
+    _warm_gather_initial_states_kernel(device, gdn_config)
     _synchronize_device(device)

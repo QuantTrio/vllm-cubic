@@ -15,6 +15,17 @@ from vllm.v1.attention.selector import get_mamba_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 
+def partition_speculative_token_inputs(
+    inputs: tuple[torch.Tensor, ...],
+    spec_token_indices: torch.Tensor,
+    pure_spec_decode: bool,
+) -> tuple[torch.Tensor, ...]:
+    """Keep token-aligned recurrent inputs on the same speculative rows."""
+    if pure_spec_decode:
+        return inputs
+    return tuple(x.index_select(0, spec_token_indices) for x in inputs)
+
+
 class MambaBase(AttentionLayerBase):
     """
     Base class for Mamba-like layers which support the v1 engine.
@@ -71,10 +82,11 @@ class MambaBase(AttentionLayerBase):
             page_size_padded=page_size_padded,
             mamba_type=self.mamba_type,
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
-            num_speculative_blocks=(
+            num_speculative_blocks=max(
+                1,
                 vllm_config.speculative_config.num_speculative_tokens
                 if vllm_config.speculative_config
-                else 0
+                else 0,
             ),
         )
 

@@ -51,6 +51,20 @@ def test_gather_initial_states_correctness():
     )
 
 
+@torch.inference_mode()
+def test_gather_initial_states_does_not_read_fresh_rows():
+    state = torch.full((4, 2, 8, 8), float("nan"), device=DEVICE)
+    state[1].normal_()
+    indices = torch.tensor([3, 1, 2], dtype=torch.int32, device=DEVICE)
+    has_initial_state = torch.tensor([False, True, False], device=DEVICE)
+
+    gathered = gather_initial_states(state, indices, has_initial_state)
+
+    torch.testing.assert_close(gathered[1], state[1])
+    assert torch.count_nonzero(gathered[[0, 2]]) == 0
+    assert torch.isfinite(gathered).all()
+
+
 def naive_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
