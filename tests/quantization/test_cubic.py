@@ -231,6 +231,28 @@ def test_cubic_config_accepts_legacy_and_two_dimensional_group_shapes():
     assert config.schemes[2][1].group_shape == (512, 1)
 
 
+def test_cubic_config_ignore_prefix_regex_excludes_subtree():
+    from vllm.model_executor.layers.linear import LinearBase
+
+    config = CubicConfig.from_config(
+        {
+            "quant_method": "cubic",
+            "format": CUBIC_FORMAT,
+            "config_groups": {
+                "layer_zero": {
+                    "targets": ["re:.*\\.layers\\.0\\.mlp\\.down_proj"],
+                    "weights": {"num_bits": 8, "group_size": [128, 128]},
+                },
+            },
+            "ignore": [r"re:^mtp\."],
+        }
+    )
+    layer = object.__new__(LinearBase)
+
+    assert config._scheme_for(layer, "mtp.layers.0.mlp.down_proj") is None
+    assert config._scheme_for(layer, "model.layers.0.mlp.down_proj").num_bits == 8
+
+
 def test_cubic_internal_group_interfaces_require_both_dimensions():
     import vllm.model_executor.layers.quantization.cubic_kernels as cubic_kernels
 

@@ -561,7 +561,7 @@ def _match_score(prefix: str, layer: torch.nn.Module, targets: list[str]) -> int
 def _is_ignored(prefix: str, ignore: list[str]) -> bool:
     return any(
         item == prefix
-        or (item.startswith("re:") and re.fullmatch(item[3:], prefix) is not None)
+        or (item.startswith("re:") and re.match(item[3:], prefix) is not None)
         for item in ignore
     )
 
