@@ -189,6 +189,13 @@ class ModelConfig:
 
     A random nonzero seed is generated once by default and shared by all tensor
     parallel workers. Set an explicit value, including 0, for reproducibility."""
+    deterministic_inference: bool = False
+    """Use batch-invariant deterministic CUDA algorithms for reproducible
+    outputs.
+
+    This may reduce performance. It is independent of ``seed`` because a fixed
+    random seed alone does not constrain CUDA kernel selection or reduction
+    order."""
     hf_config: PretrainedConfig = field(init=False)
     """The Hugging Face config of the model."""
     hf_text_config: PretrainedConfig = field(init=False)
