@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+import vllm.envs as envs
 from tests.v1.attention.test_attention_backends import BATCH_SPECS
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.v1.attention.backends.utils import (
@@ -16,6 +17,22 @@ from vllm.v1.worker.ubatch_utils import (
     slice_query_start_locs,
     split_attn_metadata,
 )
+
+
+def test_flash_attention_low_m_uses_batch_invariant_split(monkeypatch):
+    from vllm.model_executor.layers.batch_invariant import (
+        LOW_M_BATCH_INVARIANT_LIMIT,
+    )
+    from vllm.v1.attention.backends.flash_attn import _get_max_num_splits
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+
+    assert _get_max_num_splits(32, 1) == 1
+    assert _get_max_num_splits(32, LOW_M_BATCH_INVARIANT_LIMIT) == 1
+    assert _get_max_num_splits(32, LOW_M_BATCH_INVARIANT_LIMIT + 1) == 32
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    assert _get_max_num_splits(32, LOW_M_BATCH_INVARIANT_LIMIT + 1) == 1
 
 
 @pytest.fixture

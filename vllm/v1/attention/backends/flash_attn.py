@@ -55,6 +55,9 @@ from vllm.config import (
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.batch_invariant import (
+    LOW_M_BATCH_INVARIANT_LIMIT,
+)
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.attention.backend import (
@@ -72,6 +75,14 @@ from vllm.v1.worker.cp_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _get_max_num_splits(max_num_splits: int, num_actual_tokens: int) -> int:
+    if envs.VLLM_BATCH_INVARIANT or (
+        0 < num_actual_tokens <= LOW_M_BATCH_INVARIANT_LIMIT
+    ):
+        return 1
+    return max_num_splits
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -530,8 +541,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # we only set num_splits when using cuda graphs.
             max_num_splits = self.max_num_splits
 
-        if envs.VLLM_BATCH_INVARIANT:
-            max_num_splits = 1
+        max_num_splits = _get_max_num_splits(max_num_splits, num_actual_tokens)
 
         def schedule(
             batch_size, cu_query_lens, max_query_len, seqlens, max_seq_len, causal
