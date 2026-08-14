@@ -24,7 +24,7 @@ CONTRACTS = (
             "def _normalize_group_size(",
             "CUBIC_SUPPORTED_BITS",
             "dynamic_a8=envs.VLLM_CUBIC_DYNAMIC_A8",
-            "cubic_w8_precompute_carrier",
+            "def materialize_cubic_a8_carrier(",
         ),
     ),
     Contract(
@@ -37,6 +37,7 @@ CONTRACTS = (
             "class CubicExecutionKind(Enum):",
             "class CubicActivationMode(Enum):",
             "def cubic_token_bucket(",
+            "def cubic_linear_token_bucket(",
             "def cubic_reconstruction_kind(",
         ),
     ),
@@ -45,9 +46,63 @@ CONTRACTS = (
         "vllm/model_executor/layers/quantization/cubic_kernels.py",
         (
             '"M_BUCKET",',
-            "M_BUCKET=cubic_token_bucket(x_2d.shape[0])",
+            "M_BUCKET=cubic_linear_token_bucket(x_2d.shape[0])",
             "cubic_token_bucket(num_tokens)",
             "cubic_token_bucket(input_rows)",
+        ),
+    ),
+    Contract(
+        "low-m-batch-invariant-execution",
+        "vllm/model_executor/layers/batch_invariant.py",
+        (
+            "LOW_M_BATCH_INVARIANT_LIMIT = 8",
+            "def use_low_m_batch_invariant(",
+            "def linear_batch_invariant(",
+        ),
+    ),
+    Contract(
+        "low-m-grouped-tp-reduction",
+        "vllm/model_executor/layers/linear.py",
+        (
+            "tensor_model_parallel_all_reduce_batch",
+            "use_low_m_batch_invariant(output_parallel)",
+        ),
+    ),
+    Contract(
+        "pynccl-independent-grouped-allreduce",
+        "vllm/distributed/device_communicators/cuda_communicator.py",
+        (
+            "def all_reduce_batch(",
+            "pynccl_comm.group_start()",
+            "pynccl_comm.group_end()",
+        ),
+    ),
+    Contract(
+        "hybrid-speculative-input-partition",
+        "vllm/model_executor/layers/mamba/abstract.py",
+        ("def partition_speculative_token_inputs(",),
+    ),
+    Contract(
+        "qwen-hybrid-compile-safety-boundary",
+        "vllm/model_executor/models/qwen3_5.py",
+        ("@ignore_torch_compile\n@support_torch_compile(",),
+    ),
+    Contract(
+        "qwen-mtp-compile-safety-boundary",
+        "vllm/model_executor/models/qwen3_5_mtp.py",
+        (
+            "@ignore_torch_compile\n@support_torch_compile(",
+            "class Qwen3_5MultiTokenPredictor(",
+            "class Qwen3_5MTP(",
+        ),
+    ),
+    Contract(
+        "gdn-packed-speculative-arithmetic-parity",
+        "vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py",
+        (
+            "b_q = b_q / tl.sqrt(",
+            "b_k = b_k / tl.sqrt(",
+            "num_warps = 1",
         ),
     ),
     Contract(

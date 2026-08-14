@@ -14,6 +14,18 @@ from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
+LOW_M_BATCH_INVARIANT_LIMIT = 8
+
+
+def use_low_m_batch_invariant(tensor: torch.Tensor) -> bool:
+    if tensor.dim() < 2 or tensor.shape[-1] == 0:
+        return False
+    num_rows = tensor.numel() // tensor.shape[-1]
+    return 0 < num_rows <= LOW_M_BATCH_INVARIANT_LIMIT and tensor.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    )
+
 
 def _matmul_launch_metadata(
     grid: Callable[..., Any], kernel: Any, args: dict[str, Any]
@@ -181,6 +193,19 @@ def matmul_persistent(
             "num_warps": 8,
         },
     }
+    if M <= LOW_M_BATCH_INVARIANT_LIMIT and dtype in (
+        torch.bfloat16,
+        torch.float16,
+    ):
+        configs[dtype].update(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "num_stages": 3,
+                "num_warps": 8,
+            }
+        )
     matmul_kernel_persistent[grid](
         a,
         b,
@@ -776,12 +801,15 @@ def _rms_norm_kernel(
     input_ptr,
     weight_ptr,
     output_ptr,
+    residual_ptr,
     input_row_stride,
     output_row_stride,
+    residual_row_stride,
     n_cols,
     eps,
     BLOCK_SIZE: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
 ):
     """
     Compute RMS normalization along the last dimension of a 2D tensor.
@@ -791,6 +819,7 @@ def _rms_norm_kernel(
     row_idx = tl.program_id(0).to(tl.int64)
     row_start_ptr = input_ptr + row_idx * input_row_stride
     output_row_start_ptr = output_ptr + row_idx * output_row_stride
+    residual_row_start_ptr = residual_ptr + row_idx * residual_row_stride
 
     # Step 1: Compute sum of squares in float32 to avoid overflow
     sum_sq = tl.zeros([1], dtype=tl.float32)
@@ -799,6 +828,11 @@ def _rms_norm_kernel(
         mask = col_idx < n_cols
 
         vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
+        if HAS_RESIDUAL:
+            residual_vals = tl.load(
+                residual_row_start_ptr + col_idx, mask=mask, other=0.0
+            )
+            vals = (vals + residual_vals).to(input_ptr.dtype.element_ty)
         # Convert to float32 for accumulation to prevent overflow
         vals_f32 = vals.to(tl.float32)
         sq_vals = vals_f32 * vals_f32
@@ -814,6 +848,12 @@ def _rms_norm_kernel(
         col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
         mask = col_idx < n_cols
         vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
+        if HAS_RESIDUAL:
+            residual_vals = tl.load(
+                residual_row_start_ptr + col_idx, mask=mask, other=0.0
+            )
+            vals = (vals + residual_vals).to(input_ptr.dtype.element_ty)
+            tl.store(residual_row_start_ptr + col_idx, vals, mask=mask)
         # Compute in float32 then convert back to input dtype
         vals_f32 = vals.to(tl.float32)
         output_f32 = vals_f32 * inv_rms
@@ -849,10 +889,6 @@ def rms_norm_batch_invariant(
         assert input.shape == residual.shape, (
             f"Input shape {input.shape} must match residual shape {residual.shape}"
         )
-        import vllm._custom_ops as ops
-
-        ops.fused_add_rms_norm(input, residual, weight, eps)
-        return input, residual
 
     if weight is not None:
         assert weight.dim() == 1, "Weight must be 1-dimensional"
@@ -869,25 +905,47 @@ def rms_norm_batch_invariant(
 
     n_rows, n_cols = input_2d.shape
 
-    output = torch.empty_like(input_2d)
+    output = input_2d if residual is not None else torch.empty_like(input_2d)
+    residual_2d = (
+        residual.reshape(-1, residual.shape[-1]).contiguous()
+        if residual is not None
+        else input_2d
+    )
     BLOCK_SIZE = 1024
     grid = (n_rows,)
     _rms_norm_kernel[grid](
         input_2d,
         weight if weight is not None else input_2d,
         output,
+        residual_2d,
         input_2d.stride(0),
         output.stride(0),
+        residual_2d.stride(0),
         n_cols,
         eps,
         BLOCK_SIZE=BLOCK_SIZE,
         HAS_WEIGHT=weight is not None,
+        HAS_RESIDUAL=residual is not None,
     )
-    return output.reshape(original_shape)
+    output = output.reshape(original_shape)
+    if residual is not None:
+        residual.copy_(residual_2d.reshape(original_shape))
+        return output, residual
+    return output
 
 
 def linear_batch_invariant(input, weight, bias=None):
-    output = matmul_batch_invariant(input, weight.t())
+    input_2d = input.reshape(-1, input.shape[-1])
+    if use_low_m_batch_invariant(input_2d):
+        if input_2d.shape[0] == 1:
+            output_2d = torch.mm(input_2d, weight.t())
+        else:
+            output_2d = torch.cat(
+                [torch.mm(row, weight.t()) for row in input_2d.split(1)], dim=0
+            )
+        output = output_2d.reshape(*input.shape[:-1], weight.shape[0])
+    else:
+        output = matmul_batch_invariant(input, weight.t())
 
     if bias is not None:
         output = output + bias

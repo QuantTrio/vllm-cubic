@@ -340,6 +340,56 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def _can_group_pynccl_all_reduce(self, input_: torch.Tensor) -> bool:
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            return False
+        if should_nccl_symm_mem_allreduce(pynccl_comm.world_size, input_):
+            return False
+        if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce(input_)
+        ):
+            return False
+        if (
+            self.fi_ar_comm is not None
+            and not self.fi_ar_comm.disabled
+            and self.fi_ar_comm.should_use_fi_ar(input_)
+        ):
+            return False
+        if (
+            self.aiter_ar_comm is not None
+            and not self.aiter_ar_comm.disabled
+            and self.aiter_ar_comm.should_custom_ar(input_)
+        ):
+            return False
+        if (
+            self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and self.ca_comm.should_custom_ar(input_)
+        ):
+            return False
+        return not (
+            self.symm_mem_comm is not None
+            and self.symm_mem_comm.should_use_symm_mem(input_)
+        )
+
+    def all_reduce_batch(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+        if len(inputs) < 2 or not all(
+            self._can_group_pynccl_all_reduce(input_) for input_ in inputs
+        ):
+            return [self.all_reduce(input_) for input_ in inputs]
+
+        pynccl_comm = self.pynccl_comm
+        assert pynccl_comm is not None
+        outputs = [torch.empty_like(input_) for input_ in inputs]
+        pynccl_comm.group_start()
+        for input_, output in zip(inputs, outputs):
+            pynccl_comm.all_reduce(input_, output)
+        pynccl_comm.group_end()
+        return outputs
+
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor | None:
         ca_comm = self.ca_comm
         if ca_comm is None:

@@ -11,7 +11,10 @@ import vllm.kernels  # noqa: F401
 from vllm import envs, ir
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
+from vllm.model_executor.layers.batch_invariant import (
+    rms_norm_batch_invariant,
+    use_low_m_batch_invariant,
+)
 
 logger = init_logger(__name__)
 
@@ -77,6 +80,19 @@ class RMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
+        if envs.VLLM_BATCH_INVARIANT or use_low_m_batch_invariant(x):
+            assert self.variance_size_override is None, (
+                "Batch invariance is not supported for variance_size_override"
+            )
+            pass_weight = (
+                self.pass_weight_add if residual is not None else self.pass_weight
+            )
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data if pass_weight else None,
+                self.variance_epsilon,
+                residual=residual,
+            )
         if residual is None:
             return ir.ops.rms_norm(
                 x,
@@ -98,7 +114,7 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if envs.VLLM_BATCH_INVARIANT:
+        if envs.VLLM_BATCH_INVARIANT or use_low_m_batch_invariant(x):
             assert self.variance_size_override is None, (
                 "Batch invariance is not supported for variance_size_override"
             )
@@ -155,6 +171,13 @@ class GemmaRMSNorm(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
         weight = self.weight.float() + 1.0
+        if use_low_m_batch_invariant(x):
+            return rms_norm_batch_invariant(
+                x,
+                weight,
+                self.variance_epsilon,
+                residual=residual,
+            )
         if residual is None:
             return ir.ops.rms_norm(x, weight, self.variance_epsilon)
         return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
@@ -164,6 +187,13 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if use_low_m_batch_invariant(x):
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.float() + 1.0,
+                self.variance_epsilon,
+                residual=residual,
+            )
         return self.forward_native(x, residual)
 
 

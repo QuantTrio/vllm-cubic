@@ -58,6 +58,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
+    BETA_IS_ONE: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -127,17 +128,30 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         x = tl.load(p_a).to(tl.float32) + tl.load(p_dt_bias).to(tl.float32)
-        softplus_x = tl.where(
-            beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
-        )
+        if BETA_IS_ONE:
+            softplus_x = tl.where(
+                x <= threshold,
+                tl.log(1.0 + tl.exp(x)),
+                x,
+            )
+        else:
+            softplus_x = tl.where(
+                beta * x <= threshold,
+                (1 / beta) * tl.log(1 + tl.exp(beta * x)),
+                x,
+            )
         b_g = -tl.exp(tl.load(p_A_log).to(tl.float32)) * softplus_x
 
         # compute beta_output = sigmoid(b)
-        b_beta = tl.sigmoid(b_b.to(tl.float32))
+        b_beta = (
+            tl.sigmoid(b_b.to(tl.float32))
+            .to(b.dtype.element_ty)
+            .to(tl.float32)
+        )
 
         if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q * (tl.rsqrt(tl.sum(b_q * b_q) + 1e-6))
-            b_k = b_k * (tl.rsqrt(tl.sum(b_k * b_k) + 1e-6))
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
         b_q = b_q * scale
         # [BV, BK]
         if not IS_KDA:
@@ -209,7 +223,7 @@ def fused_sigmoid_gating_delta_rule_update(
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
-    num_warps = 4
+    num_warps = 1
 
     if cu_seqlens is not None and q.shape[0] != 1:
         raise ValueError(
@@ -272,6 +286,7 @@ def fused_sigmoid_gating_delta_rule_update(
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
+        BETA_IS_ONE=beta == 1.0,
         num_warps=num_warps,
         num_stages=num_stages,
     )

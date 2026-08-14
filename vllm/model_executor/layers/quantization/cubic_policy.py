@@ -48,6 +48,13 @@ def cubic_token_bucket(num_tokens: int) -> int:
     )
 
 
+def cubic_linear_token_bucket(num_tokens: int) -> int:
+    """Use one tactic identity for decode-sized independent linear rows."""
+    if num_tokens <= 8:
+        return cubic_token_bucket(1)
+    return cubic_token_bucket(num_tokens)
+
+
 def cubic_reconstruction_kind(num_bits: int) -> CubicReconstructionKind:
     """Classify packed supply independently of execution and activation mode."""
     if num_bits not in CUBIC_SUPPORTED_BITS:

@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.compilation.decorators import support_torch_compile
+from vllm.compilation.decorators import ignore_torch_compile, support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
@@ -50,6 +50,7 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+@ignore_torch_compile
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -198,6 +199,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
+@ignore_torch_compile
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,

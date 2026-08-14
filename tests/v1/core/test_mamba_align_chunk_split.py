@@ -158,6 +158,29 @@ def _prefill(prompt_len: int, budgets: list[int]) -> int:
     return _count_cached_boundary_states(manager, request, state_at)
 
 
+def test_fresh_prefill_segmentation_is_independent_of_eagle() -> None:
+    """Speculative decoding must not change fresh-prefill arithmetic."""
+    chunk_ends = []
+    for use_eagle in (False, True):
+        (request,) = create_requests(
+            1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE
+        )
+        ends = []
+        while request.num_computed_tokens < request.num_tokens:
+            num_new_tokens = _split(
+                request,
+                request.num_tokens - request.num_computed_tokens,
+                use_eagle=use_eagle,
+                partial_hit=True,
+            )
+            assert num_new_tokens > 0
+            request.num_computed_tokens += num_new_tokens
+            ends.append(request.num_computed_tokens)
+        chunk_ends.append(ends)
+
+    assert chunk_ends[0] == chunk_ends[1]
+
+
 def test_fragmented_first_chunk_does_not_poison_mamba_prefix_cache() -> None:
     """EAGLE zeroes `last_cache_position` for prompts under two blocks.
 

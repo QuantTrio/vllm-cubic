@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 from vllm.model_executor.layers.quantization.cubic_policy import (
     CUBIC_ALIGNED_BITS,
     CUBIC_SUPPORTED_BITS,
+    cubic_linear_token_bucket,
     cubic_token_bucket,
 )
 from vllm.model_executor.layers.quantization.utils.int8_utils import (
@@ -58,6 +59,9 @@ _CUBIC_LINEAR_BLOCK_K_TACTICS: dict[
 ] = {}
 _CUBIC_LINEAR_TILE_TACTICS: dict[
     tuple[int, bool, int, int, int, int, int, int], tuple[int, int, int, int]
+] = {}
+_CUBIC_LINEAR_STREAM_TACTICS: dict[
+    tuple[int, bool, int, int, int, int, int, int], tuple[int, int]
 ] = {}
 _CUBIC_MOE_DENSE_BLOCK_TACTICS: dict[
     tuple[int, bool, int, int, int, int, int, int, int], int
@@ -505,12 +509,12 @@ def _cubic_linear_use_gemv(
         k,
         group_size,
         group_out,
-        cubic_token_bucket(m),
+        cubic_linear_token_bucket(m),
     )
     if exact in _CUBIC_LINEAR_EXECUTION_TACTICS:
         return _CUBIC_LINEAR_EXECUTION_TACTICS[exact]
     matching = [
-        (abs(tokens - cubic_token_bucket(m)), use_gemv)
+        (abs(tokens - cubic_linear_token_bucket(m)), use_gemv)
         for (
             dev,
             a8,
@@ -552,12 +556,12 @@ def _cubic_linear_block_k(
         k,
         group_size,
         group_out,
-        cubic_token_bucket(m),
+        cubic_linear_token_bucket(m),
     )
     if exact in _CUBIC_LINEAR_BLOCK_K_TACTICS:
         return _CUBIC_LINEAR_BLOCK_K_TACTICS[exact]
     matching = [
-        (abs(tokens - cubic_token_bucket(m)), block_k)
+        (abs(tokens - cubic_linear_token_bucket(m)), block_k)
         for (
             dev,
             a8,
@@ -599,12 +603,12 @@ def _cubic_linear_tile(
         k,
         group_size,
         group_out,
-        cubic_token_bucket(m),
+        cubic_linear_token_bucket(m),
     )
     if exact in _CUBIC_LINEAR_TILE_TACTICS:
         return _CUBIC_LINEAR_TILE_TACTICS[exact]
     matching = [
-        (abs(tokens - cubic_token_bucket(m)), tile)
+        (abs(tokens - cubic_linear_token_bucket(m)), tile)
         for (
             dev,
             a8,
@@ -624,6 +628,29 @@ def _cubic_linear_tile(
         and output_group == group_out
     ]
     return min(matching, key=lambda item: item[0])[1] if matching else fallback
+
+
+def _cubic_linear_stream_config(
+    *,
+    dynamic_a8: bool,
+    num_bits: int,
+    n: int,
+    k: int,
+    group_size: int,
+    group_out: int,
+    m: int,
+) -> tuple[int, int] | None:
+    key = (
+        torch.accelerator.current_device_index(),
+        dynamic_a8,
+        num_bits,
+        n,
+        k,
+        group_size,
+        group_out,
+        cubic_linear_token_bucket(m),
+    )
+    return _CUBIC_LINEAR_STREAM_TACTICS.get(key)
 
 
 def _cubic_moe_dense_block_m(
@@ -1617,6 +1644,101 @@ def _cubic_linear_gemv_kernel(
     )
 
 
+@triton.jit(do_not_specialize=["M"])
+def _cubic_linear_stream_gemv_kernel(
+    input_ptr,
+    weight_ptr,
+    scale_ptr,
+    cubic_a_ptr,
+    cubic_b_ptr,
+    output_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    stride_im,
+    stride_ik,
+    stride_wn,
+    stride_wp,
+    stride_sn,
+    stride_sg,
+    stride_om,
+    stride_on,
+    NUM_BITS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    GROUP_OUT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(1)
+    offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+    packs_per_group: tl.constexpr = GROUP_SIZE // 8
+    sign_bit: tl.constexpr = 1 << (NUM_BITS - 1)
+    offs_pack = tl.arange(0, packs_per_group)
+    accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for group in tl.static_range(0, NUM_GROUPS):
+        byte_indices = group * GROUP_SIZE * NUM_BITS // 8 + offs_pack * NUM_BITS
+        packed = tl.zeros((BLOCK_N, packs_per_group), dtype=tl.int64)
+        for byte_lane in tl.static_range(0, NUM_BITS):
+            packed_byte = tl.load(
+                weight_ptr
+                + offs_n[:, None] * stride_wn
+                + (byte_indices[None, :] + byte_lane) * stride_wp,
+                mask=n_mask[:, None],
+                other=0,
+            ).to(tl.int64)
+            packed |= packed_byte << (byte_lane * 8)
+        metadata_offsets = (offs_n // GROUP_OUT) * stride_sn + group * stride_sg
+        metadata_mask = n_mask & (group < NUM_GROUPS)
+        weight_scale = tl.load(
+            scale_ptr + metadata_offsets, mask=metadata_mask, other=0.0
+        ).to(tl.float32)
+        if NUM_BITS > 2:
+            cubic_a = tl.load(
+                cubic_a_ptr + metadata_offsets,
+                mask=metadata_mask,
+                other=1.0,
+            ).to(tl.float32)[:, None]
+            cubic_b = tl.load(
+                cubic_b_ptr + metadata_offsets,
+                mask=metadata_mask,
+                other=0.0,
+            ).to(tl.float32)[:, None]
+        else:
+            cubic_a = 1.0
+            cubic_b = 0.0
+        contribution = tl.zeros((BLOCK_N, packs_per_group), dtype=tl.float32)
+        for code_lane in tl.static_range(0, 8):
+            global_k = group * GROUP_SIZE + offs_pack * 8 + code_lane
+            activation = tl.load(
+                input_ptr + row * stride_im + global_k * stride_ik,
+                mask=(row < M) & (global_k < K),
+                other=0.0,
+            ).to(tl.float32)
+            raw = (packed >> (code_lane * NUM_BITS)) & ((1 << NUM_BITS) - 1)
+            if NUM_BITS == 1:
+                weight = raw.to(tl.float32) * 2.0 - 1.0
+            else:
+                signed = tl.where(raw >= sign_bit, raw - (1 << NUM_BITS), raw)
+                signed = tl.where(signed == -sign_bit, 0, signed)
+                if NUM_BITS == 2:
+                    weight = signed.to(tl.float32)
+                else:
+                    signed_f32 = signed.to(tl.float32)
+                    t = tl.abs(signed_f32) / (sign_bit - 1)
+                    weight = t * (
+                        cubic_a + t * (cubic_b + t * (1.0 - cubic_a - cubic_b))
+                    )
+                    weight = tl.where(signed < 0, -weight, weight)
+            contribution += weight * activation[None, :]
+        accumulator += weight_scale * tl.sum(contribution, axis=1)
+    tl.store(
+        output_ptr + row * stride_om + offs_n * stride_on,
+        accumulator,
+        mask=(row < M) & n_mask,
+    )
+
+
 def cubic_linear(
     x: torch.Tensor,
     packed: torch.Tensor,
@@ -1631,6 +1753,44 @@ def cubic_linear(
 ) -> torch.Tensor:
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     output = torch.empty(x_2d.shape[0], packed.shape[0], device=x.device, dtype=x.dtype)
+    stream_config = _cubic_linear_stream_config(
+        dynamic_a8=False,
+        num_bits=num_bits,
+        n=packed.shape[0],
+        k=input_size,
+        group_size=group_size,
+        group_out=group_out,
+        m=x_2d.shape[0],
+    )
+    if stream_config is not None:
+        block_n, num_warps = stream_config
+        grid = (triton.cdiv(packed.shape[0], block_n), x_2d.shape[0])
+        _cubic_linear_stream_gemv_kernel[grid](
+            x_2d,
+            packed,
+            scale,
+            a,
+            b,
+            output,
+            x_2d.shape[0],
+            packed.shape[0],
+            input_size,
+            scale.shape[1],
+            x_2d.stride(0),
+            x_2d.stride(1),
+            packed.stride(0),
+            packed.stride(1),
+            scale.stride(0),
+            scale.stride(1),
+            output.stride(0),
+            output.stride(1),
+            NUM_BITS=num_bits,
+            GROUP_SIZE=group_size,
+            GROUP_OUT=group_out,
+            BLOCK_N=block_n,
+            num_warps=num_warps,
+        )
+        return output.reshape(*x.shape[:-1], packed.shape[0])
     gemv_eligible = (
         x_2d.shape[0] <= 8
         and group_size in (32, 64, 128, 256, 512)
@@ -1676,7 +1836,7 @@ def cubic_linear(
             scale.stride(1),
             output.stride(0),
             output.stride(1),
-            M_BUCKET=cubic_token_bucket(x_2d.shape[0]),
+            M_BUCKET=cubic_linear_token_bucket(x_2d.shape[0]),
             NUM_BITS=num_bits,
             GROUP_SIZE=group_size,
         )
@@ -1707,7 +1867,7 @@ def cubic_linear(
             scale.stride(1),
             output.stride(0),
             output.stride(1),
-            M_BUCKET=cubic_token_bucket(x_2d.shape[0]),
+            M_BUCKET=cubic_linear_token_bucket(x_2d.shape[0]),
             NUM_BITS=num_bits,
             GROUP_SIZE=group_size,
             GROUP_OUT=group_out,
@@ -1740,7 +1900,7 @@ def cubic_linear(
         scale.stride(1),
         output.stride(-2),
         output.stride(1),
-        M_BUCKET=cubic_token_bucket(x_2d.shape[0]),
+        M_BUCKET=cubic_linear_token_bucket(x_2d.shape[0]),
         NUM_BITS=num_bits,
         GROUP_SIZE=group_size,
         GROUP_OUT=group_out,
@@ -2142,7 +2302,7 @@ def cubic_linear_dynamic_a8(
             scale.stride(1),
             output.stride(0),
             output.stride(1),
-            M_BUCKET=cubic_token_bucket(x_2d.shape[0]),
+            M_BUCKET=cubic_linear_token_bucket(x_2d.shape[0]),
             NUM_BITS=num_bits,
             GROUP_SIZE=group_size,
             GROUP_OUT=group_out,
@@ -2175,7 +2335,7 @@ def cubic_linear_dynamic_a8(
         scale.stride(1),
         output.stride(0),
         output.stride(1),
-        M_BUCKET=cubic_token_bucket(x_2d.shape[0]),
+        M_BUCKET=cubic_linear_token_bucket(x_2d.shape[0]),
         NUM_BITS=num_bits,
         GROUP_SIZE=group_size,
         GROUP_OUT=group_out,
@@ -2235,7 +2395,13 @@ def _cubic_linear_precomputed_a8_kernel(
             mask=(offs_n[None, :] < N) & (global_k[:, None] < K),
             other=0,
         )
-        partial = tl.dot(activation, weight, out_dtype=tl.int32)
+        if BLOCK_K < 32:
+            partial = tl.sum(
+                activation[:, :, None].to(tl.int32) * weight[None, :, :].to(tl.int32),
+                axis=1,
+            )
+        else:
+            partial = tl.dot(activation, weight, out_dtype=tl.int32)
         group = (k_block * BLOCK_K) // GROUP_SIZE
         weight_scale = tl.load(
             weight_scale_ptr + (offs_n // GROUP_OUT) * stride_sn + group * stride_sg,
@@ -2327,22 +2493,18 @@ def cubic_w8_precompute_carrier(
     group_out: int,
 ) -> torch.Tensor:
     """Materialize the deterministic W8 INT8 carrier once during loading."""
-    if packed.shape[1] != input_size or packed.dtype != torch.uint8:
-        raise ValueError("Cubic W8 carrier requires one packed byte per weight.")
-    codes = packed.view(torch.int8).to(torch.float32)
-    codes = torch.where(codes == -128, 0.0, codes)
-    if packed.shape[0] % group_out or a.shape[0] != packed.shape[0] // group_out:
-        raise ValueError("Cubic W8 carrier metadata has an invalid output shape.")
-    groups = torch.arange(input_size, device=packed.device) // group_size
-    output_groups = torch.arange(packed.shape[0], device=packed.device) // group_out
-    coefficient_a = a[output_groups[:, None], groups[None, :]].to(torch.float32)
-    coefficient_b = b[output_groups[:, None], groups[None, :]].to(torch.float32)
-    t = codes.abs() * (1.0 / 127.0)
-    normalized = t * (
-        coefficient_a + t * (coefficient_b + t * (1.0 - coefficient_a - coefficient_b))
+    from vllm.model_executor.layers.quantization.cubic import (
+        materialize_cubic_a8_carrier,
     )
-    return torch.clamp(torch.round(codes.sign() * normalized * 127.0), -127, 127).to(
-        torch.int8
+
+    return materialize_cubic_a8_carrier(
+        packed,
+        a,
+        b,
+        num_bits=8,
+        group_size=group_size,
+        input_size=input_size,
+        group_out=group_out,
     )
 
 
@@ -2358,13 +2520,13 @@ def cubic_linear_dynamic_a8_precomputed(
     input_size: int,
     group_out: int,
 ) -> torch.Tensor:
-    """Apply Dynamic-A8 using a load-time W8 carrier."""
-    del a, b
-    if num_bits != 8 or carrier.dtype != torch.int8:
-        raise ValueError("Precomputed Cubic Linear requires an INT8 W8 carrier.")
+    """Apply Dynamic-A8 using a load-time Cubic carrier."""
+    if num_bits not in CUBIC_SUPPORTED_BITS or carrier.dtype != torch.int8:
+        raise ValueError("Precomputed Cubic Linear requires an INT8 carrier.")
     if carrier.shape[0] % group_out or scale.shape[0] != carrier.shape[0] // group_out:
         raise ValueError("Precomputed Cubic Linear metadata has an invalid shape.")
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    del a, b
     x_q, x_scale = per_token_quant_int8(x_2d)
     output = torch.empty(
         x_2d.shape[0], carrier.shape[0], device=x.device, dtype=x.dtype
@@ -2485,7 +2647,7 @@ def calibrate_cubic_linear_execution(
         input_size,
         group_size,
         group_out,
-        cubic_token_bucket(x.reshape(-1, x.shape[-1]).shape[0]),
+        cubic_linear_token_bucket(x.reshape(-1, x.shape[-1]).shape[0]),
     )
     func: Callable[..., torch.Tensor]
     if precomputed_carrier:
@@ -2504,7 +2666,14 @@ def calibrate_cubic_linear_execution(
     )
     reference: torch.Tensor | None = None
     scores: list[
-        tuple[float, bool, int | None, tuple[int, int, int, int] | None, int]
+        tuple[
+            float,
+            bool,
+            int | None,
+            tuple[int, int, int, int] | None,
+            int,
+            tuple[int, int] | None,
+        ]
     ] = []
     for use_gemv in execution_candidates:
         configs = (
@@ -2514,6 +2683,7 @@ def calibrate_cubic_linear_execution(
             tuple(configs) if precomputed_carrier else (None,)
         )
         for block_k, config in itertools.product(block_k_candidates, tile_candidates):
+            _CUBIC_LINEAR_STREAM_TACTICS.pop(key, None)
             _CUBIC_LINEAR_EXECUTION_TACTICS[key] = use_gemv
             if block_k is not None:
                 _CUBIC_LINEAR_BLOCK_K_TACTICS[key] = block_k
@@ -2556,6 +2726,7 @@ def calibrate_cubic_linear_execution(
                         block_k,
                         tile,
                         tile_candidates.index(config),
+                        None,
                     )
                 )
             except (
@@ -2575,22 +2746,90 @@ def calibrate_cubic_linear_execution(
                     x.reshape(-1, x.shape[-1]).shape[0],
                     error,
                 )
+    stream_eligible = (
+        not dynamic_a8
+        and x.reshape(-1, x.shape[-1]).shape[0] <= 8
+        and group_size >= 8
+        and group_size % 8 == 0
+        and input_size % group_size == 0
+    )
+    if stream_eligible:
+        for index, stream_config in enumerate(((8, 4), (16, 4))):
+            _CUBIC_LINEAR_STREAM_TACTICS[key] = stream_config
+
+            def launch_stream() -> torch.Tensor:
+                return cubic_linear(
+                    x,
+                    packed,
+                    scale,
+                    a,
+                    b,
+                    num_bits=num_bits,
+                    group_size=group_size,
+                    group_out=group_out,
+                    input_size=input_size,
+                )
+
+            try:
+                output = launch_stream()
+                torch.accelerator.synchronize()
+                if reference is None:
+                    reference = output
+                else:
+                    torch.testing.assert_close(output, reference, rtol=0.02, atol=0.02)
+                score = triton.testing.do_bench(
+                    launch_stream,
+                    warmup=10,
+                    rep=30,
+                )
+                scores.append((score, True, None, None, index, stream_config))
+            except (
+                RuntimeError,
+                AssertionError,
+                triton.runtime.errors.OutOfResources,
+            ) as error:
+                from vllm.logger import init_logger
+
+                init_logger(__name__).warning(
+                    "Skipping Cubic Linear A16 stream W%d N=%d K=%d M=%d: %s",
+                    num_bits,
+                    packed.shape[0],
+                    input_size,
+                    x.reshape(-1, x.shape[-1]).shape[0],
+                    error,
+                )
+    _CUBIC_LINEAR_STREAM_TACTICS.pop(key, None)
     if not scores:
         _CUBIC_LINEAR_EXECUTION_TACTICS.pop(key, None)
         _CUBIC_LINEAR_BLOCK_K_TACTICS.pop(key, None)
         _CUBIC_LINEAR_TILE_TACTICS.pop(key, None)
+        _CUBIC_LINEAR_STREAM_TACTICS.pop(key, None)
         return None
     measured_best = min(score for score, *_ in scores)
     near_best = [item for item in scores if item[0] <= measured_best * 1.01]
-    best_score, best_use_gemv, best_block_k, best_tile, _ = min(
+    (
+        best_score,
+        best_use_gemv,
+        best_block_k,
+        best_tile,
+        _,
+        best_stream_config,
+    ) = min(
         near_best,
-        key=lambda item: (not item[1], -(item[2] or 0), item[4]),
+        key=lambda item: (
+            item[5] is not None,
+            not item[1],
+            -(item[2] or 0),
+            item[4],
+        ),
     )
     _CUBIC_LINEAR_EXECUTION_TACTICS[key] = best_use_gemv
     if best_block_k is not None:
         _CUBIC_LINEAR_BLOCK_K_TACTICS[key] = best_block_k
     if best_tile is not None:
         _CUBIC_LINEAR_TILE_TACTICS[key] = best_tile
+    if best_stream_config is not None:
+        _CUBIC_LINEAR_STREAM_TACTICS[key] = best_stream_config
     from vllm.logger import init_logger
 
     init_logger(__name__).info(
@@ -2602,7 +2841,11 @@ def calibrate_cubic_linear_execution(
         group_out,
         group_size,
         x.reshape(-1, x.shape[-1]).shape[0],
-        "GEMV" if best_use_gemv else "dense",
+        (
+            "packed-stream"
+            if best_stream_config is not None
+            else ("GEMV" if best_use_gemv else "dense")
+        ),
         best_block_k,
         best_tile,
         best_score,

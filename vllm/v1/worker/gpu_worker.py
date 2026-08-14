@@ -383,6 +383,8 @@ class Worker(WorkerBase):
 
             # Set random seed.
             set_random_seed(self.model_config.seed)
+            if self.model_config.deterministic_inference:
+                torch.use_deterministic_algorithms(True)
 
             # Now take memory snapshot after NCCL is initialized
             gc.collect()

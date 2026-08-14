@@ -373,12 +373,11 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
 
         block_size = self.cache_config.block_size
-        # The last block-aligned position whose state can be cached. With
-        # Eagle, FullAttn prunes the last matching block, so back off one
-        # block to avoid a Mamba cache miss.
+        # The last block-aligned position whose state can be cached. This is a
+        # property of the prompt, so speculative decoding must not change the
+        # fresh-prefill segmentation. EAGLE cache-hit rewind is handled by the
+        # KV-cache lookup path instead.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
-            last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
         # Invariant: slot p holds the state after exactly (p + 1) * block_size

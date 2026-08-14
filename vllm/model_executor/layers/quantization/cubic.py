@@ -243,6 +243,45 @@ def unpack_cubic_codes(
     return codes.to(torch.int8).reshape(*packed.shape[:-1], num_values)
 
 
+def materialize_cubic_a8_carrier(
+    packed: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    num_bits: int,
+    group_size: int,
+    input_size: int,
+    group_out: int,
+) -> torch.Tensor:
+    """Materialize the exact INT8 carrier used by Dynamic-A8 Linear."""
+    if packed.dtype != torch.uint8:
+        raise ValueError("Cubic A8 carrier requires packed uint8 weights.")
+    expected_bytes = math.ceil(input_size * num_bits / 8)
+    if packed.shape[1] != expected_bytes:
+        raise ValueError(
+            "Cubic A8 carrier packed width does not match the logical input size."
+        )
+    if packed.shape[0] % group_out or a.shape[0] != packed.shape[0] // group_out:
+        raise ValueError("Cubic A8 carrier metadata has an invalid output shape.")
+
+    codes = unpack_cubic_codes(packed, num_bits, input_size).to(torch.float32)
+    if num_bits == 1:
+        return (codes * 127.0).to(torch.int8)
+
+    input_groups = torch.arange(input_size, device=packed.device) // group_size
+    output_groups = torch.arange(packed.shape[0], device=packed.device) // group_out
+    coefficient_a = a[output_groups[:, None], input_groups[None, :]].to(torch.float32)
+    coefficient_b = b[output_groups[:, None], input_groups[None, :]].to(torch.float32)
+    magnitude_max = (1 << (num_bits - 1)) - 1
+    t = codes.abs() / magnitude_max
+    normalized = t * (
+        coefficient_a + t * (coefficient_b + t * (1.0 - coefficient_a - coefficient_b))
+    )
+    return torch.clamp(torch.round(codes.sign() * normalized * 127.0), -127, 127).to(
+        torch.int8
+    )
+
+
 def dequantize_cubic(
     packed: torch.Tensor,
     scale: torch.Tensor,
@@ -743,15 +782,12 @@ class CubicLinearMethod(LinearMethodBase):
             or layer.weight_b.dtype != torch.float16
         ):
             raise ValueError("Cubic linear a/b must remain FP16 at runtime.")
-        if self.dynamic_a8 and self.scheme.num_bits == 8:
-            from vllm.model_executor.layers.quantization.cubic_kernels import (
-                cubic_w8_precompute_carrier,
-            )
-
-            layer.weight_carrier = cubic_w8_precompute_carrier(
+        if self.dynamic_a8:
+            layer.weight_carrier = materialize_cubic_a8_carrier(
                 layer.weight_packed,
                 layer.weight_a,
                 layer.weight_b,
+                num_bits=self.scheme.num_bits,
                 group_size=self.scheme.group_size,
                 input_size=layer.input_size_per_partition,
                 group_out=self.scheme.group_out,

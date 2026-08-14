@@ -26,6 +26,9 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.mamba.abstract import (
+    partition_speculative_token_inputs,
+)
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -35,6 +38,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
+)
+from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
+    gather_initial_states,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
@@ -353,7 +359,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.head_k_dim,
             self.head_v_dim,
             self.conv_kernel_size,
-            self.num_spec,
+            max(1, self.num_spec),
         )
 
     def __init__(
@@ -1250,12 +1256,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
         if spec_sequence_masks is not None:
-            if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
-                mixed_qkv_spec = mixed_qkv
-                mixed_qkv_non_spec = None
-            else:
-                mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
-                mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
+            assert spec_token_indx is not None
+            assert non_spec_token_indx is not None
+            pure_spec_decode = (
+                attn_metadata.num_prefills == 0
+                and attn_metadata.num_decodes == 0
+            )
+            mixed_qkv_spec, a_spec, b_spec = partition_speculative_token_inputs(
+                (mixed_qkv, a, b),
+                spec_token_indx,
+                pure_spec_decode,
+            )
+            mixed_qkv_non_spec = (
+                None
+                if pure_spec_decode
+                else mixed_qkv.index_select(0, non_spec_token_indx)
+            )
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
@@ -1282,6 +1298,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None
+            assert has_initial_state is not None
+            assert non_spec_state_indices_tensor is not None
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
@@ -1379,8 +1397,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
-                    a=a,
-                    b=b,
+                    a=a_spec,
+                    b=b_spec,
                     dt_bias=self.dt_bias,
                     q=query_spec,
                     k=key_spec,
@@ -1433,8 +1451,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
+            initial_state = gather_initial_states(
+                ssm_state,
+                prefill_state_indices,
+                prefill_has_initial_state,
+            )
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,

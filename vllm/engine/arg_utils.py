@@ -448,6 +448,7 @@ class EngineArgs:
     dtype: ModelDType = ModelConfig.dtype
     kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
     seed: int = get_field(ModelConfig, "seed")
+    deterministic_inference: bool = ModelConfig.deterministic_inference
     max_model_len: int = ModelConfig.max_model_len
     cudagraph_capture_sizes: list[int] | None = (
         CompilationConfig.cudagraph_capture_sizes
@@ -760,6 +761,13 @@ class EngineArgs:
         # CompilationConfig object
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
+        if self.deterministic_inference:
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            os.environ["VLLM_BATCH_INVARIANT"] = "1"
+            self.compilation_config.inductor_compile_config.update(
+                combo_kernels=False,
+                benchmark_combo_kernel=False,
+            )
         if isinstance(self.attention_config, dict):
             self.attention_config = AttentionConfig(**self.attention_config)
         if isinstance(self.mamba_config, dict):
@@ -842,6 +850,10 @@ class EngineArgs:
         )
         model_group.add_argument("--dtype", **model_kwargs["dtype"])
         model_group.add_argument("--seed", **model_kwargs["seed"])
+        model_group.add_argument(
+            "--deterministic-inference",
+            **model_kwargs["deterministic_inference"],
+        )
         model_group.add_argument("--hf-config-path", **model_kwargs["hf_config_path"])
         model_group.add_argument(
             "--allowed-local-media-path", **model_kwargs["allowed_local_media_path"]
@@ -1727,6 +1739,7 @@ class EngineArgs:
             allowed_media_domains=self.allowed_media_domains,
             dtype=self.dtype,
             seed=self.seed,
+            deterministic_inference=self.deterministic_inference,
             revision=self.revision,
             code_revision=self.code_revision,
             hf_token=self.hf_token,

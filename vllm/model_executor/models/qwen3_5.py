@@ -30,7 +30,7 @@ import torch
 from torch import nn
 
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.compilation.decorators import support_torch_compile
+from vllm.compilation.decorators import ignore_torch_compile, support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -203,6 +203,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             )
 
 
+@ignore_torch_compile
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -238,7 +239,6 @@ class Qwen3_5Model(Qwen3NextModel):
 
         self.config = config
         self.quant_config = vllm_config.quant_config
-
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -405,7 +405,7 @@ class Qwen3_5ForCausalLMBase(
             hf_config.linear_key_head_dim,
             hf_config.linear_value_head_dim,
             hf_config.linear_conv_kernel_dim,
-            num_spec,
+            max(1, num_spec),
         )
 
     @classmethod
@@ -617,7 +617,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             hf_config.linear_key_head_dim,
             hf_config.linear_value_head_dim,
             hf_config.linear_conv_kernel_dim,
-            num_spec,
+            max(1, num_spec),
         )
 
     @classmethod

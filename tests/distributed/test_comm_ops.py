@@ -318,6 +318,34 @@ def test_cuda_communicator_checkpoints_flashinfer_workspaces(
         workspace.checkpoint_restore.assert_called_once_with(group)
 
 
+def test_cuda_communicator_groups_independent_pynccl_all_reduces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    communicator = CudaCommunicator.__new__(CudaCommunicator)
+    communicator.pynccl_comm = Mock(disabled=False, world_size=8)
+    communicator.qr_comm = None
+    communicator.fi_ar_comm = None
+    communicator.aiter_ar_comm = None
+    communicator.ca_comm = None
+    communicator.symm_mem_comm = None
+    monkeypatch.setattr(
+        "vllm.distributed.device_communicators.cuda_communicator."
+        "should_nccl_symm_mem_allreduce",
+        lambda *_: False,
+    )
+    inputs = [torch.tensor([[1.0]]), torch.tensor([[2.0]])]
+
+    outputs = communicator.all_reduce_batch(inputs)
+
+    communicator.pynccl_comm.group_start.assert_called_once_with()
+    communicator.pynccl_comm.group_end.assert_called_once_with()
+    calls = communicator.pynccl_comm.all_reduce.call_args_list
+    assert [call.args[0] for call in calls] == inputs
+    assert [call.args[1] for call in calls] == outputs
+    assert outputs[0].shape == inputs[0].shape
+    assert outputs[1].shape == inputs[1].shape
+
+
 def test_async_intermediate_tensors_lazy_wait() -> None:
     work = _DummyWork()
     post_calls = {"n": 0}

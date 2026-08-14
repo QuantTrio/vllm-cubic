@@ -537,6 +537,32 @@ def test_rms_norm_batch_invariance(dtype):
     )
 
 
+@skip_unsupported
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_rms_norm_batch_invariance(dtype):
+    """Fused residual-add preserves a row across low-M batch shapes."""
+    device = torch.device(DEVICE_TYPE)
+    torch.manual_seed(43)
+    hidden_size = 3584
+    weight = torch.randn(hidden_size, dtype=torch.float32, device=device)
+    row = torch.randn(1, hidden_size, dtype=dtype, device=device)
+    residual = torch.randn_like(row)
+
+    out_single, residual_single = rms_norm_batch_invariant(
+        row.clone(), weight, residual=residual.clone()
+    )
+    batch = torch.randn(8, hidden_size, dtype=dtype, device=device)
+    batch_residual = torch.randn_like(batch)
+    batch[4] = row[0]
+    batch_residual[4] = residual[0]
+    out_batch, residual_batch = rms_norm_batch_invariant(
+        batch, weight, residual=batch_residual
+    )
+
+    assert torch.equal(out_single[0], out_batch[4])
+    assert torch.equal(residual_single[0], residual_batch[4])
+
+
 if __name__ == "__main__":
     # Run a quick smoke test
     print("Running quick smoke test of RMS norm implementations...")

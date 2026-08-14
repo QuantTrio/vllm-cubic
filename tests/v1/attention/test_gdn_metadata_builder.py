@@ -17,6 +17,9 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.layers.mamba.abstract import (
+    partition_speculative_token_inputs,
+)
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
@@ -25,6 +28,26 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
+
+
+def test_qwen_spec_partition_keeps_gates_aligned() -> None:
+    mixed_qkv = torch.arange(24).view(6, 4)
+    a = torch.arange(6).view(6, 1) + 100
+    b = torch.arange(6).view(6, 1) + 200
+    spec_indices = torch.tensor([1, 3, 4])
+    non_spec_indices = torch.tensor([0, 2, 5])
+
+    qkv_spec, a_spec, b_spec = partition_speculative_token_inputs(
+        (mixed_qkv, a, b),
+        spec_indices,
+        pure_spec_decode=False,
+    )
+    qkv_non_spec = mixed_qkv.index_select(0, non_spec_indices)
+
+    torch.testing.assert_close(qkv_spec, mixed_qkv[spec_indices])
+    torch.testing.assert_close(a_spec, a[spec_indices])
+    torch.testing.assert_close(b_spec, b[spec_indices])
+    torch.testing.assert_close(qkv_non_spec, mixed_qkv[non_spec_indices])
 
 
 @dataclass

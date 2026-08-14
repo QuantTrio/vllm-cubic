@@ -34,6 +34,9 @@ from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup,
 )
+from vllm.model_executor.warmup.spec_decode_triton_warmup import (
+    spec_decode_triton_warmup,
+)
 from vllm.model_executor.warmup.v1_block_table_warmup import (
     warm_v1_block_table_kernels,
 )
@@ -111,6 +114,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             zeroer.warmup(worker.model_runner.kv_cache_config.num_blocks)
 
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+    spec_decode_triton_warmup(worker.model_runner)
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real

@@ -9,6 +9,7 @@ from vllm.model_executor.layers.quantization.cubic_policy import (
     CubicActivationMode,
     CubicExecutionKind,
     CubicReconstructionKind,
+    cubic_linear_token_bucket,
     cubic_reconstruction_kind,
     cubic_token_bucket,
 )
@@ -27,6 +28,16 @@ def test_cubic_token_buckets_are_finite_and_ordered() -> None:
     assert {cubic_token_bucket(num_tokens) for num_tokens in range(1, 65537)} == set(
         CUBIC_TOKEN_BUCKETS
     )
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [(1, 1), (2, 1), (4, 1), (8, 1), (9, 16), (17, 32)],
+)
+def test_cubic_linear_low_m_uses_one_tactic_identity(
+    num_tokens: int, expected: int
+) -> None:
+    assert cubic_linear_token_bucket(num_tokens) == expected
 
 
 def test_cubic_supported_bits_cover_the_complete_format() -> None:
