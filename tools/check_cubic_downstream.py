@@ -18,6 +18,27 @@ class Contract:
 
 CONTRACTS = (
     Contract(
+        "strict-cubic-correctness-harness",
+        "tools/cubic_correctness_harness.py",
+        (
+            "STRICT_RTOL = 0.0",
+            "STRICT_ATOL = 0.0",
+            "tools/run_cubic_correctness_gates.py",
+            "experimental_tolerances_cannot_pass_gate",
+        ),
+    ),
+    Contract(
+        "parallel-cubic-correctness-gates",
+        "tools/run_cubic_correctness_gates.py",
+        (
+            "VLLM_CUBIC_CORRECTNESS_GATE_WORKERS",
+            "VLLM_CUBIC_TEST_CPU_THREADS_PER_WORKER",
+            "CUDA_VISIBLE_DEVICES",
+            "--cubic-shard-count",
+            "--cubic-shard-index",
+        ),
+    ),
+    Contract(
         "cubic-format",
         "vllm/model_executor/layers/quantization/cubic.py",
         (
@@ -25,6 +46,9 @@ CONTRACTS = (
             "CUBIC_SUPPORTED_BITS",
             "dynamic_a8=envs.VLLM_CUBIC_DYNAMIC_A8",
             "def materialize_cubic_a8_carrier(",
+            "def install_cubic_a8_carrier(",
+            'if self.dynamic_a8 and carrier is not None:',
+            "if self.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT:",
         ),
     ),
     Contract(
@@ -36,20 +60,69 @@ CONTRACTS = (
             "CUBIC_TOKEN_BUCKETS =",
             "class CubicExecutionKind(Enum):",
             "class CubicActivationMode(Enum):",
+            "class CubicRuntimeCandidate:",
+            "def cubic_runtime_memory(",
+            "def select_cubic_runtime_candidate(",
             "def cubic_token_bucket(",
             "def cubic_linear_token_bucket(",
             "def cubic_reconstruction_kind(",
         ),
     ),
     Contract(
-        "finite-cubic-token-tactics",
+        "explicit-cubic-linear-tactics",
         "vllm/model_executor/layers/quantization/cubic_kernels.py",
         (
-            '"M_BUCKET",',
-            "M_BUCKET=cubic_linear_token_bucket(x_2d.shape[0])",
+            "def _cubic_linear_tile(",
+            "precomputed_carrier: bool,",
+            "_CUBIC_COMPACT_LINEAR_TILE_TACTICS",
+            "_CUBIC_LINEAR_RESIDENCY_TACTICS",
+            "BLOCK_M=block_m",
+            "BLOCK_N=block_n",
+            "num_warps=num_warps",
             "cubic_token_bucket(num_tokens)",
             "cubic_token_bucket(input_rows)",
         ),
+    ),
+    Contract(
+        "shape-calibrated-cubic-moe-reduction",
+        "vllm/model_executor/layers/quantization/cubic_kernels.py",
+        (
+            "_CUBIC_MOE_SUM_TACTICS",
+            "def _cubic_moe_use_torch_sum(",
+            "def calibrate_cubic_moe_sum_backend(",
+        ),
+    ),
+    Contract(
+        "speculative-runtime-jit-warmup",
+        "vllm/model_executor/warmup/spec_decode_triton_warmup.py",
+        (
+            "for num_sampled_tokens in {num_spec_tokens, num_spec_tokens + 1}:",
+            "for dtype in (torch.float32, torch.int32):",
+            "context.initialize_from_forward_context(",
+            "context.run_fused_postprocess(",
+            "context.run_fused_precopy(",
+        ),
+    ),
+    Contract(
+        "bounded-cubic-startup-calibration",
+        "vllm/model_executor/warmup/cubic_warmup.py",
+        (
+            "representatives = (1, 16, 64, 256, 512)",
+            "def _moe_calibration_token_buckets(",
+            "moe_token_buckets=moe_token_buckets",
+            "def _materialization_token_buckets(",
+            "def _materialize_cubic_linear_residency(",
+            "_CUBIC_LINEAR_METADATA_RESIDENCY_TACTICS",
+            "benefit / extra",
+            "key + (backend,)",
+            "install_cubic_expanded_metadata(",
+            "materialization_buckets = _materialization_token_buckets(max_tokens)",
+        ),
+    ),
+    Contract(
+        "parallel-cubic-startup-compilation",
+        "vllm/envs.py",
+        ("VLLM_CUBIC_COMPILE_WORKERS_PER_GPU",),
     ),
     Contract(
         "low-m-batch-invariant-execution",
@@ -70,11 +143,12 @@ CONTRACTS = (
         ),
     ),
     Contract(
-        "low-m-grouped-tp-reduction",
+        "explicit-batch-invariant-tp-reduction",
         "vllm/model_executor/layers/linear.py",
         (
             "tensor_model_parallel_all_reduce_batch",
-            "use_low_m_batch_invariant(output_parallel)",
+            "if envs.VLLM_BATCH_INVARIANT:",
+            "output_parallel",
         ),
     ),
     Contract(
@@ -140,7 +214,17 @@ CONTRACTS = (
         (
             "b_q = b_q / tl.sqrt(",
             "b_k = b_k / tl.sqrt(",
+            "b_h = b_h.to(ht.dtype.element_ty).to(tl.float32)",
             "num_warps = 1",
+        ),
+    ),
+    Contract(
+        "gemma-prefill-batch-invariant-rmsnorm",
+        "vllm/model_executor/layers/layernorm.py",
+        (
+            "class GemmaRMSNorm(CustomOp):",
+            "return rms_norm_batch_invariant(",
+            "self.weight.float() + 1.0",
         ),
     ),
     Contract(
