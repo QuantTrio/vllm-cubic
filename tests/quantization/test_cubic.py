@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.quantization.cubic import (
+    CUBIC_COMPACT_METADATA_FORMAT,
     CUBIC_FORMAT,
     CubicConfig,
     CubicLinearMetadataParameter,
@@ -17,6 +18,7 @@ from vllm.model_executor.layers.quantization.cubic import (
     CubicScheme,
     cubic_is_strictly_monotonic,
     cubic_levels,
+    decode_cubic_compact_metadata,
     dequantize_cubic,
     pack_cubic_codes,
     quantize_cubic,
@@ -127,6 +129,54 @@ def test_cubic_linear_can_materialize_operator_weight():
     assert cached is actual
 
 
+def test_cubic_resident_a16_uses_batch_invariant_linear(monkeypatch):
+    from vllm import envs
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    calls = []
+
+    def batch_invariant_linear(x, weight, bias=None):
+        calls.append((x, weight, bias))
+        return x @ weight.T if bias is None else x @ weight.T + bias
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.batch_invariant.linear_batch_invariant",
+        batch_invariant_linear,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.cubic."
+        "apply_cubic_exact_marlin_weight",
+        lambda *_args, **_kwargs: pytest.fail(
+            "exact Marlin must not run in batch-invariant mode"
+        ),
+    )
+    weight = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
+    layer = SimpleNamespace(
+        weight_packed=weight,
+        cubic_a16_packed_weight=None,
+        cubic_weight_is_expanded_a16=True,
+        cubic_exact_marlin_weight=torch.empty(0),
+        cubic_exact_marlin_levels=torch.empty(0),
+        cubic_exact_marlin_workspace=torch.empty(0),
+        cubic_exact_marlin_token_buckets=(1,),
+        input_size_per_partition=3,
+        output_size_per_partition=2,
+    )
+    method = CubicLinearMethod(
+        CubicScheme(num_bits=4, group_size=32, group_out=1)
+    )
+    x = torch.tensor([[1, 2, 3]], dtype=torch.bfloat16)
+
+    actual = method.apply(layer, x)
+
+    torch.testing.assert_close(actual, x @ weight.T, rtol=0, atol=0)
+    assert len(calls) == 1
+    assert calls[0][0] is x
+    assert calls[0][1] is weight
+    assert calls[0][2] is None
+
+
 @pytest.mark.parametrize("bits", range(2, 9))
 def test_cubic_exact_zero_endpoints_and_int_special_case(bits: int):
     magnitude_max = (1 << (bits - 1)) - 1
@@ -229,6 +279,541 @@ def test_cubic_config_accepts_legacy_and_two_dimensional_group_shapes():
     assert config.schemes[0][1].group_shape == (1, 512)
     assert config.schemes[1][1].group_shape == (128, 512)
     assert config.schemes[2][1].group_shape == (512, 1)
+
+
+def test_cubic_compact_metadata_decodes_per_logical_partition():
+    scale_code = torch.tensor([[2, 3], [4, 5], [6, 7]], dtype=torch.int8)
+    a_code = torch.tensor([[1, -2], [3, -4], [5, -6]], dtype=torch.int8)
+    b_code = torch.tensor([[-1, 2], [-3, 4], [-5, 6]], dtype=torch.int8)
+    packed_ab = ((a_code & 0xF) | ((b_code & 0xF) << 4)).to(torch.uint8)
+
+    scale, a, b = decode_cubic_compact_metadata(
+        scale_code,
+        packed_ab,
+        torch.tensor([0.5, 0.25]),
+        torch.tensor([0.125, 0.25]),
+        torch.tensor([0.5, 0.75]),
+        [2, 1],
+        1,
+    )
+
+    torch.testing.assert_close(
+        scale,
+        torch.tensor([[1.0, 1.5], [2.0, 2.5], [1.5, 1.75]]),
+    )
+    torch.testing.assert_close(
+        a,
+        torch.tensor(
+            [[1.125, 0.75], [1.375, 0.5], [2.25, -0.5]],
+            dtype=torch.float16,
+        ),
+    )
+    torch.testing.assert_close(
+        b,
+        torch.tensor(
+            [[-0.5, 1.0], [-1.5, 2.0], [-3.75, 4.5]],
+            dtype=torch.float16,
+        ),
+    )
+
+
+def test_cubic_config_accepts_compact_metadata():
+    config = CubicConfig.from_config(
+        {
+            "quant_method": "cubic",
+            "format": CUBIC_FORMAT,
+            "config_groups": {
+                "compact": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 4,
+                        "group_size": [1, 32],
+                        "scale_dtype": "torch.int8",
+                        "param_dtype": "packed_int4",
+                        "metadata_format": (
+                            "int8-scale-int4-ab-global-fp32"
+                        ),
+                    },
+                }
+            },
+        }
+    )
+
+    scheme = config.schemes[0][1]
+    assert scheme.metadata_format == "int8-scale-int4-ab-global-fp32"
+    assert scheme.effective_bits == 4.5
+
+
+def test_cubic_linear_keeps_compact_metadata_resident_after_loading():
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight_packed",
+        torch.nn.Parameter(
+            torch.zeros(3, 4, dtype=torch.uint8), requires_grad=False
+        ),
+    )
+    layer.register_parameter(
+        "weight_scale",
+        torch.nn.Parameter(
+            torch.tensor(
+                [[2, 3, 4, 5], [6, 7, 8, 9], [10, 11, 12, 13]],
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        ),
+    )
+    layer.register_parameter(
+        "weight_ab",
+        torch.nn.Parameter(
+            torch.full((3, 4), 0x1F, dtype=torch.uint8),
+            requires_grad=False,
+        ),
+    )
+    for name, value in (
+        ("scale", [0.5, 0.25]),
+        ("a", [0.125, 0.25]),
+        ("b", [0.5, 0.75]),
+    ):
+        layer.register_parameter(
+            f"weight_{name}_global",
+            torch.nn.Parameter(torch.tensor(value), requires_grad=False),
+        )
+    layer.input_size_per_partition = 8
+    layer.output_size_per_partition = 3
+    layer.output_partition_sizes = [2, 1]
+    method = CubicLinearMethod(
+        CubicScheme(
+            num_bits=4,
+            group_size=2,
+            group_out=1,
+            metadata_format="int8-scale-int4-ab-global-fp32",
+        )
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.weight_scale.dtype == torch.int8
+    assert layer.weight_ab.dtype == torch.uint8
+    assert not hasattr(layer, "weight_a")
+    assert not hasattr(layer, "weight_b")
+    assert layer.weight_global_index.tolist() == [0, 0, 1]
+    scale, a, b = decode_cubic_compact_metadata(
+        layer.weight_scale,
+        layer.weight_ab,
+        layer.weight_scale_global,
+        layer.weight_a_global,
+        layer.weight_b_global,
+        layer.output_partition_sizes,
+        method.scheme.group_out,
+    )
+    torch.testing.assert_close(
+        scale[:, 0], torch.tensor([1.0, 3.0, 2.5])
+    )
+    torch.testing.assert_close(
+        a[:, 0],
+        torch.tensor([0.875, 0.875, 0.75], dtype=torch.float16),
+    )
+    torch.testing.assert_close(
+        b[:, 0],
+        torch.tensor([0.5, 0.5, 0.75], dtype=torch.float16),
+    )
+
+
+def test_cubic_dynamic_a8_keeps_compact_metadata_resident_after_loading():
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight_packed",
+        torch.nn.Parameter(torch.zeros(3, 4, dtype=torch.uint8), False),
+    )
+    layer.register_parameter(
+        "weight_scale",
+        torch.nn.Parameter(torch.ones(3, 4, dtype=torch.int8), False),
+    )
+    layer.register_parameter(
+        "weight_ab",
+        torch.nn.Parameter(torch.zeros(3, 4, dtype=torch.uint8), False),
+    )
+    for name in ("scale", "a", "b"):
+        layer.register_parameter(
+            f"weight_{name}_global",
+            torch.nn.Parameter(torch.ones(2), False),
+        )
+    layer.input_size_per_partition = 8
+    layer.output_size_per_partition = 3
+    layer.output_partition_sizes = [2, 1]
+    method = CubicLinearMethod(
+        CubicScheme(
+            num_bits=4,
+            group_size=2,
+            group_out=1,
+            metadata_format="int8-scale-int4-ab-global-fp32",
+        ),
+        dynamic_a8=True,
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.weight_scale.dtype == torch.int8
+    assert layer.weight_ab.dtype == torch.uint8
+    assert not hasattr(layer, "weight_carrier")
+    assert not hasattr(layer, "weight_a")
+    assert not hasattr(layer, "weight_b")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bits", range(1, 9))
+def test_cubic_a8_replaces_packed_codes_with_runtime_carrier(bits: int):
+    from vllm.model_executor.layers.quantization.cubic import (
+        install_cubic_a8_carrier,
+        materialize_cubic_a8_carrier,
+    )
+
+    device = torch.device("cuda")
+    if bits == 1:
+        codes = (
+            torch.randint(0, 2, (4, 8), device=device, dtype=torch.int16)
+            .mul_(2)
+            .sub_(1)
+        )
+    else:
+        magnitude_max = (1 << (bits - 1)) - 1
+        codes = torch.randint(
+            -magnitude_max,
+            magnitude_max + 1,
+            (4, 8),
+            device=device,
+            dtype=torch.int16,
+        )
+    packed = pack_cubic_codes(codes, bits)
+    scale = torch.ones(4, 1, device=device, dtype=torch.float32)
+    a = torch.full((4, 1), 0.5, device=device, dtype=torch.float16)
+    b = torch.full((4, 1), 0.25, device=device, dtype=torch.float16)
+    expected = materialize_cubic_a8_carrier(
+        packed,
+        a,
+        b,
+        num_bits=bits,
+        group_size=8,
+        input_size=8,
+        group_out=1,
+    )
+    layer = torch.nn.Module()
+    for name, value in (
+        ("weight_packed", packed),
+        ("weight_scale", scale),
+        ("weight_a", a),
+        ("weight_b", b),
+    ):
+        layer.register_parameter(
+            name, torch.nn.Parameter(value, requires_grad=False)
+        )
+    layer.input_size_per_partition = 8
+    layer.output_size_per_partition = 4
+    layer.output_partition_sizes = [4]
+    layer.params_dtype = torch.bfloat16
+    method = CubicLinearMethod(
+        CubicScheme(
+            num_bits=bits,
+            group_size=8,
+            group_out=1,
+            reserved_code="binary" if bits == 1 else "zero",
+        ),
+        dynamic_a8=True,
+    )
+
+    method.process_weights_after_loading(layer)
+    install_cubic_a8_carrier(layer, method.scheme)
+
+    assert layer.cubic_weight_packed_is_carrier
+    assert layer.weight_packed.dtype == torch.int8
+    assert layer.weight_packed.numel() == codes.numel()
+    assert not hasattr(layer, "weight_carrier")
+    torch.testing.assert_close(layer.weight_packed, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        method.dequantize(layer),
+        expected.to(torch.float32).mul(1.0 / 127.0).to(torch.bfloat16),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bits", range(1, 9))
+@pytest.mark.parametrize("group_out", [1, 32])
+@pytest.mark.parametrize("dynamic_a8", [False, True])
+def test_cubic_marlin_carrier_supports_all_bits_and_output_groups(
+    bits: int,
+    group_out: int,
+    dynamic_a8: bool,
+):
+    from vllm.model_executor.layers.quantization.cubic import (
+        apply_cubic_marlin_weight,
+        materialize_cubic_a8_carrier,
+        prepare_cubic_marlin_weight,
+    )
+    from vllm.model_executor.layers.quantization.utils.int8_utils import (
+        per_token_quant_int8,
+    )
+
+    n, k, group_size = 64, 128, 32
+    magnitude_max = 1 if bits == 1 else (1 << (bits - 1)) - 1
+    codes = torch.randint(
+        -magnitude_max,
+        magnitude_max + 1,
+        (n, k),
+        device="cuda",
+        dtype=torch.int16,
+    )
+    if bits == 1:
+        codes = torch.where(codes < 0, -1, 1)
+    packed = pack_cubic_codes(codes, bits)
+    metadata_shape = (n // group_out, k // group_size)
+    scale = torch.rand(metadata_shape, device="cuda", dtype=torch.float32)
+    a = torch.rand(metadata_shape, device="cuda", dtype=torch.float16)
+    b = torch.rand(metadata_shape, device="cuda", dtype=torch.float16)
+    carrier = materialize_cubic_a8_carrier(
+        packed,
+        a,
+        b,
+        num_bits=bits,
+        group_size=group_size,
+        input_size=k,
+        group_out=group_out,
+    )
+    prepared = prepare_cubic_marlin_weight(
+        carrier,
+        scale,
+        params_dtype=torch.float16,
+        group_size=group_size,
+        group_out=group_out,
+        dynamic_a8=dynamic_a8,
+    )
+    assert prepared is not None
+
+    x = torch.randn(3, k, device="cuda", dtype=torch.float16)
+    actual = apply_cubic_marlin_weight(
+        x,
+        prepared,
+        output_size=n,
+        input_size=k,
+        dynamic_a8=dynamic_a8,
+    )
+    expanded_scale = scale.repeat_interleave(group_out, dim=0).repeat_interleave(
+        group_size, dim=1
+    )
+    weight = carrier.float() * expanded_scale[:, :k] / 127
+    if dynamic_a8:
+        quantized_x, x_scale = per_token_quant_int8(x)
+        reference_x = quantized_x.float() * x_scale
+    else:
+        reference_x = x.float()
+    reference = torch.nn.functional.linear(reference_x, weight).to(x.dtype)
+    torch.testing.assert_close(actual, reference, rtol=0.02, atol=0.1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("group_out", [1, 8])
+def test_cubic_dynamic_a8_marlin_preserves_group_mapping_exactly(
+    group_out: int,
+):
+    from vllm.model_executor.layers.quantization.cubic import (
+        apply_cubic_marlin_weight,
+        prepare_cubic_marlin_weight,
+    )
+
+    n, k, group_size = 64, 128, 32
+    carrier = (
+        torch.arange(n * k, device="cuda", dtype=torch.int32)
+        .remainder(255)
+        .sub(127)
+        .to(torch.int8)
+        .reshape(n, k)
+    )
+    output_groups = n // group_out
+    group_scales = torch.tensor(
+        [127.0, 63.5, 31.75, 15.875], device="cuda", dtype=torch.float32
+    )
+    scale = group_scales.repeat(output_groups, 1)
+    prepared = prepare_cubic_marlin_weight(
+        carrier,
+        scale,
+        params_dtype=torch.float16,
+        group_size=group_size,
+        group_out=group_out,
+        dynamic_a8=True,
+    )
+    assert prepared is not None
+
+    output_scale = scale.repeat_interleave(group_out, dim=0)
+    for input_index in (0, 31, 32, 63, 64, 95, 96, 127):
+        x = torch.zeros((1, k), device="cuda", dtype=torch.float16)
+        x[0, input_index] = 127
+        actual = apply_cubic_marlin_weight(
+            x,
+            prepared,
+            output_size=n,
+            input_size=k,
+            dynamic_a8=True,
+        )
+        expected = (
+            carrier[:, input_index].float()
+            * output_scale[:, input_index // group_size]
+        ).to(actual.dtype)
+        torch.testing.assert_close(
+            actual.squeeze(0), expected, rtol=0, atol=0
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cubic_marlin_defers_groups_wider_than_tp_local_input():
+    from vllm.model_executor.layers.quantization.cubic import (
+        prepare_cubic_marlin_weight,
+    )
+
+    carrier = torch.zeros((128, 256), device="cuda", dtype=torch.int8)
+    scale = torch.ones((1, 1), device="cuda", dtype=torch.float32)
+
+    prepared = prepare_cubic_marlin_weight(
+        carrier,
+        scale,
+        params_dtype=torch.bfloat16,
+        group_size=512,
+        group_out=128,
+        dynamic_a8=True,
+    )
+
+    assert prepared is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("tokens", [2, 64])
+def test_cubic_exact_marlin_preserves_w4_g32_codes_and_batch_rows(tokens: int):
+    from vllm.model_executor.layers.quantization.cubic import (
+        apply_cubic_exact_marlin_weight,
+        dequantize_cubic,
+        prepare_cubic_exact_marlin_weight,
+    )
+
+    torch.manual_seed(4)
+    n = k = 128
+    codes = torch.randint(-7, 8, (n, k), device="cuda", dtype=torch.int8)
+    packed = pack_cubic_codes(codes, 4)
+    scale = torch.rand(n, k // 32, device="cuda", dtype=torch.float32) * 0.1
+    coefficient_a = torch.rand(n, k // 32, device="cuda", dtype=torch.float16)
+    coefficient_b = torch.rand(n, k // 32, device="cuda", dtype=torch.float16)
+    prepared = prepare_cubic_exact_marlin_weight(
+        packed,
+        scale,
+        coefficient_a,
+        coefficient_b,
+        params_dtype=torch.bfloat16,
+        num_bits=4,
+        group_size=32,
+        group_out=1,
+        input_size=k,
+    )
+    assert prepared is not None
+
+    inputs = torch.randn(tokens, k, device="cuda", dtype=torch.bfloat16)
+    actual = apply_cubic_exact_marlin_weight(
+        inputs,
+        prepared,
+        output_size=n,
+        input_size=k,
+    )
+    weight = dequantize_cubic(
+        packed,
+        scale,
+        coefficient_a,
+        coefficient_b,
+        total_bits=4,
+        group_size=32,
+        group_out=1,
+        num_values=k,
+        output_dtype=torch.bfloat16,
+    )
+    reference = torch.nn.functional.linear(inputs, weight)
+    if tokens == 2:
+        independent = torch.cat(
+            [
+                apply_cubic_exact_marlin_weight(
+                    row[None],
+                    prepared,
+                    output_size=n,
+                    input_size=k,
+                )
+                for row in inputs
+            ]
+        )
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        torch.testing.assert_close(actual, independent, rtol=0, atol=0)
+    else:
+        error = actual.float() - reference.float()
+        reference_rms = reference.float().square().mean().sqrt()
+        nrmse = error.square().mean().sqrt() / reference_rms
+        assert nrmse.item() < 0.01
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bits", range(1, 9))
+@pytest.mark.parametrize("group_out", (1, 8))
+def test_compact_dynamic_a8_uses_resident_carrier_without_marlin(
+    bits: int, group_out: int
+):
+    from vllm.model_executor.layers.quantization.cubic import (
+        install_cubic_a8_carrier,
+    )
+
+    device = torch.device("cuda")
+    n, k, group_size = 16, 64, 128
+    magnitude_max = 1 if bits == 1 else (1 << (bits - 1)) - 1
+    codes = torch.randint(
+        -magnitude_max,
+        magnitude_max + 1,
+        (n, k),
+        device=device,
+        dtype=torch.int16,
+    )
+    if bits == 1:
+        codes = torch.where(codes < 0, -1, 1)
+    metadata_shape = (n // group_out, 1)
+    layer = torch.nn.Module()
+    for name, value in (
+        ("weight_packed", pack_cubic_codes(codes, bits)),
+        (
+            "weight_scale",
+            torch.full(metadata_shape, 64, device=device, dtype=torch.int8),
+        ),
+        ("weight_ab", torch.zeros(metadata_shape, device=device, dtype=torch.uint8)),
+        ("weight_scale_global", torch.tensor([1 / 64], device=device)),
+        ("weight_a_global", torch.tensor([1 / 8], device=device)),
+        ("weight_b_global", torch.tensor([1 / 8], device=device)),
+    ):
+        layer.register_parameter(name, torch.nn.Parameter(value, False))
+    layer.input_size_per_partition = k
+    layer.output_size_per_partition = n
+    layer.output_partition_sizes = [n]
+    layer.params_dtype = torch.float16
+    method = CubicLinearMethod(
+        CubicScheme(
+            num_bits=bits,
+            group_size=group_size,
+            group_out=group_out,
+            metadata_format=CUBIC_COMPACT_METADATA_FORMAT,
+            reserved_code="binary" if bits == 1 else "zero",
+        ),
+        dynamic_a8=True,
+    )
+    method.process_weights_after_loading(layer)
+    x = torch.randn(3, k, device=device, dtype=torch.float16)
+    reference = method.apply(layer, x)
+
+    install_cubic_a8_carrier(layer, method.scheme)
+
+    assert layer.cubic_weight_packed_is_carrier
+    assert not getattr(layer, "cubic_weight_packed_is_marlin", False)
+    actual = method.apply(layer, x)
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 def test_cubic_config_ignore_prefix_regex_excludes_subtree():
@@ -547,6 +1132,360 @@ def test_cubic_a16_linear_supports_two_dimensional_groups(
     )
 
     torch.testing.assert_close(actual, x @ weight.T, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bits", range(1, 9))
+@pytest.mark.parametrize(
+    ("group_out", "group_size"),
+    ((1, 32), (1, 128), (128, 1), (32, 64)),
+)
+def test_cubic_compact_a16_supports_all_bits_and_group_layouts(
+    monkeypatch: pytest.MonkeyPatch,
+    bits: int,
+    group_out: int,
+    group_size: int,
+):
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        cubic_linear_compact,
+    )
+
+    device = torch.device("cuda")
+    outputs = inputs = 128
+    generator = torch.Generator(device=device).manual_seed(
+        bits * 1000 + group_out * 10 + group_size
+    )
+    if bits == 1:
+        codes = torch.randint(
+            0,
+            2,
+            (outputs, inputs),
+            generator=generator,
+            device=device,
+            dtype=torch.int16,
+        )
+        codes = codes * 2 - 1
+    else:
+        magnitude_max = (1 << (bits - 1)) - 1
+        codes = torch.randint(
+            -magnitude_max,
+            magnitude_max + 1,
+            (outputs, inputs),
+            generator=generator,
+            device=device,
+            dtype=torch.int16,
+        )
+    packed = pack_cubic_codes(codes, bits)
+    metadata_shape = (outputs // group_out, inputs // group_size)
+    scale_code = torch.randint(
+        1,
+        32,
+        metadata_shape,
+        generator=generator,
+        device=device,
+        dtype=torch.int8,
+    )
+    a_code = torch.randint(
+        -7,
+        8,
+        metadata_shape,
+        generator=generator,
+        device=device,
+        dtype=torch.int8,
+    )
+    b_code = torch.randint(
+        -7,
+        8,
+        metadata_shape,
+        generator=generator,
+        device=device,
+        dtype=torch.int8,
+    )
+    packed_ab = ((b_code & 0xF) << 4 | (a_code & 0xF)).to(torch.uint8)
+    scale_global = torch.tensor([0.001], device=device)
+    a_global = torch.tensor([0.03125], device=device)
+    b_global = torch.tensor([0.03125], device=device)
+    global_index = torch.zeros(
+        metadata_shape[0], device=device, dtype=torch.uint8
+    )
+    scale = scale_code.float() * scale_global
+    a = (1.0 + a_code.float() * a_global).half()
+    b = (b_code.float() * b_global).half()
+    weight = dequantize_cubic(
+        packed,
+        scale,
+        a,
+        b,
+        total_bits=bits,
+        group_size=group_size,
+        group_out=group_out,
+        num_values=inputs,
+        output_dtype=torch.bfloat16,
+    )
+    x = torch.randn(
+        9, inputs, generator=generator, device=device, dtype=torch.bfloat16
+    )
+
+    low_m = cubic_linear_compact(
+        x[:1],
+        packed,
+        scale_code,
+        packed_ab,
+        scale_global,
+        a_global,
+        b_global,
+        global_index,
+        num_bits=bits,
+        group_size=group_size,
+        group_out=group_out,
+        input_size=inputs,
+    )
+    torch.testing.assert_close(low_m, x[:1] @ weight.T, rtol=0, atol=0)
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+
+    actual = cubic_linear_compact(
+        x,
+        packed,
+        scale_code,
+        packed_ab,
+        scale_global,
+        a_global,
+        b_global,
+        global_index,
+        num_bits=bits,
+        group_size=group_size,
+        group_out=group_out,
+        input_size=inputs,
+    )
+    expanded = cubic_linear_compact(
+        x,
+        packed,
+        scale,
+        a,
+        b,
+        a_global,
+        b_global,
+        global_index,
+        num_bits=bits,
+        group_size=group_size,
+        group_out=group_out,
+        input_size=inputs,
+        _expanded_metadata=True,
+    )
+    tokenwise = torch.cat(
+        [
+            cubic_linear_compact(
+                row,
+                packed,
+                scale_code,
+                packed_ab,
+                scale_global,
+                a_global,
+                b_global,
+                global_index,
+                num_bits=bits,
+                group_size=group_size,
+                group_out=group_out,
+                input_size=inputs,
+            )
+            for row in x.split(1)
+        ]
+    )
+    expanded_tokenwise = torch.cat(
+        [
+            cubic_linear_compact(
+                row,
+                packed,
+                scale,
+                a,
+                b,
+                a_global,
+                b_global,
+                global_index,
+                num_bits=bits,
+                group_size=group_size,
+                group_out=group_out,
+                input_size=inputs,
+                _expanded_metadata=True,
+            )
+            for row in x.split(1)
+        ]
+    )
+
+    torch.testing.assert_close(actual, x @ weight.T, rtol=0.03, atol=0.03)
+    torch.testing.assert_close(expanded, x @ weight.T, rtol=0.03, atol=0.03)
+    torch.testing.assert_close(actual, tokenwise, rtol=0, atol=0)
+    torch.testing.assert_close(expanded, expanded_tokenwise, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bits", range(1, 9))
+@pytest.mark.parametrize(
+    ("group_out", "group_size"),
+    ((1, 128), (128, 1), (32, 64)),
+)
+def test_cubic_compact_a8_matches_expanded_metadata_path(
+    monkeypatch: pytest.MonkeyPatch,
+    bits: int,
+    group_out: int,
+    group_size: int,
+):
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        cubic_linear_dynamic_a8,
+        cubic_linear_dynamic_a8_compact,
+    )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    device = torch.device("cuda")
+    outputs = inputs = 128
+    generator = torch.Generator(device=device).manual_seed(
+        bits * 1000 + group_out * 10 + group_size
+    )
+    if bits == 1:
+        codes = torch.randint(
+            0,
+            2,
+            (outputs, inputs),
+            generator=generator,
+            device=device,
+            dtype=torch.int16,
+        )
+        codes = codes * 2 - 1
+    else:
+        magnitude_max = (1 << (bits - 1)) - 1
+        codes = torch.randint(
+            -magnitude_max,
+            magnitude_max + 1,
+            (outputs, inputs),
+            generator=generator,
+            device=device,
+            dtype=torch.int16,
+        )
+    packed = pack_cubic_codes(codes, bits)
+    metadata_shape = (outputs // group_out, inputs // group_size)
+    scale_code = torch.randint(
+        1,
+        32,
+        metadata_shape,
+        generator=generator,
+        device=device,
+        dtype=torch.int8,
+    )
+    a_code = torch.randint(
+        -7,
+        8,
+        metadata_shape,
+        generator=generator,
+        device=device,
+        dtype=torch.int8,
+    )
+    b_code = torch.randint(
+        -7,
+        8,
+        metadata_shape,
+        generator=generator,
+        device=device,
+        dtype=torch.int8,
+    )
+    packed_ab = ((b_code & 0xF) << 4 | (a_code & 0xF)).to(torch.uint8)
+    scale_global = torch.tensor([0.001], device=device)
+    a_global = torch.tensor([0.03125], device=device)
+    b_global = torch.tensor([0.03125], device=device)
+    global_index = torch.zeros(
+        metadata_shape[0], device=device, dtype=torch.uint8
+    )
+    scale = scale_code.float() * scale_global
+    a = (1.0 + a_code.float() * a_global).half()
+    b = (b_code.float() * b_global).half()
+    x = torch.randn(
+        9, inputs, generator=generator, device=device, dtype=torch.bfloat16
+    )
+
+    expected = cubic_linear_dynamic_a8(
+        x,
+        packed,
+        scale,
+        a,
+        b,
+        num_bits=bits,
+        group_size=group_size,
+        group_out=group_out,
+        input_size=inputs,
+    )
+    actual = cubic_linear_dynamic_a8_compact(
+        x,
+        packed,
+        scale_code,
+        packed_ab,
+        scale_global,
+        a_global,
+        b_global,
+        global_index,
+        num_bits=bits,
+        group_size=group_size,
+        group_out=group_out,
+        input_size=inputs,
+    )
+    expanded = cubic_linear_dynamic_a8_compact(
+        x,
+        packed,
+        scale,
+        a,
+        b,
+        a_global,
+        b_global,
+        global_index,
+        num_bits=bits,
+        group_size=group_size,
+        group_out=group_out,
+        input_size=inputs,
+        _expanded_metadata=True,
+    )
+    tokenwise = torch.cat(
+        [
+            cubic_linear_dynamic_a8_compact(
+                row,
+                packed,
+                scale_code,
+                packed_ab,
+                scale_global,
+                a_global,
+                b_global,
+                global_index,
+                num_bits=bits,
+                group_size=group_size,
+                group_out=group_out,
+                input_size=inputs,
+            )
+            for row in x.split(1)
+        ]
+    )
+    expanded_tokenwise = torch.cat(
+        [
+            cubic_linear_dynamic_a8_compact(
+                row,
+                packed,
+                scale,
+                a,
+                b,
+                a_global,
+                b_global,
+                global_index,
+                num_bits=bits,
+                group_size=group_size,
+                group_out=group_out,
+                input_size=inputs,
+                _expanded_metadata=True,
+            )
+            for row in x.split(1)
+        ]
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.01)
+    torch.testing.assert_close(expanded, expected, rtol=0.01, atol=0.01)
+    torch.testing.assert_close(actual, tokenwise, rtol=0, atol=0)
+    torch.testing.assert_close(expanded, expanded_tokenwise, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -922,3 +1861,30 @@ def test_cubic_decode_w2_route_sum_fusion_is_exact(bits: int):
     )
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_cubic_moe_sum_policy_uses_nearest_calibrated_token_bucket(monkeypatch):
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 3)
+    monkeypatch.setattr(
+        cubic_kernels,
+        "_CUBIC_MOE_SUM_TACTICS",
+        {
+            (3, 5120, 16, 32, True): True,
+            (3, 5120, 16, 128, True): False,
+        },
+    )
+    expert_map = torch.empty(0, dtype=torch.int32)
+
+    assert cubic_kernels._cubic_moe_use_torch_sum(5120, 16, 40, expert_map)
+    assert not cubic_kernels._cubic_moe_use_torch_sum(5120, 16, 96, expert_map)
+
+
+def test_cubic_moe_sum_policy_falls_back_to_safe_zeroed_routes(monkeypatch):
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(cubic_kernels, "_CUBIC_MOE_SUM_TACTICS", {})
+
+    assert cubic_kernels._cubic_moe_use_torch_sum(3584, 16, 1, None)

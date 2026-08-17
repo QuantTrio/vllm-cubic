@@ -13,6 +13,7 @@
       const int4 *__restrict__ b_bias_ptr,                                     \
       const float *__restrict__ a_scales_ptr,                                  \
       const int4 *__restrict__ scales_ptr,                                     \
+      const int4 *__restrict__ cubic_levels_ptr,                               \
       const float *__restrict__ global_scale_ptr,                              \
       const int4 *__restrict__ zp_ptr, const int *__restrict__ g_idx,          \
       int num_groups, int prob_m, int prob_n, int prob_k, int lda, int *locks, \
@@ -36,7 +37,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float   // is zero point of float16 type?
+          const bool is_zp_float,  // is zero point of float16 type?
+          const bool is_cubic = false
           >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 

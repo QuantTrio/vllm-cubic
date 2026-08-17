@@ -16,6 +16,7 @@ import socket
 import time
 import uuid
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -25,19 +26,36 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.cubic import (
+    CUBIC_COMPACT_METADATA_FORMAT,
     CubicLinearMethod,
     CubicMoEMethod,
+    apply_cubic_exact_marlin_weight,
+    apply_cubic_marlin_weight,
     cubic_carrier_levels,
+    expanded_cubic_metadata,
+    install_cubic_a16_weight,
+    install_cubic_carrier,
+    install_cubic_exact_marlin_weight,
+    install_cubic_expanded_metadata,
+    materialize_cubic_a8_carrier,
+    materialize_cubic_a16_weight,
+    prepare_cubic_exact_marlin_weight,
+    prepare_cubic_marlin_weight,
 )
 from vllm.model_executor.layers.quantization.cubic_policy import (
     CUBIC_TOKEN_BUCKETS,
+    CubicCarrierResidency,
+    CubicMetadataResidency,
+    CubicRuntimeCandidate,
+    cubic_linear_residency_budget,
     cubic_linear_token_bucket,
+    cubic_runtime_memory,
     cubic_token_bucket,
 )
 
 logger = init_logger(__name__)
 
-_CUBIC_TACTIC_CACHE_SCHEMA = 22
+_CUBIC_TACTIC_CACHE_SCHEMA = 37
 _CUBIC_TACTIC_CACHE_FILENAME = "cubic_tactics.json"
 _CUBIC_TACTIC_REGISTRY_NAMES = (
     "_CUBIC_W2_A8_SITU_TACTICS",
@@ -48,15 +66,28 @@ _CUBIC_TACTIC_REGISTRY_NAMES = (
     "_CUBIC_LINEAR_EXECUTION_TACTICS",
     "_CUBIC_LINEAR_BLOCK_K_TACTICS",
     "_CUBIC_LINEAR_TILE_TACTICS",
+    "_CUBIC_COMPACT_LINEAR_TILE_TACTICS",
     "_CUBIC_LINEAR_STREAM_TACTICS",
+    "_CUBIC_LINEAR_RESIDENCY_TACTICS",
+    "_CUBIC_LINEAR_REJECTED_RESIDENCIES",
+    "_CUBIC_LINEAR_METADATA_RESIDENCY_TACTICS",
     "_CUBIC_MOE_DENSE_BLOCK_TACTICS",
     "_CUBIC_MOE_DENSE_BLOCK_K_TACTICS",
     "_CUBIC_MOE_ROUTE_CTA_TACTICS",
+    "_CUBIC_MOE_SUM_TACTICS",
     "_CUBIC8_W2_BLOCK_N_TACTICS",
     "_CUBIC8_W2_LUT_TACTICS",
 )
 
 CalibrationTask = tuple[Any, ...]
+
+
+def _linear_metadata_signature(
+    layer: torch.nn.Module, method: CubicLinearMethod
+) -> tuple[str, str]:
+    if method.scheme.metadata_format != "float32-scale-float16-ab":
+        return str(layer.weight_scale.dtype), str(layer.weight_ab.dtype)
+    return str(layer.weight_a.dtype), str(layer.weight_b.dtype)
 
 
 def _cubic_tactic_registries() -> dict[str, dict[tuple[Any, ...], Any]]:
@@ -72,6 +103,7 @@ def _cubic_model_signature(
     for module in model.modules():
         method = getattr(module, "quant_method", None)
         if isinstance(method, CubicLinearMethod):
+            metadata_signature = _linear_metadata_signature(module, method)
             signatures.append(
                 [
                     "linear",
@@ -81,8 +113,8 @@ def _cubic_model_signature(
                     int(module.input_size_per_partition),
                     int(module.output_size_per_partition),
                     list(module.weight_packed.shape),
-                    str(module.weight_a.dtype),
-                    str(module.weight_b.dtype),
+                    *metadata_signature,
+                    method.scheme.metadata_format,
                     bool(method.dynamic_a8),
                 ]
             )
@@ -210,6 +242,7 @@ def _linear_task_id(
     method: CubicLinearMethod,
     tokens: int,
 ) -> CalibrationTask:
+    metadata_signature = _linear_metadata_signature(layer, method)
     return (
         "linear",
         method.scheme.num_bits,
@@ -217,8 +250,8 @@ def _linear_task_id(
         method.scheme.group_out,
         int(layer.input_size_per_partition),
         int(layer.output_size_per_partition),
-        str(layer.weight_a.dtype),
-        str(layer.weight_b.dtype),
+        *metadata_signature,
+        getattr(method, "dynamic_a8", False),
         tokens,
     )
 
@@ -249,9 +282,14 @@ def _moe_task_id(
 
 
 def _cubic_calibration_tasks(
-    model: torch.nn.Module, token_buckets: tuple[int, ...]
+    model: torch.nn.Module,
+    token_buckets: tuple[int, ...],
+    *,
+    moe_token_buckets: tuple[int, ...] | None = None,
 ) -> tuple[CalibrationTask, ...]:
     tasks: set[CalibrationTask] = set()
+    if moe_token_buckets is None:
+        moe_token_buckets = token_buckets
     linear_token_buckets = tuple(
         sorted({cubic_linear_token_bucket(m) for m in token_buckets})
     )
@@ -262,14 +300,14 @@ def _cubic_calibration_tasks(
                 _linear_task_id(module, method, m) for m in linear_token_buckets
             )
         elif isinstance(method, CubicMoEMethod):
-            tasks.update(_moe_task_id(module, method, m) for m in token_buckets)
+            tasks.update(_moe_task_id(module, method, m) for m in moe_token_buckets)
     tasks.update(("w2_situ", *spec) for spec in _cubic_w2_a8_situ_specs(model))
     return tuple(sorted(tasks, key=repr))
 
 
 def _cubic_task_weight(task: CalibrationTask) -> int:
     if task[0] == "linear":
-        _, _, _, _, k, n, _, _, m = task
+        k, n, m = task[4], task[5], task[-1]
         return int(k) * int(n) * (32 + int(m))
     if task[0] == "w2_situ":
         _, n, k, _, _, _, local_experts = task
@@ -502,6 +540,8 @@ def _merge_cubic_tactics(
                     "_CUBIC_W2_A8_SITU_TACTICS",
                     "_CUBIC_LINEAR_TILE_TACTICS",
                     "_CUBIC_LINEAR_STREAM_TACTICS",
+                    "_CUBIC_LINEAR_RESIDENCY_TACTICS",
+                    "_CUBIC_LINEAR_METADATA_RESIDENCY_TACTICS",
                 ):
                     value = tuple(value)
                 registry[local_key] = value
@@ -602,7 +642,498 @@ def _calibration_token_buckets(
 ) -> tuple[int, ...]:
     del capture_sizes
     largest_bucket = cubic_token_bucket(max_tokens)
+    representatives = (1, 16, 64, 256, 512)
+    selected = tuple(bucket for bucket in representatives if bucket <= largest_bucket)
+    if largest_bucket not in selected and largest_bucket < representatives[-1]:
+        selected = (*selected, largest_bucket)
+    return tuple(sorted(set(selected)))
+
+
+def _moe_calibration_token_buckets(
+    max_tokens: int, base_buckets: tuple[int, ...]
+) -> tuple[int, ...]:
+    """Add one bounded large-M point for routed-weight reuse calibration."""
+    largest_bucket = cubic_token_bucket(max_tokens)
+    if largest_bucket <= base_buckets[-1]:
+        return base_buckets
+    return (*base_buckets, largest_bucket)
+
+
+def _materialization_token_buckets(max_tokens: int) -> tuple[int, ...]:
+    largest_bucket = cubic_token_bucket(max_tokens)
     return tuple(bucket for bucket in CUBIC_TOKEN_BUCKETS if bucket <= largest_bucket)
+
+
+def _validate_cubic_resident_output(
+    resident: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    max_nrmse: float = 0.01,
+) -> None:
+    """Reject a resident candidate with material normalized output error."""
+    resident_fp32 = resident.float()
+    reference_fp32 = reference.float()
+    if not torch.isfinite(resident_fp32).all():
+        raise AssertionError("Cubic resident candidate produced non-finite output.")
+    error_energy = (resident_fp32 - reference_fp32).square().mean()
+    reference_energy = reference_fp32.square().mean().clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    nrmse = torch.sqrt(error_energy / reference_energy).item()
+    if nrmse > max_nrmse:
+        raise AssertionError(
+            f"Cubic resident candidate NRMSE {nrmse:.6f} exceeds "
+            f"{max_nrmse:.6f}."
+        )
+
+
+def _validate_cubic_batch_invariance(
+    operation: Callable[[torch.Tensor], torch.Tensor],
+    inputs: torch.Tensor,
+) -> None:
+    """Reject semantic row drift while allowing bounded reduction rounding."""
+    row_count = min(inputs.reshape(-1, inputs.shape[-1]).shape[0], 512)
+    if row_count == 1:
+        return
+    ramp = torch.linspace(
+        -1,
+        1,
+        inputs.shape[-1],
+        device=inputs.device,
+        dtype=inputs.dtype,
+    )
+    indices = torch.arange(
+        inputs.shape[-1], device=inputs.device, dtype=torch.int64
+    )
+    hashed = ((indices * 1103515245 + 12345) % 65536).to(torch.float32)
+    hashed = ((hashed - 32768) / 32768).to(inputs.dtype)
+    probes = torch.stack(
+        (
+            ramp,
+            ramp.flip(0) * 0.125,
+            hashed,
+            hashed.roll(inputs.shape[-1] // 3) * 2,
+        )
+    )
+    solo = torch.cat([operation(row.reshape(1, -1)) for row in probes])
+    repeats = (row_count + probes.shape[0] - 1) // probes.shape[0]
+    batched_inputs = probes.repeat(repeats, 1)[:row_count]
+    batched = operation(batched_inputs)
+    expected = solo.repeat(repeats, 1)[:row_count]
+    if batched.shape != expected.shape:
+        raise AssertionError(
+            f"resident output shape {tuple(batched.shape)} does not match "
+            f"independent-row shape {tuple(expected.shape)}"
+        )
+    batched_fp32 = batched.float()
+    expected_fp32 = expected.float()
+    if not torch.isfinite(batched_fp32).all():
+        raise AssertionError("resident batched output contains non-finite values")
+    error = batched_fp32 - expected_fp32
+    reference_energy = expected_fp32.square().mean().clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    nrmse = torch.sqrt(error.square().mean() / reference_energy).item()
+    expected_rows = expected_fp32.reshape(row_count, -1)
+    batched_rows = batched_fp32.reshape(row_count, -1)
+    cosine = torch.nn.functional.cosine_similarity(
+        expected_rows, batched_rows, dim=1, eps=1e-12
+    )
+    expected_norm = torch.linalg.vector_norm(expected_rows, dim=1).clamp_min(1e-12)
+    norm_ratio_error = (
+        (torch.linalg.vector_norm(batched_rows, dim=1) / expected_norm) - 1
+    ).abs().max().item()
+    min_cosine = cosine.min().item()
+    if nrmse > 5e-3 or min_cosine < 0.9999 or norm_ratio_error > 0.01:
+        raise AssertionError(
+            "resident batched rows exceed reduction-rounding bounds: "
+            f"nrmse={nrmse:.6g}, min_cosine={min_cosine:.6g}, "
+            f"max_norm_ratio_error={norm_ratio_error:.6g}"
+        )
+
+
+def _a16_marlin_representation_matches_expanded_weight(
+    carrier: torch.Tensor,
+    scale: torch.Tensor,
+    expanded_weight: torch.Tensor,
+    *,
+    group_size: int,
+    group_out: int,
+) -> bool:
+    """Return whether Marlin carrier and scales preserve the A16 weight."""
+    if carrier.shape != expanded_weight.shape:
+        return False
+    input_groups = torch.arange(carrier.shape[1], device=carrier.device) // group_size
+    row_chunk = max(group_out, 256 - (256 % group_out))
+    for row_start in range(0, carrier.shape[0], row_chunk):
+        row_end = min(row_start + row_chunk, carrier.shape[0])
+        output_groups = (
+            torch.arange(row_start, row_end, device=carrier.device) // group_out
+        )
+        scale_values = (
+            scale.to(expanded_weight.dtype) * (1.0 / 127.0)
+        )[output_groups[:, None], input_groups[None, :]]
+        reconstructed = (
+            carrier[row_start:row_end].float() * scale_values.float()
+        ).to(expanded_weight.dtype)
+        if not torch.equal(reconstructed, expanded_weight[row_start:row_end]):
+            return False
+    return True
+
+
+def _linear_residency_key(
+    layer: torch.nn.Module,
+    method: CubicLinearMethod,
+    tokens: int,
+) -> tuple[int, bool, bool, int, int, int, int, int, int]:
+    return (
+        torch.accelerator.current_device_index(),
+        method.dynamic_a8,
+        method.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT,
+        method.scheme.num_bits,
+        int(layer.output_size_per_partition),
+        int(layer.input_size_per_partition),
+        method.scheme.group_out,
+        method.scheme.group_size,
+        cubic_linear_token_bucket(tokens),
+    )
+
+
+def _linear_residency_backend_key(
+    layer: torch.nn.Module,
+    method: CubicLinearMethod,
+    backend: str,
+) -> tuple[int, bool, bool, int, int, int, int, int, str]:
+    return _linear_residency_key(layer, method, 1)[:-1] + (backend,)
+
+
+def _linear_residency_backend_rejected(
+    rejected: dict[tuple[Any, ...], bool],
+    layer: torch.nn.Module,
+    method: CubicLinearMethod,
+    backend: str,
+) -> bool:
+    expected = _linear_residency_backend_key(layer, method, backend)
+    # Metadata storage does not affect a resident carrier backend's arithmetic.
+    # Reject the backend for the entire execution signature if either compact
+    # or legacy metadata exposed batch-dependent output.
+    return any(
+        key[0:2] == expected[0:2]
+        and key[3:] == expected[3:]
+        and value
+        for key, value in rejected.items()
+    )
+
+
+def _linear_residency_latency_score(
+    latency_by_bucket: dict[int, float],
+) -> float:
+    """Score residency for one prefill followed by a decode sequence."""
+    return sum(
+        latency * (128 if bucket == 1 else 1)
+        for bucket, latency in latency_by_bucket.items()
+    )
+
+
+def _materialize_cubic_linear_residency(
+    layer_groups: dict[
+        CalibrationTask, list[tuple[torch.nn.Module, CubicLinearMethod]]
+    ],
+) -> None:
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    carrier_registry = cubic_kernels._CUBIC_LINEAR_RESIDENCY_TACTICS
+    rejected_registry = cubic_kernels._CUBIC_LINEAR_REJECTED_RESIDENCIES
+    metadata_registry = cubic_kernels._CUBIC_LINEAR_METADATA_RESIDENCY_TACTICS
+    device = torch.accelerator.current_device_index()
+    total_memory = torch.cuda.get_device_properties(device).total_memory
+    free_memory, _ = torch.accelerator.get_memory_info(device)
+    budget = cubic_linear_residency_budget(
+        total_memory_bytes=total_memory,
+        free_memory_bytes=free_memory,
+    )
+    remaining = budget
+    hybrid_online_buckets: dict[tuple[Any, ...], tuple[int, ...]] = {}
+    exact_marlin_buckets: dict[tuple[Any, ...], tuple[int, ...]] = {}
+    plans: list[
+        tuple[
+            list[tuple[torch.nn.Module, CubicLinearMethod]],
+            tuple[CubicRuntimeCandidate, ...],
+            dict[str, str],
+        ]
+    ] = []
+    for members in layer_groups.values():
+        layer, method = members[0]
+        prefix = _linear_residency_key(layer, method, 1)[:-1]
+        carrier_measurements: dict[
+            str, dict[int, tuple[float, float, str, int]]
+        ] = {}
+        for key, value in carrier_registry.items():
+            if key[:-2] == prefix:
+                carrier_measurements.setdefault(key[-1], {})[key[-2]] = value
+        metadata_measurements = {
+            key[-1]: value
+            for key, value in metadata_registry.items()
+            if key[:-1] == prefix
+        }
+        if not carrier_measurements and not metadata_measurements:
+            continue
+        required_buckets = (
+            set(metadata_measurements)
+            if metadata_measurements
+            else set().union(*(set(values) for values in carrier_measurements.values()))
+        )
+        partial_exact_measurements = carrier_measurements.get("exact-marlin", {})
+        carrier_measurements = {
+            backend: values
+            for backend, values in carrier_measurements.items()
+            if set(values) == required_buckets
+            and not _linear_residency_backend_rejected(
+                rejected_registry, layer, method, backend
+            )
+        }
+        source = (
+            metadata_measurements
+            if metadata_measurements
+            else next(iter(carrier_measurements.values()), None)
+        )
+        if source is None:
+            continue
+        online_ms = _linear_residency_latency_score(
+            {bucket: source[bucket][0] for bucket in required_buckets}
+        )
+        candidates = [
+            CubicRuntimeCandidate(
+                name="packed-online",
+                latency_ms=online_ms,
+                extra_memory_bytes=0,
+                metadata=(
+                    CubicMetadataResidency.COMPACT
+                    if method.scheme.metadata_format
+                    == CUBIC_COMPACT_METADATA_FORMAT
+                    else CubicMetadataResidency.EXPANDED
+                ),
+                carrier=CubicCarrierResidency.ONLINE,
+            )
+        ]
+        installers: dict[str, str] = {}
+        if metadata_measurements:
+            metadata_extras = {value[2] for value in metadata_measurements.values()}
+            if len(metadata_extras) != 1:
+                raise RuntimeError(
+                    "Cubic metadata residency measurements disagree by token bucket."
+                )
+            candidate = CubicRuntimeCandidate(
+                name="expanded-metadata",
+                latency_ms=_linear_residency_latency_score(
+                    {
+                        bucket: metadata_measurements[bucket][1]
+                        for bucket in required_buckets
+                    }
+                ),
+                extra_memory_bytes=metadata_extras.pop(),
+                metadata=CubicMetadataResidency.EXPANDED,
+                carrier=CubicCarrierResidency.ONLINE,
+            )
+            candidates.append(candidate)
+            installers[candidate.name] = "metadata"
+        for measured_backend, measurements in carrier_measurements.items():
+            if measured_backend == "exact-marlin":
+                continue
+            backends = {value[2] for value in measurements.values()}
+            extras = {value[3] for value in measurements.values()}
+            if backends != {measured_backend} or len(extras) != 1:
+                raise RuntimeError(
+                    "Cubic carrier residency measurements disagree by token bucket."
+                )
+            backend = measured_backend
+            candidate = CubicRuntimeCandidate(
+                name=(
+                    "dense-expanded-replaces-packed"
+                    if backend == "dense"
+                    else f"{backend}-carrier-replaces-packed"
+                ),
+                latency_ms=_linear_residency_latency_score(
+                    {
+                        bucket: measurements[bucket][1]
+                        for bucket in required_buckets
+                    }
+                ),
+                extra_memory_bytes=extras.pop(),
+                metadata=CubicMetadataResidency.EXPANDED,
+                carrier=(
+                    CubicCarrierResidency.EXPANDED
+                    if backend == "dense"
+                    else CubicCarrierResidency.PRECOMPUTED
+                ),
+            )
+            candidates.append(candidate)
+            installers[candidate.name] = backend
+            if backend == "dense":
+                online_buckets = tuple(
+                    bucket
+                    for bucket in sorted(required_buckets)
+                    if measurements[bucket][0] * 1.03 < measurements[bucket][1]
+                )
+                dense_buckets = tuple(
+                    bucket
+                    for bucket in sorted(required_buckets)
+                    if bucket not in online_buckets
+                )
+                if online_buckets and dense_buckets:
+                    packed_bytes = (
+                        layer.weight_packed.numel()
+                        * layer.weight_packed.element_size()
+                    )
+                    hybrid = CubicRuntimeCandidate(
+                        name="dense-expanded-with-packed-dispatch",
+                        latency_ms=_linear_residency_latency_score(
+                            {
+                                bucket: (
+                                    measurements[bucket][0]
+                                    if bucket in online_buckets
+                                    else measurements[bucket][1]
+                                )
+                                for bucket in required_buckets
+                            }
+                        ),
+                        extra_memory_bytes=(
+                            candidate.extra_memory_bytes + packed_bytes
+                        ),
+                        metadata=candidate.metadata,
+                        carrier=candidate.carrier,
+                    )
+                    candidates.append(hybrid)
+                    installers[hybrid.name] = "dense-hybrid"
+                    hybrid_online_buckets[prefix] = online_buckets
+        exact_measurements = (
+            partial_exact_measurements
+            if set(partial_exact_measurements) == required_buckets
+            else {}
+        )
+        if exact_measurements and not _linear_residency_backend_rejected(
+            rejected_registry, layer, method, "exact-marlin"
+        ):
+            extras = {value[3] for value in exact_measurements.values()}
+            if len(extras) != 1:
+                raise RuntimeError(
+                    "Exact Cubic Marlin measurements disagree on memory use."
+                )
+            exact_buckets = CUBIC_TOKEN_BUCKETS
+            candidate = CubicRuntimeCandidate(
+                name="exact-marlin-with-packed-dispatch",
+                latency_ms=_linear_residency_latency_score(
+                    {
+                        bucket: (
+                            exact_measurements[bucket][1]
+                            if bucket in exact_measurements
+                            else source[bucket][0]
+                        )
+                        for bucket in required_buckets
+                    }
+                ),
+                extra_memory_bytes=extras.pop(),
+                metadata=(
+                    CubicMetadataResidency.COMPACT
+                    if method.scheme.metadata_format
+                    == CUBIC_COMPACT_METADATA_FORMAT
+                    else CubicMetadataResidency.EXPANDED
+                ),
+                carrier=CubicCarrierResidency.PRECOMPUTED,
+            )
+            candidates.append(candidate)
+            installers[candidate.name] = "exact-marlin-hybrid"
+            exact_marlin_buckets[prefix] = exact_buckets
+        plans.append((members, tuple(candidates), installers))
+
+    states: list[
+        tuple[
+            torch.nn.Module,
+            CubicLinearMethod,
+            tuple[CubicRuntimeCandidate, ...],
+            dict[str, str],
+            CubicRuntimeCandidate,
+        ]
+    ] = []
+    for members, candidates, installers in plans:
+        states.extend(
+            (layer, method, candidates, installers, candidates[0])
+            for layer, method in members
+        )
+    while True:
+        best: tuple[float, float, int, str, int, CubicRuntimeCandidate] | None = None
+        for index, (_, _, candidates, _, current) in enumerate(states):
+            for target in candidates:
+                extra = target.extra_memory_bytes - current.extra_memory_bytes
+                benefit = current.latency_ms - target.latency_ms
+                if (
+                    extra < 0
+                    or extra > remaining
+                    or target.latency_ms * 1.01 >= current.latency_ms
+                ):
+                    continue
+                priority = float("inf") if extra == 0 else benefit / extra
+                choice = (priority, benefit, -extra, target.name, index, target)
+                if best is None or choice[:4] > best[:4]:
+                    best = choice
+        if best is None:
+            break
+        _, _, neg_extra, _, index, target = best
+        layer, method, candidates, installers, _ = states[index]
+        states[index] = (layer, method, candidates, installers, target)
+        remaining += neg_extra
+
+    for layer, method, _, installers, selected in states:
+        backend = installers.get(selected.name)
+        if backend == "metadata":
+            install_cubic_expanded_metadata(layer, method.scheme)
+        elif backend == "dense":
+            install_cubic_a16_weight(layer, method.scheme)
+        elif backend == "dense-hybrid":
+            prefix = _linear_residency_key(layer, method, 1)[:-1]
+            install_cubic_a16_weight(
+                layer,
+                method.scheme,
+                retain_packed=True,
+                online_buckets=hybrid_online_buckets[prefix],
+            )
+        elif backend == "exact-marlin-hybrid":
+            prefix = _linear_residency_key(layer, method, 1)[:-1]
+            install_cubic_exact_marlin_weight(
+                layer,
+                method.scheme,
+                token_buckets=exact_marlin_buckets[prefix],
+            )
+        elif backend is not None:
+            install_cubic_carrier(
+                layer,
+                method.scheme,
+                dynamic_a8=method.dynamic_a8,
+                backend=backend,
+            )
+        layer.cubic_runtime_residency = selected.name
+
+    for members, candidates, _ in plans:
+        layer, method = members[0]
+        counts = {
+            candidate.name: sum(
+                selected.name == candidate.name
+                for state_layer, _, _, _, selected in states
+                if state_layer in {item[0] for item in members}
+            )
+            for candidate in candidates
+        }
+        logger.info(
+            "Cubic Linear residency W%d G=%dx%d N=%d K=%d: %s, "
+            "budget_left=%.2f MiB",
+            method.scheme.num_bits,
+            method.scheme.group_out,
+            method.scheme.group_size,
+            layer.output_size_per_partition,
+            layer.input_size_per_partition,
+            counts,
+            remaining / (1024**2),
+        )
 
 
 @torch.inference_mode()
@@ -614,20 +1145,28 @@ def _warmup_cubic_linear_families(
     calibrate: bool = True,
 ) -> None:
     from vllm.model_executor.layers.quantization.cubic_kernels import (
+        calibrate_cubic_compact_linear_execution,
         calibrate_cubic_linear_execution,
         cubic_linear,
+        cubic_linear_compact,
         cubic_linear_dynamic_a8,
+        cubic_linear_dynamic_a8_compact,
         cubic_linear_dynamic_a8_precomputed,
     )
 
     token_buckets = tuple(sorted({cubic_linear_token_bucket(m) for m in token_buckets}))
-    layers: dict[CalibrationTask, tuple[torch.nn.Module, CubicLinearMethod]] = {}
+    layer_groups: dict[
+        CalibrationTask, list[tuple[torch.nn.Module, CubicLinearMethod]]
+    ] = {}
     for module in model.modules():
         method = getattr(module, "quant_method", None)
         if not isinstance(method, CubicLinearMethod):
             continue
         key = _linear_task_id(module, method, 0)[:-1]
-        layers.setdefault(key, (module, method))
+        layer_groups.setdefault(key, []).append((module, method))
+    if not calibrate:
+        _materialize_cubic_linear_residency(layer_groups)
+    layers = {key: members[0] for key, members in layer_groups.items()}
 
     for layer, method in layers.values():
         bits = method.scheme.num_bits
@@ -642,6 +1181,40 @@ def _warmup_cubic_linear_families(
         )
         if not assigned_tokens:
             continue
+        if getattr(layer, "cubic_weight_packed_is_marlin", False) or getattr(
+            layer, "cubic_weight_is_expanded_a16", False
+        ):
+            if progress is not None:
+                for m in assigned_tokens:
+                    progress(_linear_task_id(layer, method, m))
+            continue
+        if getattr(layer, "cubic_weight_packed_is_carrier", False):
+            if not method.dynamic_a8:
+                raise RuntimeError(
+                    "A resident Cubic INT8 carrier requires Dynamic-A8."
+                )
+            unused_curve = (
+                layer.weight_ab
+                if method.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT
+                else layer.weight_a
+            )
+            for m in assigned_tokens:
+                x = torch.randn(m, k, device="cuda", dtype=layer.params_dtype)
+                cubic_linear_dynamic_a8_precomputed(
+                    x,
+                    layer.weight_packed,
+                    layer.weight_scale,
+                    unused_curve,
+                    unused_curve,
+                    num_bits=bits,
+                    group_size=group_size,
+                    group_out=group_out,
+                    input_size=k,
+                    _compile_only=True,
+                )
+                if progress is not None:
+                    progress(_linear_task_id(layer, method, m))
+            continue
         logger.info(
             "%s Cubic Linear %s: W%d G=%dx%d N=%d K=%d M=%s",
             "Calibrating" if calibrate else "Materializing",
@@ -653,6 +1226,319 @@ def _warmup_cubic_linear_families(
             k,
             assigned_tokens,
         )
+        if method.scheme.metadata_format != "float32-scale-float16-ab":
+            compact_op = (
+                cubic_linear_dynamic_a8_compact
+                if method.dynamic_a8
+                else cubic_linear_compact
+            )
+            scale, coefficient_a, coefficient_b = expanded_cubic_metadata(
+                layer, method.scheme
+            )
+            residency_carrier = None
+            residency_marlin = None
+            residency_exact_marlin = None
+            residency_expanded = None
+            residency_marlin_extra_bytes = 0
+            residency_expanded_extra_bytes = 0
+            if calibrate:
+                free_memory, _ = torch.accelerator.get_memory_info(
+                    layer.weight_packed.device
+                )
+                packed_bytes = layer.weight_packed.numel()
+                if not method.dynamic_a8 and n * k * 2 <= free_memory:
+                    residency_exact_marlin = prepare_cubic_exact_marlin_weight(
+                        layer.weight_packed,
+                        scale,
+                        coefficient_a,
+                        coefficient_b,
+                        params_dtype=layer.params_dtype,
+                        num_bits=bits,
+                        group_size=group_size,
+                        group_out=group_out,
+                        input_size=k,
+                    )
+                if n * k * 5 <= free_memory:
+                    residency_carrier = materialize_cubic_a8_carrier(
+                        layer.weight_packed,
+                        coefficient_a,
+                        coefficient_b,
+                        num_bits=bits,
+                        group_size=group_size,
+                        input_size=k,
+                        group_out=group_out,
+                    )
+                    residency_marlin = prepare_cubic_marlin_weight(
+                        residency_carrier,
+                        scale,
+                        params_dtype=layer.params_dtype,
+                        group_size=group_size,
+                        group_out=group_out,
+                        dynamic_a8=method.dynamic_a8,
+                    )
+                    residency_marlin_extra_bytes = max(0, n * k - packed_bytes)
+                    residency_marlin_extra_bytes += max(
+                        0,
+                        scale.numel() * scale.element_size()
+                        - layer.weight_scale.numel()
+                        * layer.weight_scale.element_size(),
+                    )
+                    if residency_marlin is not None:
+                        residency_marlin_extra_bytes += (
+                            residency_marlin.persistent_bytes
+                        )
+                if not method.dynamic_a8:
+                    expanded_bytes = n * k * torch.empty(
+                        (), dtype=layer.params_dtype
+                    ).element_size()
+                    if expanded_bytes * 4 <= free_memory:
+                        residency_expanded = materialize_cubic_a16_weight(
+                            layer, method.scheme
+                        )
+                        residency_expanded_extra_bytes = max(
+                            0, expanded_bytes - packed_bytes
+                        )
+                if (
+                    residency_marlin is not None
+                    and not method.dynamic_a8
+                    and residency_expanded is not None
+                    and not _a16_marlin_representation_matches_expanded_weight(
+                        residency_carrier,
+                        scale,
+                        residency_expanded,
+                        group_size=group_size,
+                        group_out=group_out,
+                    )
+                ):
+                    residency_marlin = None
+                    residency_marlin_extra_bytes = 0
+            for m in assigned_tokens:
+                x = torch.randn(m, k, device="cuda", dtype=layer.params_dtype)
+                if calibrate:
+                    online_ms = calibrate_cubic_compact_linear_execution(
+                        x,
+                        layer.weight_packed,
+                        layer.weight_scale,
+                        layer.weight_ab,
+                        layer.weight_scale_global,
+                        layer.weight_a_global,
+                        layer.weight_b_global,
+                        layer.weight_global_index,
+                        num_bits=bits,
+                        group_size=group_size,
+                        group_out=group_out,
+                        input_size=k,
+                        dynamic_a8=method.dynamic_a8,
+                    )
+                    expanded_metadata_ms = calibrate_cubic_compact_linear_execution(
+                        x,
+                        layer.weight_packed,
+                        scale,
+                        coefficient_a,
+                        coefficient_b,
+                        layer.weight_a_global,
+                        layer.weight_b_global,
+                        layer.weight_global_index,
+                        num_bits=bits,
+                        group_size=group_size,
+                        group_out=group_out,
+                        input_size=k,
+                        dynamic_a8=method.dynamic_a8,
+                        expanded_metadata=True,
+                    )
+                    expanded_metadata = partial(
+                        compact_op,
+                        x,
+                        layer.weight_packed,
+                        scale,
+                        coefficient_a,
+                        coefficient_b,
+                        layer.weight_a_global,
+                        layer.weight_b_global,
+                        layer.weight_global_index,
+                        num_bits=bits,
+                        group_size=group_size,
+                        group_out=group_out,
+                        input_size=k,
+                        _expanded_metadata=True,
+                    )
+                    if online_ms is not None and expanded_metadata_ms is not None:
+                        online = partial(
+                            compact_op,
+                            x,
+                            layer.weight_packed,
+                            layer.weight_scale,
+                            layer.weight_ab,
+                            layer.weight_scale_global,
+                            layer.weight_a_global,
+                            layer.weight_b_global,
+                            layer.weight_global_index,
+                            num_bits=bits,
+                            group_size=group_size,
+                            group_out=group_out,
+                            input_size=k,
+                        )
+                        _validate_cubic_resident_output(expanded_metadata(), online())
+                        from vllm.model_executor.layers.quantization import (
+                            cubic_kernels,
+                        )
+
+                        cubic_kernels._CUBIC_LINEAR_METADATA_RESIDENCY_TACTICS[
+                            _linear_residency_key(layer, method, m)
+                        ] = (
+                            online_ms,
+                            expanded_metadata_ms,
+                            scale.nbytes + coefficient_a.nbytes + coefficient_b.nbytes,
+                        )
+                    residents: list[
+                        tuple[str, Callable[[torch.Tensor], torch.Tensor], int]
+                    ] = []
+                    if residency_exact_marlin is not None:
+                        residents.append(
+                            (
+                                "exact-marlin",
+                                partial(
+                                    apply_cubic_exact_marlin_weight,
+                                    prepared=residency_exact_marlin,
+                                    output_size=n,
+                                    input_size=k,
+                                ),
+                                residency_exact_marlin.persistent_bytes,
+                            )
+                        )
+                    if residency_marlin is not None:
+                        residents.append(
+                            (
+                                "marlin",
+                                partial(
+                                    apply_cubic_marlin_weight,
+                                    prepared=residency_marlin,
+                                    output_size=n,
+                                    input_size=k,
+                                    dynamic_a8=method.dynamic_a8,
+                                ),
+                                residency_marlin_extra_bytes,
+                            )
+                        )
+                    if not method.dynamic_a8 and residency_expanded is not None:
+                        residents.append(
+                            (
+                                "dense",
+                                partial(
+                                    torch.nn.functional.linear,
+                                    weight=residency_expanded,
+                                ),
+                                residency_expanded_extra_bytes,
+                            )
+                        )
+                    if method.dynamic_a8 and residency_carrier is not None:
+                        calibrate_cubic_linear_execution(
+                            x,
+                            residency_carrier,
+                            scale,
+                            coefficient_a,
+                            coefficient_b,
+                            num_bits=bits,
+                            group_size=group_size,
+                            group_out=group_out,
+                            input_size=k,
+                            dynamic_a8=True,
+                            precomputed_carrier=True,
+                        )
+                        residents.append(
+                            (
+                                "triton",
+                                partial(
+                                    cubic_linear_dynamic_a8_precomputed,
+                                    carrier=residency_carrier,
+                                    scale=scale,
+                                    a=coefficient_a,
+                                    b=coefficient_b,
+                                    num_bits=bits,
+                                    group_size=group_size,
+                                    group_out=group_out,
+                                    input_size=k,
+                                ),
+                                residency_marlin_extra_bytes,
+                            )
+                        )
+                    if online_ms is not None and residents:
+                        import triton
+
+                        online = partial(
+                            compact_op,
+                            x,
+                            layer.weight_packed,
+                            layer.weight_scale,
+                            layer.weight_ab,
+                            layer.weight_scale_global,
+                            layer.weight_a_global,
+                            layer.weight_b_global,
+                            layer.weight_global_index,
+                            num_bits=bits,
+                            group_size=group_size,
+                            group_out=group_out,
+                            input_size=k,
+                        )
+                        from vllm.model_executor.layers.quantization import (
+                            cubic_kernels,
+                        )
+
+                        for backend, operation, extra_bytes in residents:
+                            resident = partial(operation, x)
+                            try:
+                                _validate_cubic_batch_invariance(operation, x)
+                            except AssertionError as error:
+                                cubic_kernels._CUBIC_LINEAR_REJECTED_RESIDENCIES[
+                                    _linear_residency_backend_key(
+                                        layer, method, backend
+                                    )
+                                ] = True
+                                logger.warning(
+                                    "Rejecting Cubic Linear %s residency for "
+                                    "W%d G=%dx%d N=%d K=%d M=%d: shared-row "
+                                    "output is batch-dependent: %s",
+                                    backend,
+                                    bits,
+                                    group_out,
+                                    group_size,
+                                    n,
+                                    k,
+                                    m,
+                                    error,
+                                )
+                                continue
+                            _validate_cubic_resident_output(resident(), online())
+                            key = _linear_residency_key(layer, method, m)
+                            cubic_kernels._CUBIC_LINEAR_RESIDENCY_TACTICS[
+                                key + (backend,)
+                            ] = (
+                                online_ms,
+                                triton.testing.do_bench(
+                                    resident, warmup=10, rep=30
+                                ),
+                                backend,
+                                extra_bytes,
+                            )
+                else:
+                    compact_op(
+                        x,
+                        layer.weight_packed,
+                        layer.weight_scale,
+                        layer.weight_ab,
+                        layer.weight_scale_global,
+                        layer.weight_a_global,
+                        layer.weight_b_global,
+                        layer.weight_global_index,
+                        num_bits=bits,
+                        group_size=group_size,
+                        group_out=group_out,
+                        input_size=k,
+                        _compile_only=True,
+                    )
+                if progress is not None:
+                    progress(_linear_task_id(layer, method, m))
+            continue
         a16_a, a16_b = layer.weight_a, layer.weight_b
         a8_a, a8_b = layer.weight_a, layer.weight_b
         if bits == 3 and layer.weight_a.dtype == torch.int8:
@@ -661,6 +1547,69 @@ def _warmup_cubic_linear_families(
         elif bits == 3:
             levels = cubic_carrier_levels(3, layer.weight_a, layer.weight_b)
             a8_a, a8_b = levels[..., 1].contiguous(), levels[..., 2].contiguous()
+        residency_carrier = None
+        residency_marlin = None
+        residency_expanded = None
+        residency_marlin_extra_bytes = 0
+        residency_expanded_extra_bytes = 0
+        if calibrate:
+            free_memory, _ = torch.accelerator.get_memory_info(
+                layer.weight_packed.device
+            )
+            carrier_bytes = n * k
+            memory = cubic_runtime_memory(
+                num_values=n * k,
+                num_groups=layer.weight_scale.numel(),
+                num_bits=bits,
+            )
+            if carrier_bytes * 5 <= free_memory:
+                residency_carrier = materialize_cubic_a8_carrier(
+                    layer.weight_packed,
+                    layer.weight_a,
+                    layer.weight_b,
+                    num_bits=bits,
+                    group_size=group_size,
+                    input_size=k,
+                    group_out=group_out,
+                )
+                residency_marlin = prepare_cubic_marlin_weight(
+                    residency_carrier,
+                    layer.weight_scale,
+                    params_dtype=layer.params_dtype,
+                    group_size=group_size,
+                    group_out=group_out,
+                    dynamic_a8=method.dynamic_a8,
+                )
+                residency_marlin_extra_bytes = (
+                    memory.carrier_replacement_extra_bytes
+                )
+                if residency_marlin is not None:
+                    residency_marlin_extra_bytes += residency_marlin.persistent_bytes
+            if not method.dynamic_a8:
+                expanded_bytes = n * k * torch.empty(
+                    (), dtype=layer.params_dtype
+                ).element_size()
+                if expanded_bytes * 4 <= free_memory:
+                    residency_expanded = materialize_cubic_a16_weight(
+                        layer, method.scheme
+                    )
+                    residency_expanded_extra_bytes = max(
+                        0, expanded_bytes - memory.packed_weight_bytes
+                    )
+            if (
+                residency_marlin is not None
+                and not method.dynamic_a8
+                and residency_expanded is not None
+                and not _a16_marlin_representation_matches_expanded_weight(
+                    residency_carrier,
+                    layer.weight_scale,
+                    residency_expanded,
+                    group_size=group_size,
+                    group_out=group_out,
+                )
+            ):
+                residency_marlin = None
+                residency_marlin_extra_bytes = 0
         modes: list[
             tuple[
                 bool,
@@ -672,7 +1621,11 @@ def _warmup_cubic_linear_families(
             ]
         ]
         if method.dynamic_a8:
-            carrier = getattr(layer, "weight_carrier", None)
+            carrier = (
+                layer.weight_packed
+                if getattr(layer, "cubic_weight_packed_is_carrier", False)
+                else getattr(layer, "weight_carrier", None)
+            )
             if carrier is None:
                 modes = [
                     (
@@ -705,17 +1658,53 @@ def _warmup_cubic_linear_families(
             phase_index = 0
             phase_total = (2 if calibrate else 1) * len(modes)
             if calibrate:
-                for (
-                    dynamic_a8,
-                    _,
-                    weight,
-                    coefficient_a,
-                    coefficient_b,
-                    precomputed_carrier,
-                ) in modes:
-                    calibrate_cubic_linear_execution(
-                        x,
+                has_resident_candidate = residency_marlin is not None or (
+                    method.dynamic_a8 and residency_carrier is not None
+                ) or residency_expanded is not None
+                if not has_resident_candidate:
+                    for (
+                        dynamic_a8,
+                        _,
                         weight,
+                        coefficient_a,
+                        coefficient_b,
+                        precomputed_carrier,
+                    ) in modes:
+                        calibrate_cubic_linear_execution(
+                            x,
+                            weight,
+                            layer.weight_scale,
+                            coefficient_a,
+                            coefficient_b,
+                            num_bits=bits,
+                            group_size=group_size,
+                            group_out=group_out,
+                            input_size=k,
+                            dynamic_a8=dynamic_a8,
+                            precomputed_carrier=precomputed_carrier,
+                        )
+                        phase_index += 1
+                        if progress is not None:
+                            progress.phase(
+                                task,
+                                phase_index,
+                                phase_total,
+                                f"{'A8' if dynamic_a8 else 'A16'} execution tactics",
+                            )
+                if residency_carrier is not None or residency_expanded is not None:
+                    import triton
+
+                    coefficient_a = a8_a if method.dynamic_a8 else a16_a
+                    coefficient_b = a8_b if method.dynamic_a8 else a16_b
+                    online_func = (
+                        cubic_linear_dynamic_a8
+                        if method.dynamic_a8
+                        else cubic_linear
+                    )
+                    online = partial(
+                        online_func,
+                        x,
+                        layer.weight_packed,
                         layer.weight_scale,
                         coefficient_a,
                         coefficient_b,
@@ -723,17 +1712,110 @@ def _warmup_cubic_linear_families(
                         group_size=group_size,
                         group_out=group_out,
                         input_size=k,
-                        dynamic_a8=dynamic_a8,
-                        precomputed_carrier=precomputed_carrier,
                     )
-                    phase_index += 1
-                    if progress is not None:
-                        progress.phase(
-                            task,
-                            phase_index,
-                            phase_total,
-                            f"{'A8' if dynamic_a8 else 'A16'} execution tactics",
+                    residents: list[
+                        tuple[str, Callable[[torch.Tensor], torch.Tensor], int]
+                    ] = []
+                    if residency_marlin is not None:
+                        residents.append(
+                            (
+                                "marlin",
+                                partial(
+                                    apply_cubic_marlin_weight,
+                                    prepared=residency_marlin,
+                                    output_size=n,
+                                    input_size=k,
+                                    dynamic_a8=method.dynamic_a8,
+                                ),
+                                residency_marlin_extra_bytes,
+                            )
                         )
+                    if residency_expanded is not None:
+                        residents.append(
+                            (
+                                "dense",
+                                partial(
+                                    torch.nn.functional.linear,
+                                    weight=residency_expanded,
+                                ),
+                                residency_expanded_extra_bytes,
+                            )
+                        )
+                    if method.dynamic_a8 and residency_carrier is not None:
+                        calibrate_cubic_linear_execution(
+                            x,
+                            residency_carrier,
+                            layer.weight_scale,
+                            a8_a,
+                            a8_b,
+                            num_bits=bits,
+                            group_size=group_size,
+                            group_out=group_out,
+                            input_size=k,
+                            dynamic_a8=True,
+                            precomputed_carrier=True,
+                        )
+                        residents.append(
+                            (
+                                "triton",
+                                partial(
+                                    cubic_linear_dynamic_a8_precomputed,
+                                    carrier=residency_carrier,
+                                    scale=layer.weight_scale,
+                                    a=a8_a,
+                                    b=a8_b,
+                                    num_bits=bits,
+                                    group_size=group_size,
+                                    group_out=group_out,
+                                    input_size=k,
+                                ),
+                                residency_marlin_extra_bytes,
+                            )
+                        )
+                    if residents:
+                        from vllm.model_executor.layers.quantization import (
+                            cubic_kernels,
+                        )
+
+                        online_ms = triton.testing.do_bench(
+                            online, warmup=10, rep=30
+                        )
+                        for backend, operation, extra_bytes in residents:
+                            resident = partial(operation, x)
+                            try:
+                                _validate_cubic_batch_invariance(operation, x)
+                            except AssertionError as error:
+                                cubic_kernels._CUBIC_LINEAR_REJECTED_RESIDENCIES[
+                                    _linear_residency_backend_key(
+                                        layer, method, backend
+                                    )
+                                ] = True
+                                logger.warning(
+                                    "Rejecting Cubic Linear %s residency for "
+                                    "W%d G=%dx%d N=%d K=%d M=%d: shared-row "
+                                    "output is batch-dependent: %s",
+                                    backend,
+                                    bits,
+                                    group_out,
+                                    group_size,
+                                    n,
+                                    k,
+                                    m,
+                                    error,
+                                )
+                                continue
+                            _validate_cubic_resident_output(resident(), online())
+                            key = _linear_residency_key(layer, method, m)
+                            cubic_kernels._CUBIC_LINEAR_RESIDENCY_TACTICS[
+                                key + (backend,)
+                            ] = (
+                                online_ms,
+                                triton.testing.do_bench(
+                                    resident, warmup=10, rep=30
+                                ),
+                                backend,
+                                extra_bytes,
+                            )
             for (
                 dynamic_a8,
                 func,
@@ -835,6 +1917,7 @@ def _warmup_cubic_moe_families(
         calibrate_cubic_a8_moe_layer_backends,
         calibrate_cubic_moe_execution,
         calibrate_cubic_moe_route_ctas,
+        calibrate_cubic_moe_sum_backend,
         cubic_fused_moe,
         cubic_fused_moe_dynamic_a8,
     )
@@ -907,6 +1990,13 @@ def _warmup_cubic_moe_families(
                 continue
             x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
             topk_weights, topk_ids = _synthetic_routes(layer, tokens)
+            if calibrate:
+                calibrate_cubic_moe_sum_backend(
+                    topk_ids,
+                    layer.expert_map,
+                    hidden,
+                    x.dtype,
+                )
             carrier_reuse = group_size / (1 << (bits - 1)) if bits > 1 else 0
             a8_a, a8_b, a8_w2_a, a8_w2_b = (
                 a8_coefficients
@@ -1301,7 +2391,13 @@ def cubic_kernel_warmup(
     if not envs.VLLM_CUBIC_AUTOTUNE:
         return
     token_buckets = _calibration_token_buckets(max_tokens, capture_sizes)
-    local_tasks = _cubic_calibration_tasks(model, token_buckets)
+    moe_token_buckets = _moe_calibration_token_buckets(max_tokens, token_buckets)
+    materialization_buckets = _materialization_token_buckets(max_tokens)
+    local_tasks = _cubic_calibration_tasks(
+        model,
+        token_buckets,
+        moe_token_buckets=moe_token_buckets,
+    )
     if not local_tasks:
         return
     rank, world_size, cpu_group = _cubic_world()
@@ -1309,7 +2405,7 @@ def cubic_kernel_warmup(
     cache_key: str | None = None
     cache_hit = False
     try:
-        cache_key = _cubic_tactic_cache_key(model, token_buckets)
+        cache_key = _cubic_tactic_cache_key(model, moe_token_buckets)
         cache_hit = _load_cubic_tactic_cache(cache_key)
     except Exception as error:  # noqa: BLE001 - cache failure must not block startup
         logger.warning("Cubic tactic cache is unavailable; recalibrating: %s", error)
@@ -1347,10 +2443,13 @@ def cubic_kernel_warmup(
         ("MoE", _warmup_cubic_moe_families),
     ):
         try:
+            family_buckets = (
+                token_buckets if family == "Linear" else moe_token_buckets
+            )
             warmup_kwargs = (
                 {"graph_capture_sizes": capture_sizes} if family == "MoE" else {}
             )
-            warmup(model, token_buckets, owned_tasks, progress, **warmup_kwargs)
+            warmup(model, family_buckets, owned_tasks, progress, **warmup_kwargs)
         except (RuntimeError, AssertionError, ValueError) as error:
             calibration_complete = False
             logger.warning(
@@ -1428,12 +2527,12 @@ def cubic_kernel_warmup(
     logger.info("Materializing merged Cubic tactics on rank=%d", rank)
     _warmup_cubic_linear_families(
         model,
-        token_buckets,
+        materialization_buckets,
         calibrate=False,
     )
     _warmup_cubic_moe_families(
         model,
-        token_buckets,
+        materialization_buckets,
         calibrate=False,
         graph_capture_sizes=capture_sizes,
     )

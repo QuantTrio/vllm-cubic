@@ -1241,6 +1241,41 @@ def marlin_gemm(
     )
 
 
+def cubic_marlin_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    cubic_levels: torch.Tensor,
+    workspace: torch.Tensor,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+) -> torch.Tensor:
+    return torch.ops._C.cubic_marlin_gemm(
+        a,
+        b_q_weight,
+        cubic_levels,
+        workspace,
+        size_m,
+        size_n,
+        size_k,
+    )
+
+
+if hasattr(torch.ops._C, "cubic_marlin_gemm"):
+
+    @register_fake("_C::cubic_marlin_gemm")
+    def _cubic_marlin_gemm_fake(
+        a: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        cubic_levels: torch.Tensor,
+        workspace: torch.Tensor,
+        size_m: torch.SymInt,
+        size_n: torch.SymInt,
+        size_k: torch.SymInt,
+    ) -> torch.Tensor:
+        return torch.empty((size_m, size_n), device=a.device, dtype=a.dtype)
+
+
 if hasattr(torch.ops._C, "marlin_gemm"):
 
     @register_fake("_C::marlin_gemm")

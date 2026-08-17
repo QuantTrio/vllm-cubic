@@ -119,6 +119,7 @@ if TYPE_CHECKING:
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_CUBIC_DYNAMIC_A8: bool = False
     VLLM_CUBIC_AUTOTUNE: bool = True
+    VLLM_CUBIC_COMPILE_WORKERS_PER_GPU: int = 2
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -1145,11 +1146,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("VLLM_TRITON_FORCE_FIRST_CONFIG", "0").strip().lower()
         in ("1", "true")
     ),
-    "VLLM_CUBIC_DYNAMIC_A8": lambda: bool(
-        int(os.getenv("VLLM_CUBIC_DYNAMIC_A8", "0"))
-    ),
-    "VLLM_CUBIC_AUTOTUNE": lambda: bool(
-        int(os.getenv("VLLM_CUBIC_AUTOTUNE", "1"))
+    "VLLM_CUBIC_DYNAMIC_A8": lambda: bool(int(os.getenv("VLLM_CUBIC_DYNAMIC_A8", "0"))),
+    "VLLM_CUBIC_AUTOTUNE": lambda: bool(int(os.getenv("VLLM_CUBIC_AUTOTUNE", "1"))),
+    "VLLM_CUBIC_COMPILE_WORKERS_PER_GPU": lambda: max(
+        1, int(os.getenv("VLLM_CUBIC_COMPILE_WORKERS_PER_GPU", "2"))
     ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (

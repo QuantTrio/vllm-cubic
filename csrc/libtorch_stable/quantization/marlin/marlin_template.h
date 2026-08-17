@@ -238,7 +238,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float   // is zero point of float16 type?
+          const bool is_zp_float,  // is zero point of float16 type?
+          const bool is_cubic
           >
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
@@ -251,6 +252,8 @@ __global__ void Marlin(
     const float* __restrict__ a_scales_ptr,
     // fp16 quantization scales. shape (k/groupsize, n)
     const int4* __restrict__ scales_ptr,
+    // Seven exact model-dtype positive levels per Cubic group/output.
+    const int4* __restrict__ cubic_levels_ptr,
     // float global scale (for nvfp4// only)
     const float* __restrict__ global_scale_ptr,
     // 4bit packed zero-points of shape
@@ -359,6 +362,12 @@ __global__ void Marlin(
   }
 
   constexpr bool has_act_order = group_blocks == 0;
+  static_assert(!is_cubic ||
+                    (a_type == vllm::kBFloat16 &&
+                     b_type == vllm::kU4B8 &&
+                     c_type == vllm::kBFloat16 &&
+                     s_type == vllm::kBFloat16 && group_blocks == 2),
+                "Cubic Marlin currently requires BF16 W4 G32");
   constexpr int m_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
 
   extern __shared__ int4 sh[];
@@ -759,8 +768,10 @@ __global__ void Marlin(
   int4* sh_bias = sh_new + sh_size_b_red_min;
   int4* sh_g_idx = sh_new + sh_b_red_bias_size;
   int4* sh_zp = sh_g_idx + (stages * g_idx_stage);
-  constexpr int sh_s_size = has_act_order ? (act_s_max_num_groups * s_sh_stride)
-                                          : (stages * s_sh_stage);
+  constexpr int cubic_level_count = is_cubic ? 7 : 1;
+  constexpr int sh_s_size =
+      has_act_order ? (act_s_max_num_groups * s_sh_stride)
+                    : (stages * s_sh_stage * cubic_level_count);
   int4* sh_s = sh_zp + (stages * zp_sh_stage);
   int4* sh_a = sh_s + sh_s_size;
 
@@ -879,12 +890,23 @@ __global__ void Marlin(
         }
       } else {
         if constexpr (group_blocks != -1) {
-          int4* sh_s_stage = sh_s + s_sh_stage * pipe;
+          int4* sh_s_stage =
+              sh_s + s_sh_stage * cubic_level_count * pipe;
 
           // Only fetch scales if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
             if (s_sh_wr_pred) {
-              cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
+              if constexpr (is_cubic) {
+  #pragma unroll
+                for (int level = 0; level < 7; level++) {
+                  cp_async4(
+                      &sh_s_stage[level * s_sh_stage + s_sh_wr],
+                      &cubic_levels_ptr[level * num_groups * s_gl_stride +
+                                        s_gl_rd]);
+                }
+              } else {
+                cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
+              }
             }
             s_gl_rd += s_gl_rd_delta * s_tb_groups;
           }
@@ -966,6 +988,7 @@ __global__ void Marlin(
   };
 
   auto fetch_scales_to_registers = [&](int k, int full_pipe) {
+    if constexpr (is_cubic) return;
     int pipe = full_pipe % stages;
     using IT1 = typename std::conditional_t<is_a_8bit, int2, int4>;
     using IT0 = typename std::conditional_t<is_a_8bit, int, int2>;
@@ -1244,6 +1267,43 @@ __global__ void Marlin(
       dequant_data(b_quant_0, reinterpret_cast<scalar_32bit_t*>(&frag_b0));
       dequant_data(b_quant_1, reinterpret_cast<scalar_32bit_t*>(&frag_b1));
 
+      if constexpr (is_cubic) {
+        FragS cubic_levels[7][4];
+        int4* sh_s_stage =
+            sh_s + s_sh_stage * cubic_level_count * (pipe % stages);
+        int warp_row = (threadIdx.x / 32) / tb_n_warps;
+        int k_blocks = b_sh_wr_iters * warp_row + k % b_sh_wr_iters;
+        int current_group = k_blocks / group_blocks;
+  #pragma unroll
+        for (int level = 0; level < 7; level++) {
+          reinterpret_cast<int4*>(&cubic_levels[level])[0] =
+              sh_s_stage[level * s_sh_stage + current_group * s_sh_stride +
+                         s_sh_rd];
+        }
+
+        auto apply_cubic_levels = [&](FragB& frag_b, int output_lane) {
+          scalar_t* values = reinterpret_cast<scalar_t*>(&frag_b);
+  #pragma unroll
+          for (int value = 0; value < 4; value++) {
+            float signed_value = Adtype::num2float(values[value]);
+            int magnitude = static_cast<int>(fabsf(signed_value));
+            scalar_t level_value = Adtype::float2num(0.0f);
+  #pragma unroll
+            for (int level = 1; level <= 7; level++) {
+              if (magnitude == level) {
+                level_value = reinterpret_cast<scalar_t*>(
+                    &cubic_levels[level - 1][j])[output_lane];
+              }
+            }
+            float decoded = Adtype::num2float(level_value);
+            values[value] =
+                Adtype::float2num(signed_value < 0.0f ? -decoded : decoded);
+          }
+        };
+        apply_cubic_levels(frag_b0, 0);
+        apply_cubic_levels(frag_b1, 1);
+      }
+
       if constexpr (dequant_skip_flop && has_zp && !is_zp_float && !is_a_8bit) {
         sub_zp<a_type_id>(frag_b0, frag_zp[j], 0);
         sub_zp<a_type_id>(frag_b1, frag_zp[j], 1);
@@ -1272,7 +1332,7 @@ __global__ void Marlin(
                                *reinterpret_cast<scalar_t2*>(&frag_s[k2][j]));
         scale_and_sub<a_type_id>(frag_b0, frag_s[k2][j][0].x, frag_zp[j].x);
         scale_and_sub<a_type_id>(frag_b1, frag_s[k2][j][0].y, frag_zp[j].y);
-      } else if constexpr (group_blocks != -1 && !is_a_8bit) {
+      } else if constexpr (group_blocks != -1 && !is_a_8bit && !is_cubic) {
         scale<a_type_id>(frag_b0, frag_s[k2][j], 0);
         scale<a_type_id>(frag_b1, frag_s[k2][j], 1);
       }
@@ -1330,7 +1390,33 @@ __global__ void Marlin(
 
       if constexpr (group_blocks != -1) {
         if (group_blocks == 2 || k == 1) {
-          if constexpr (a_type == vllm::kS8) {
+          if constexpr (a_type == vllm::kS8 && b_type == vllm::kS8) {
+            float2 s_vals[2];
+            s_vals[0] = Cdtype::num22float2(frag_s[k2][j * 2][0]);
+            s_vals[1] =
+                Cdtype::num22float2(frag_s[k2][j * 2 + 1][0]);
+
+  #pragma unroll
+            for (int i = 0; i < thread_m_blocks; i++) {
+  #pragma unroll
+              for (int g = 0; g < 4; g++) {
+                float scale = reinterpret_cast<float*>(&s_vals[0])[g % 2];
+                int partial =
+                    *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]);
+                frag_c[i][j][0][g] += __int2float_rn(partial) * scale;
+                frag_c_tmp[i][j][0][g] = 0.0f;
+              }
+
+  #pragma unroll
+              for (int g = 0; g < 4; g++) {
+                float scale = reinterpret_cast<float*>(&s_vals[1])[g % 2];
+                int partial =
+                    *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]);
+                frag_c[i][j][1][g] += __int2float_rn(partial) * scale;
+                frag_c_tmp[i][j][1][g] = 0.0f;
+              }
+            }
+          } else if constexpr (a_type == vllm::kS8) {
             int2 s_vals[2];
             s_vals[0] = {
                 (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[0],
@@ -1874,7 +1960,8 @@ __global__ void Marlin(
             for (int g = 0; g < 4; g++) {
               float c_val = frag_c[i][j][0][g];
 
-              if constexpr (a_type == vllm::kS8) {
+              if constexpr (a_type == vllm::kS8 &&
+                            !(b_type == vllm::kS8 && group_blocks != -1)) {
                 c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
               }
               float s_val = frag_a_s[i * 2 + g / 2];
@@ -1884,7 +1971,8 @@ __global__ void Marlin(
             for (int g = 0; g < 4; g++) {
               float c_val = frag_c[i][j][1][g];
 
-              if constexpr (a_type == vllm::kS8) {
+              if constexpr (a_type == vllm::kS8 &&
+                            !(b_type == vllm::kS8 && group_blocks != -1)) {
                 c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
               }
               float s_val = frag_a_s[i * 2 + g / 2];

@@ -134,17 +134,21 @@ def _check_marlin_supported(
     if quant_type not in supported_types:
         return (
             False,
-            f"Marlin does not support weight_bits = {quant_type}. "
-            f"Only types = {supported_types} "
-            f"are supported (for group_size = {group_size}, "
-            f"device_capability = {device_capability}, zp = {has_zp}).",
+            (
+                f"Marlin does not support weight_bits = {quant_type}. "
+                f"Only types = {supported_types} "
+                f"are supported (for group_size = {group_size}, "
+                f"device_capability = {device_capability}, zp = {has_zp})."
+            ),
         )
     if group_size is None or group_size not in MARLIN_SUPPORTED_GROUP_SIZES:
         return (
             False,
-            f"Marlin does not support group_size = {group_size}. "
-            f"Only group_sizes = {MARLIN_SUPPORTED_GROUP_SIZES} "
-            "are supported.",
+            (
+                f"Marlin does not support group_size = {group_size}. "
+                f"Only group_sizes = {MARLIN_SUPPORTED_GROUP_SIZES} "
+                "are supported."
+            ),
         )
 
     return True, None
@@ -488,8 +492,9 @@ def marlin_permute_bias(s: torch.Tensor) -> torch.Tensor:
 
 
 def marlin_act_int8_process_scales(s: torch.Tensor):
-    a_scales_scale_factor = 1 / 4096 * s.max().float()
-    s = s / s.max() * 4096
+    scale_max = s.abs().max().float().clamp_min(torch.finfo(torch.float32).tiny)
+    a_scales_scale_factor = scale_max / 4096
+    s = s / scale_max * 4096
     s = s.round().to(torch.int16).view(s.dtype)
     return s, a_scales_scale_factor
 
@@ -728,11 +733,16 @@ def apply_gptq_marlin_linear(
 
     a_scales = None
     if input_dtype == torch.int8:
-        assert wtype == scalar_types.uint4b8, (
-            "W8A8-INT8 is not supported by marlin kernel."
+        assert wtype in (
+            scalar_types.int8,
+            scalar_types.uint4b8,
+            scalar_types.uint8b128,
+        ), (
+            "INT8 activation requires a Marlin integer carrier weight."
         )
         reshaped_x, a_scales = marlin_quant_input(reshaped_x, input_dtype)
-        a_scales = a_scales * input_global_scale
+        if input_global_scale is not None:
+            a_scales = a_scales * input_global_scale
     elif input_dtype == torch.float8_e4m3fn:
         assert wtype == scalar_types.uint4b8, (
             "INT8 weight + FP8 activation is not supported."

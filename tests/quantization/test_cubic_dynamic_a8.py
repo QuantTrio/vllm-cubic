@@ -273,13 +273,14 @@ def test_cubic_linear_tile_reuses_nearest_calibrated_shape(
         cubic_kernels,
         "_CUBIC_LINEAR_TILE_TACTICS",
         {
-            (7, True, 8, 4096, 1024, 512, 128, 64): (16, 64, 4, 3),
-            (7, True, 8, 4096, 1024, 512, 128, 256): (32, 64, 8, 3),
+            (7, True, False, 8, 4096, 1024, 512, 128, 64): (16, 64, 4, 3),
+            (7, True, False, 8, 4096, 1024, 512, 128, 256): (32, 64, 8, 3),
         },
     )
 
     assert cubic_kernels._cubic_linear_tile(
         dynamic_a8=True,
+        precomputed_carrier=False,
         num_bits=8,
         n=4096,
         k=1024,
@@ -288,6 +289,39 @@ def test_cubic_linear_tile_reuses_nearest_calibrated_shape(
         m=96,
         fallback=(8, 32, 4, 2),
     ) == (16, 64, 4, 3)
+
+
+def test_cubic_linear_tactics_distinguish_packed_and_carrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 7)
+    monkeypatch.setattr(
+        cubic_kernels,
+        "_CUBIC_LINEAR_TILE_TACTICS",
+        {
+            (7, True, False, 4, 4096, 4096, 32, 1, 1): (1, 8, 4, 1),
+            (7, True, True, 4, 4096, 4096, 32, 1, 1): (1, 64, 8, 3),
+        },
+    )
+    common = {
+        "dynamic_a8": True,
+        "num_bits": 4,
+        "n": 4096,
+        "k": 4096,
+        "group_size": 32,
+        "group_out": 1,
+        "m": 1,
+        "fallback": (1, 16, 4, 1),
+    }
+
+    assert cubic_kernels._cubic_linear_tile(
+        **common, precomputed_carrier=False
+    ) == (1, 8, 4, 1)
+    assert cubic_kernels._cubic_linear_tile(
+        **common, precomputed_carrier=True
+    ) == (1, 64, 8, 3)
 
 
 def _reference_carriers(
@@ -1373,6 +1407,7 @@ def test_cubic_a16_packed_stream_matches_regular_linear(
     key = (
         torch.accelerator.current_device_index(),
         False,
+        False,
         bits,
         outputs,
         input_size,
@@ -1395,6 +1430,7 @@ def test_cubic_a16_packed_stream_matches_regular_linear(
     ((1, 128), (128, 1), (32, 64)),
 )
 def test_cubic_low_m_linear_is_batch_invariant(
+    monkeypatch: pytest.MonkeyPatch,
     bits: int,
     group_out: int,
     group_size: int,
@@ -1408,6 +1444,7 @@ def test_cubic_low_m_linear_is_batch_invariant(
         cubic_linear_dynamic_a8_precomputed,
     )
 
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     outputs = input_size = 128
     device = torch.device("cuda")
     codes = _make_codes((outputs, input_size), bits).to(device)
@@ -1416,7 +1453,7 @@ def test_cubic_low_m_linear_is_batch_invariant(
     scale = torch.rand(metadata_shape, device=device, dtype=torch.float32) * 0.1
     a = torch.full(metadata_shape, 0.5, device=device, dtype=torch.float16)
     b = torch.full(metadata_shape, 0.25, device=device, dtype=torch.float16)
-    x = torch.randn(2, input_size, device=device, dtype=torch.bfloat16)
+    x = torch.randn(9, input_size, device=device, dtype=torch.bfloat16)
     carrier = materialize_cubic_a8_carrier(
         packed,
         a,
@@ -1443,6 +1480,245 @@ def test_cubic_low_m_linear_is_batch_invariant(
             [kernel(row, weight, scale, a, b, **kwargs) for row in x.split(1)]
         )
         torch.testing.assert_close(batched, tokenwise, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cubic_w8_large_linear_keeps_k_reduction_batch_invariant() -> None:
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        cubic_linear_dynamic_a8_precomputed,
+    )
+
+    outputs, input_size, group_size = 8192, 5120, 512
+    carrier = torch.randint(
+        -127,
+        128,
+        (outputs, input_size),
+        device="cuda",
+        dtype=torch.int8,
+    )
+    scale = torch.rand(
+        outputs,
+        input_size // group_size,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    unused = torch.empty(0, device="cuda")
+    row = torch.linspace(
+        -1,
+        1,
+        input_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).reshape(1, -1)
+    kwargs = {
+        "num_bits": 8,
+        "group_size": group_size,
+        "group_out": 1,
+        "input_size": input_size,
+    }
+
+    solo = cubic_linear_dynamic_a8_precomputed(
+        row, carrier, scale, unused, unused, **kwargs
+    )
+    batched = cubic_linear_dynamic_a8_precomputed(
+        row.repeat(256, 1), carrier, scale, unused, unused, **kwargs
+    )[:1]
+
+    torch.testing.assert_close(batched, solo, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bits", range(1, 9))
+@pytest.mark.parametrize("dynamic_a8", (False, True))
+@pytest.mark.parametrize(
+    "forced_backend", (None, True, False), ids=("auto", "gemv", "gemm")
+)
+def test_cubic_moe_is_exact_across_decode_batch_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    bits: int,
+    dynamic_a8: bool,
+    forced_backend: bool | None,
+) -> None:
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    device = torch.device("cuda")
+    experts, tokens, top_k = 2, 16, 2
+    hidden = intermediate = group_size = 128
+    generator = torch.Generator(device=device).manual_seed(9100 + bits)
+
+    def make_weight(shape: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
+        codes = _make_codes(shape, bits).to(device)
+        packed = pack_cubic_codes(codes, bits)
+        metadata_shape = (*shape[:-1], shape[-1] // group_size)
+        scale = torch.rand(
+            metadata_shape,
+            generator=generator,
+            device=device,
+            dtype=torch.float32,
+        )
+        scale = scale * 0.02 + 0.01
+        a = torch.full(metadata_shape, 0.5, device=device, dtype=torch.float16)
+        b = torch.full(metadata_shape, 0.25, device=device, dtype=torch.float16)
+        return packed, scale, a, b
+
+    w1, w1_scale, w1_a, w1_b = make_weight(
+        (experts, 2 * intermediate, hidden)
+    )
+    w2, w2_scale, w2_a, w2_b = make_weight(
+        (experts, hidden, intermediate)
+    )
+    x = torch.randn(
+        tokens, hidden, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    topk_ids = torch.tensor([[0, 1]], device=device, dtype=torch.int32).repeat(
+        tokens, 1
+    )
+    topk_weights = torch.softmax(
+        torch.randn(tokens, top_k, generator=generator, device=device), dim=-1
+    )
+    kernel = (
+        cubic_kernels.cubic_fused_moe_dynamic_a8
+        if dynamic_a8
+        else cubic_kernels.cubic_fused_moe
+    )
+    if forced_backend is not None:
+        device_index = torch.accelerator.current_device_index()
+        for num_tokens in (1, tokens):
+            key = (
+                device_index,
+                dynamic_a8,
+                bits,
+                hidden,
+                intermediate,
+                group_size,
+                1,
+                experts,
+                cubic_kernels.cubic_token_bucket(num_tokens),
+            )
+            monkeypatch.setitem(
+                cubic_kernels._CUBIC_MOE_EXECUTION_TACTICS,
+                key,
+                forced_backend,
+            )
+
+    def run(start: int, end: int) -> torch.Tensor:
+        return kernel(
+            x[start:end],
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_a,
+            w1_b,
+            w2_a,
+            w2_b,
+            topk_weights[start:end],
+            topk_ids[start:end],
+            activation=MoEActivation.SITU,
+            apply_router_weight_on_input=False,
+            global_num_experts=experts,
+            expert_map=None,
+            num_bits=bits,
+            group_size=group_size,
+            group_out=1,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            activation_situ_beta=4.0,
+            activation_situ_linear_beta=25.0,
+        )
+
+    solo = run(0, 1)
+    batched = run(0, tokens)[:1]
+    torch.testing.assert_close(batched, solo, rtol=0, atol=0)
+    if forced_backend is None:
+        monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+        target = tokens // 2
+        solo = run(target, target + 1)
+        batched = run(0, tokens)[target : target + 1]
+        torch.testing.assert_close(batched, solo, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cubic_dynamic_a8_moe_ep_is_exact_across_batch_shapes() -> None:
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        cubic_fused_moe_dynamic_a8,
+    )
+
+    device = torch.device("cuda")
+    bits, group_out, group_size = 4, 128, 512
+    local_experts, global_experts, tokens, top_k = 2, 6, 16, 6
+    hidden, intermediate = 4096, 2048
+    generator = torch.Generator(device=device).manual_seed(19403)
+
+    def make_weight(shape: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
+        codes = _make_codes(shape, bits).to(device)
+        packed = pack_cubic_codes(codes, bits)
+        metadata_shape = (
+            shape[0],
+            shape[1] // group_out,
+            shape[2] // group_size,
+        )
+        scale = torch.rand(
+            metadata_shape,
+            generator=generator,
+            device=device,
+            dtype=torch.float32,
+        )
+        scale = scale * 0.02 + 0.01
+        a = torch.full(metadata_shape, 0.5, device=device, dtype=torch.float16)
+        b = torch.full(metadata_shape, 0.25, device=device, dtype=torch.float16)
+        return packed, scale, a, b
+
+    w1, w1_scale, w1_a, w1_b = make_weight(
+        (local_experts, 2 * intermediate, hidden)
+    )
+    w2, w2_scale, w2_a, w2_b = make_weight(
+        (local_experts, hidden, intermediate)
+    )
+    x = torch.randn(
+        tokens, hidden, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    topk_ids = torch.arange(
+        global_experts, device=device, dtype=torch.int32
+    ).repeat(tokens, 1)
+    topk_weights = torch.softmax(
+        torch.randn(tokens, top_k, generator=generator, device=device), dim=-1
+    )
+    expert_map = torch.tensor(
+        [0, 1, -1, -1, -1, -1], device=device, dtype=torch.int32
+    )
+
+    def run(end: int) -> torch.Tensor:
+        return cubic_fused_moe_dynamic_a8(
+            x[:end],
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_a,
+            w1_b,
+            w2_a,
+            w2_b,
+            topk_weights[:end],
+            topk_ids[:end],
+            activation=MoEActivation.SILU,
+            apply_router_weight_on_input=False,
+            global_num_experts=global_experts,
+            expert_map=expert_map,
+            num_bits=bits,
+            group_size=group_size,
+            group_out=group_out,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            activation_situ_beta=None,
+            activation_situ_linear_beta=None,
+        )
+
+    solo = run(1)
+    batched = run(tokens)[:1]
+    torch.testing.assert_close(batched, solo, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

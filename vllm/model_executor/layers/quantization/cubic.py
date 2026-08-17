@@ -26,10 +26,15 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.cubic_policy import CUBIC_SUPPORTED_BITS
-from vllm.model_executor.parameter import PackedvLLMParameter
+from vllm.model_executor.parameter import (
+    PackedvLLMParameter,
+    PerTensorScaleParameter,
+)
 from vllm.model_executor.utils import set_weight_attrs
 
 CUBIC_FORMAT = "cubic-pack-quantized"
+CUBIC_LEGACY_METADATA_FORMAT = "float32-scale-float16-ab"
+CUBIC_COMPACT_METADATA_FORMAT = "int8-scale-int4-ab-global-fp32"
 
 
 def _normalize_group_size(value: Any) -> tuple[int, int]:
@@ -50,6 +55,7 @@ class CubicScheme:
     group_size: int
     group_out: int
     param_dtype: torch.dtype = torch.float16
+    metadata_format: str = CUBIC_LEGACY_METADATA_FORMAT
     reserved_code: str = "zero"
 
     def __post_init__(self) -> None:
@@ -60,8 +66,18 @@ class CubicScheme:
             )
         if self.group_size <= 0 or self.group_out <= 0:
             raise ValueError("Cubic group dimensions must be positive.")
+        if self.metadata_format not in (
+            CUBIC_LEGACY_METADATA_FORMAT,
+            CUBIC_COMPACT_METADATA_FORMAT,
+        ):
+            raise ValueError(
+                f"Unsupported Cubic metadata format {self.metadata_format!r}."
+            )
         if self.param_dtype != torch.float16:
-            raise ValueError("The reference Cubic path supports FP16 a/b only.")
+            raise ValueError(
+                "Cubic runtime a/b metadata must use FP16 after checkpoint "
+                "decoding."
+            )
         expected_code = "binary" if self.num_bits == 1 else "zero"
         if self.reserved_code != expected_code:
             raise ValueError(
@@ -71,7 +87,14 @@ class CubicScheme:
 
     @property
     def effective_bits(self) -> float:
-        return self.num_bits + 64 / (self.group_out * self.group_size)
+        metadata_bits = (
+            64
+            if self.metadata_format == CUBIC_LEGACY_METADATA_FORMAT
+            else 16
+        )
+        return self.num_bits + metadata_bits / (
+            self.group_out * self.group_size
+        )
 
     @property
     def group_shape(self) -> tuple[int, int]:
@@ -112,6 +135,65 @@ class CubicLinearMetadataParameter(PackedvLLMParameter):
         loaded_weight = loaded_weight.narrow(self.input_dim, group_offset, shard_size)
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
+
+
+def decode_cubic_compact_metadata(
+    scale_code: torch.Tensor,
+    packed_ab: torch.Tensor,
+    scale_global: torch.Tensor,
+    a_global: torch.Tensor,
+    b_global: torch.Tensor,
+    output_partition_sizes: list[int],
+    group_out: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expand compact checkpoint metadata into the existing runtime ABI."""
+    output_group_counts = torch.tensor(
+        output_partition_sizes,
+        device=scale_code.device,
+        dtype=torch.int64,
+    ).div(group_out, rounding_mode="floor")
+
+    def expand_global(value: torch.Tensor) -> torch.Tensor:
+        return torch.repeat_interleave(value.float(), output_group_counts)[:, None]
+
+    signed_a = (packed_ab.to(torch.int8) << 4) >> 4
+    signed_b = packed_ab.to(torch.int8) >> 4
+    scale = scale_code.float() * expand_global(scale_global)
+    a = 1.0 + signed_a.float() * expand_global(a_global)
+    b = signed_b.float() * expand_global(b_global)
+    return scale, a.half(), b.half()
+
+
+def expanded_cubic_metadata(
+    layer: torch.nn.Module,
+    scheme: CubicScheme,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the logical FP32/FP16 metadata for either checkpoint ABI."""
+    if scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
+        return decode_cubic_compact_metadata(
+            layer.weight_scale,
+            layer.weight_ab,
+            layer.weight_scale_global,
+            layer.weight_a_global,
+            layer.weight_b_global,
+            layer.output_partition_sizes,
+            scheme.group_out,
+        )
+    return layer.weight_scale, layer.weight_a, layer.weight_b
+
+
+def install_cubic_expanded_metadata(
+    layer: torch.nn.Module,
+    scheme: CubicScheme,
+) -> None:
+    """Cache decoded metadata while retaining the compact checkpoint ABI."""
+    if getattr(layer, "cubic_metadata_is_expanded", False):
+        return
+    scale, coefficient_a, coefficient_b = expanded_cubic_metadata(layer, scheme)
+    layer.register_buffer("cubic_weight_scale_expanded", scale)
+    layer.register_buffer("cubic_weight_a_expanded", coefficient_a)
+    layer.register_buffer("cubic_weight_b_expanded", coefficient_b)
+    layer.cubic_metadata_is_expanded = True
 
 
 def cubic_levels(
@@ -280,6 +362,379 @@ def materialize_cubic_a8_carrier(
     return torch.clamp(torch.round(codes.sign() * normalized * 127.0), -127, 127).to(
         torch.int8
     )
+
+
+def install_cubic_a8_carrier(
+    layer: torch.nn.Module,
+    scheme: CubicScheme,
+) -> None:
+    """Replace a legacy packed Linear weight with its runtime A8 carrier."""
+    install_cubic_carrier(layer, scheme, dynamic_a8=True)
+
+
+@dataclass(frozen=True)
+class CubicMarlinWeight:
+    weight: torch.Tensor
+    scales: torch.Tensor
+    input_global_scale: torch.Tensor | None
+    workspace: torch.Tensor
+    empty_int: torch.Tensor
+
+    @property
+    def persistent_bytes(self) -> int:
+        tensors = (
+            self.scales,
+            self.input_global_scale,
+            self.workspace,
+            self.empty_int,
+        )
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in tensors
+            if tensor is not None
+        )
+
+
+@dataclass(frozen=True)
+class CubicExactMarlinWeight:
+    """Packed W4 codes and exact per-group levels for Cubic Marlin."""
+
+    weight: torch.Tensor
+    levels: torch.Tensor
+    workspace: torch.Tensor
+
+    @property
+    def persistent_bytes(self) -> int:
+        return self.weight.nbytes + self.levels.nbytes + self.workspace.nbytes
+
+
+def prepare_cubic_exact_marlin_weight(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    coefficient_a: torch.Tensor,
+    coefficient_b: torch.Tensor,
+    *,
+    params_dtype: torch.dtype,
+    num_bits: int,
+    group_size: int,
+    group_out: int,
+    input_size: int,
+) -> CubicExactMarlinWeight | None:
+    """Prepare exact W4/G32 Cubic codes for the Marlin path."""
+    if (
+        num_bits != 4
+        or group_size != 32
+        or group_out != 1
+        or params_dtype != torch.bfloat16
+        or packed.dtype != torch.uint8
+        or input_size % 128
+        or packed.shape[0] % 128
+    ):
+        return None
+    if packed.shape[1] != input_size // 2:
+        return None
+
+    import vllm._custom_ops as ops
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_make_workspace_new,
+        marlin_permute_scales,
+    )
+
+    output_size = packed.shape[0]
+    biased_packed = torch.bitwise_xor(packed, 0x88).contiguous()
+    qweight = biased_packed.view(torch.int32).T.contiguous()
+    empty_perm = torch.empty(0, dtype=torch.int32, device=packed.device)
+    weight = ops.gptq_marlin_repack(
+        qweight,
+        empty_perm,
+        input_size,
+        output_size,
+        4,
+        is_a_8bit=False,
+    )
+
+    normalized = cubic_levels(
+        4,
+        coefficient_a,
+        coefficient_b,
+        dtype=torch.float32,
+    )[..., 1:]
+    logical_levels = (
+        normalized * scale.float().unsqueeze(-1)
+    ).to(params_dtype)
+    levels = torch.stack(
+        [
+            marlin_permute_scales(
+                logical_levels[..., index].T.contiguous(),
+                input_size,
+                output_size,
+                group_size,
+            )
+            for index in range(7)
+        ]
+    ).contiguous()
+    return CubicExactMarlinWeight(
+        weight=weight,
+        levels=levels,
+        workspace=marlin_make_workspace_new(packed.device),
+    )
+
+
+def apply_cubic_exact_marlin_weight(
+    x: torch.Tensor,
+    prepared: CubicExactMarlinWeight,
+    *,
+    output_size: int,
+    input_size: int,
+) -> torch.Tensor:
+    """Execute one exact Cubic Marlin candidate."""
+    import vllm._custom_ops as ops
+
+    flattened = x.reshape(-1, input_size).contiguous()
+    output = ops.cubic_marlin_gemm(
+        flattened,
+        prepared.weight,
+        prepared.levels,
+        prepared.workspace,
+        flattened.shape[0],
+        output_size,
+        input_size,
+    )
+    return output.reshape(*x.shape[:-1], output_size)
+
+
+def prepare_cubic_marlin_weight(
+    carrier: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    params_dtype: torch.dtype,
+    group_size: int,
+    group_out: int,
+    dynamic_a8: bool,
+) -> CubicMarlinWeight | None:
+    """Prepare a tensor-core candidate without mutating the owning layer."""
+    import vllm._custom_ops as ops
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        check_marlin_supported,
+        check_marlin_supports_shape,
+        marlin_make_workspace_new,
+        marlin_permute_scales,
+    )
+    from vllm.scalar_type import scalar_types
+
+    if carrier.dtype != torch.int8 or carrier.ndim != 2:
+        raise ValueError("Cubic Marlin preparation requires a 2-D INT8 carrier.")
+    n, k = carrier.shape
+    expected_scale_shape = (n // group_out, math.ceil(k / group_size))
+    if scale.shape != expected_scale_shape:
+        raise ValueError("Cubic Marlin scale shape does not match the carrier.")
+    # Marlin requires every local K partition to contain complete input
+    # groups. Compact Cubic remains the canonical path when a logical group
+    # is wider than, or straddles, a TP-local partition.
+    if group_size > k or k % group_size:
+        return None
+    shape_supported, _ = check_marlin_supports_shape(n, k, k, group_size)
+    if not (
+        check_marlin_supported(scalar_types.uint8b128, group_size)
+        and shape_supported
+    ):
+        return None
+
+    if dynamic_a8:
+        qweight = carrier.contiguous().view(torch.int32).T.contiguous()
+    else:
+        biased = (carrier.to(torch.int16) + 128).to(torch.uint8).contiguous()
+        qweight = biased.view(torch.int32).T.contiguous()
+    empty_int = torch.empty(0, dtype=torch.int32, device=carrier.device)
+    weight = ops.gptq_marlin_repack(
+        qweight,
+        empty_int,
+        k,
+        n,
+        8,
+        is_a_8bit=dynamic_a8,
+    )
+    scales = (
+        scale.repeat_interleave(group_out, dim=0)
+        .T.contiguous()
+        .to(params_dtype)
+        * (1.0 / 127.0)
+    )
+    scales = marlin_permute_scales(
+        scales,
+        k,
+        n,
+        group_size,
+        is_a_8bit=dynamic_a8,
+    )
+    return CubicMarlinWeight(
+        weight=weight,
+        scales=scales,
+        input_global_scale=None,
+        workspace=marlin_make_workspace_new(carrier.device),
+        empty_int=empty_int,
+    )
+
+
+def apply_cubic_marlin_weight(
+    x: torch.Tensor,
+    prepared: CubicMarlinWeight,
+    *,
+    output_size: int,
+    input_size: int,
+    dynamic_a8: bool,
+) -> torch.Tensor:
+    """Execute one prepared Cubic Marlin candidate."""
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        apply_gptq_marlin_linear,
+    )
+    from vllm.scalar_type import scalar_types
+
+    return apply_gptq_marlin_linear(
+        x,
+        prepared.weight,
+        prepared.scales,
+        prepared.empty_int,
+        prepared.empty_int,
+        prepared.empty_int,
+        prepared.workspace,
+        scalar_types.int8 if dynamic_a8 else scalar_types.uint8b128,
+        output_size,
+        input_size,
+        True,
+        input_global_scale=prepared.input_global_scale,
+        input_dtype=torch.int8 if dynamic_a8 else None,
+    )
+
+
+def install_cubic_carrier(
+    layer: torch.nn.Module,
+    scheme: CubicScheme,
+    *,
+    dynamic_a8: bool,
+    backend: str = "triton",
+) -> None:
+    """Replace packed codes with an exact carrier and its best resident ABI."""
+    if getattr(layer, "cubic_weight_packed_is_carrier", False):
+        return
+    scale, coefficient_a, coefficient_b = expanded_cubic_metadata(layer, scheme)
+    carrier = materialize_cubic_a8_carrier(
+        layer.weight_packed,
+        coefficient_a,
+        coefficient_b,
+        num_bits=scheme.num_bits,
+        group_size=scheme.group_size,
+        input_size=layer.input_size_per_partition,
+        group_out=scheme.group_out,
+    )
+    layer.weight_packed.data = carrier
+    layer.weight_scale.data = scale
+    layer.cubic_weight_packed_is_carrier = True
+    if backend == "marlin":
+        _install_cubic_marlin_weight(layer, scheme, dynamic_a8=dynamic_a8)
+    elif backend != "triton":
+        raise ValueError(f"Unsupported Cubic carrier backend: {backend}.")
+
+
+def materialize_cubic_a16_weight(
+    layer: torch.nn.Module,
+    scheme: CubicScheme,
+) -> torch.Tensor:
+    """Materialize the model-dtype weight represented by packed Cubic codes."""
+    scale, coefficient_a, coefficient_b = expanded_cubic_metadata(layer, scheme)
+    return dequantize_cubic(
+        layer.weight_packed,
+        scale,
+        coefficient_a,
+        coefficient_b,
+        total_bits=scheme.num_bits,
+        group_size=scheme.group_size,
+        group_out=scheme.group_out,
+        num_values=layer.input_size_per_partition,
+        output_dtype=layer.params_dtype,
+    )
+
+
+def install_cubic_a16_weight(
+    layer: torch.nn.Module,
+    scheme: CubicScheme,
+    *,
+    retain_packed: bool = False,
+    online_buckets: tuple[int, ...] = (),
+) -> None:
+    """Replace packed codes with the exact model-dtype A16 resident weight."""
+    if getattr(layer, "cubic_weight_is_expanded_a16", False):
+        return
+    expanded = materialize_cubic_a16_weight(layer, scheme)
+    if retain_packed:
+        layer.register_buffer(
+            "cubic_a16_packed_weight",
+            layer.weight_packed.detach().clone(),
+            persistent=False,
+        )
+        layer.cubic_a16_online_buckets = online_buckets
+    layer.weight_packed.data = expanded
+    layer.cubic_weight_is_expanded_a16 = True
+
+
+def install_cubic_exact_marlin_weight(
+    layer: torch.nn.Module,
+    scheme: CubicScheme,
+    *,
+    token_buckets: tuple[int, ...],
+) -> None:
+    """Install an exact Cubic Marlin candidate beside packed weights."""
+    scale, coefficient_a, coefficient_b = expanded_cubic_metadata(layer, scheme)
+    prepared = prepare_cubic_exact_marlin_weight(
+        layer.weight_packed,
+        scale,
+        coefficient_a,
+        coefficient_b,
+        params_dtype=layer.params_dtype,
+        num_bits=scheme.num_bits,
+        group_size=scheme.group_size,
+        group_out=scheme.group_out,
+        input_size=layer.input_size_per_partition,
+    )
+    if prepared is None:
+        raise RuntimeError("Selected exact Cubic Marlin path is unsupported.")
+    layer.register_buffer("cubic_exact_marlin_weight", prepared.weight)
+    layer.register_buffer("cubic_exact_marlin_levels", prepared.levels)
+    layer.register_buffer("cubic_exact_marlin_workspace", prepared.workspace)
+    layer.cubic_exact_marlin_token_buckets = token_buckets
+
+
+def _install_cubic_marlin_weight(
+    layer: torch.nn.Module,
+    scheme: CubicScheme,
+    *,
+    dynamic_a8: bool,
+) -> None:
+    """Repack a resident Cubic INT8 carrier for Marlin tensor cores."""
+    carrier = layer.weight_packed
+    if carrier.dtype != torch.int8:
+        raise ValueError("Cubic Marlin preparation requires an INT8 carrier.")
+    prepared = prepare_cubic_marlin_weight(
+        carrier,
+        layer.weight_scale,
+        params_dtype=layer.params_dtype,
+        group_size=scheme.group_size,
+        group_out=scheme.group_out,
+        dynamic_a8=dynamic_a8,
+    )
+    if prepared is None:
+        return
+
+    layer.weight_packed.data = prepared.weight
+    layer.register_buffer("cubic_marlin_scales", prepared.scales)
+    layer.register_buffer(
+        "cubic_marlin_input_global_scale", prepared.input_global_scale
+    )
+    layer.register_buffer("cubic_marlin_workspace", prepared.workspace)
+    layer.register_buffer("cubic_marlin_empty_int", prepared.empty_int)
+    layer.cubic_weight_packed_is_carrier = False
+    layer.cubic_weight_packed_is_marlin = True
+    layer.cubic_marlin_dynamic_a8 = dynamic_a8
 
 
 def dequantize_cubic(
@@ -603,12 +1058,31 @@ class CubicConfig(QuantizationConfig):
         schemes = []
         for group in groups.values():
             weights = group.get("weights") or {}
+            metadata_format = weights.get(
+                "metadata_format", CUBIC_LEGACY_METADATA_FORMAT
+            )
             scale_dtype = weights.get("scale_dtype", "float32")
-            if scale_dtype not in ("float32", "torch.float32"):
-                raise ValueError("Cubic scale metadata must use float32.")
+            expected_scale_dtypes = (
+                ("float32", "torch.float32")
+                if metadata_format == CUBIC_LEGACY_METADATA_FORMAT
+                else ("int8", "torch.int8")
+            )
+            if scale_dtype not in expected_scale_dtypes:
+                raise ValueError(
+                    f"Cubic {metadata_format} requires scale_dtype in "
+                    f"{expected_scale_dtypes}."
+                )
             param_dtype = weights.get("param_dtype", "float16")
-            if param_dtype not in ("float16", "torch.float16"):
-                raise ValueError("Cubic a/b metadata must use float16.")
+            expected_param_dtypes = (
+                ("float16", "torch.float16")
+                if metadata_format == CUBIC_LEGACY_METADATA_FORMAT
+                else ("packed_int4",)
+            )
+            if param_dtype not in expected_param_dtypes:
+                raise ValueError(
+                    f"Cubic {metadata_format} requires param_dtype in "
+                    f"{expected_param_dtypes}."
+                )
             num_bits = int(weights["num_bits"])
             group_out, group_in = _normalize_group_size(weights["group_size"])
             scheme = CubicScheme(
@@ -616,6 +1090,7 @@ class CubicConfig(QuantizationConfig):
                 group_size=group_in,
                 group_out=group_out,
                 param_dtype=torch.float16,
+                metadata_format=metadata_format,
                 reserved_code=weights.get(
                     "reserved_code", "binary" if num_bits == 1 else "zero"
                 ),
@@ -670,6 +1145,10 @@ class CubicConfig(QuantizationConfig):
                 else UnquantizedLinearMethod()
             )
         if isinstance(layer, RoutedExperts):
+            if scheme and scheme.metadata_format != CUBIC_LEGACY_METADATA_FORMAT:
+                raise ValueError(
+                    "Compact Cubic metadata is not yet supported by FusedMoE."
+                )
             return (
                 CubicMoEMethod(
                     scheme,
@@ -738,24 +1217,47 @@ class CubicLinearMethod(LinearMethodBase):
             "input_size_per_partition": input_size_per_partition,
             "input_group_size": self.scheme.group_size,
         }
-        scale = CubicLinearMetadataParameter(
-            data=torch.empty(output_groups, num_groups, dtype=torch.float32),
-            **metadata_args,
-        )
-        a = CubicLinearMetadataParameter(
-            data=torch.empty(output_groups, num_groups, dtype=torch.float16),
-            **metadata_args,
-        )
-        b = CubicLinearMetadataParameter(
-            data=torch.empty(output_groups, num_groups, dtype=torch.float16),
-            **metadata_args,
-        )
         layer.register_parameter("weight_packed", weight)
-        layer.register_parameter("weight_scale", scale)
-        layer.register_parameter("weight_a", a)
-        layer.register_parameter("weight_b", b)
+        if self.scheme.metadata_format == CUBIC_LEGACY_METADATA_FORMAT:
+            scale = CubicLinearMetadataParameter(
+                data=torch.empty(output_groups, num_groups, dtype=torch.float32),
+                **metadata_args,
+            )
+            a = CubicLinearMetadataParameter(
+                data=torch.empty(output_groups, num_groups, dtype=torch.float16),
+                **metadata_args,
+            )
+            b = CubicLinearMetadataParameter(
+                data=torch.empty(output_groups, num_groups, dtype=torch.float16),
+                **metadata_args,
+            )
+            layer.register_parameter("weight_scale", scale)
+            layer.register_parameter("weight_a", a)
+            layer.register_parameter("weight_b", b)
+        else:
+            scale = CubicLinearMetadataParameter(
+                data=torch.empty(output_groups, num_groups, dtype=torch.int8),
+                **metadata_args,
+            )
+            ab = CubicLinearMetadataParameter(
+                data=torch.empty(output_groups, num_groups, dtype=torch.uint8),
+                **metadata_args,
+            )
+            layer.register_parameter("weight_scale", scale)
+            layer.register_parameter("weight_ab", ab)
+            for name in ("scale", "a", "b"):
+                global_parameter = PerTensorScaleParameter(
+                    data=torch.empty(
+                        len(output_partition_sizes), dtype=torch.float32
+                    ),
+                    weight_loader=weight_loader,
+                )
+                layer.register_parameter(
+                    f"weight_{name}_global", global_parameter
+                )
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+        layer.output_partition_sizes = output_partition_sizes
         layer.params_dtype = params_dtype
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -766,8 +1268,6 @@ class CubicLinearMethod(LinearMethodBase):
             raise ValueError("Cubic packed linear weight must remain uint8.")
         if layer.weight_packed.shape[-1] != expected_bytes:
             raise ValueError("Cubic packed linear weight has an invalid width.")
-        if layer.weight_scale.dtype != torch.float32:
-            raise ValueError("Cubic linear scale must remain FP32 at runtime.")
         expected_groups = math.ceil(
             layer.input_size_per_partition / self.scheme.group_size
         )
@@ -777,32 +1277,71 @@ class CubicLinearMethod(LinearMethodBase):
         )
         if tuple(layer.weight_scale.shape) != expected_shape:
             raise ValueError("Cubic linear metadata has an invalid group count.")
+        if self.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
+            if layer.weight_scale.dtype != torch.int8:
+                raise ValueError("Compact Cubic scale codes must remain INT8.")
+            if layer.weight_ab.dtype != torch.uint8:
+                raise ValueError("Compact Cubic packed a/b must remain uint8.")
+            group_counts = torch.tensor(
+                layer.output_partition_sizes,
+                device=layer.weight_scale.device,
+                dtype=torch.int64,
+            ).div(self.scheme.group_out, rounding_mode="floor")
+            global_index = torch.repeat_interleave(
+                torch.arange(
+                    len(group_counts),
+                    device=group_counts.device,
+                    dtype=torch.uint8,
+                ),
+                group_counts,
+            )
+            layer.register_buffer("weight_global_index", global_index)
+        elif layer.weight_scale.dtype != torch.float32:
+            raise ValueError("Cubic linear scale must remain FP32 at runtime.")
+        if self.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
+            return
         if (
             layer.weight_a.dtype != torch.float16
             or layer.weight_b.dtype != torch.float16
         ):
             raise ValueError("Cubic linear a/b must remain FP16 at runtime.")
-        if self.dynamic_a8:
-            layer.weight_carrier = materialize_cubic_a8_carrier(
-                layer.weight_packed,
-                layer.weight_a,
-                layer.weight_b,
-                num_bits=self.scheme.num_bits,
-                group_size=self.scheme.group_size,
-                input_size=layer.input_size_per_partition,
-                group_out=self.scheme.group_out,
-            )
 
     def dequantize(self, layer: torch.nn.Module) -> torch.Tensor:
         """Materialize the Linear weight for an operator requiring a vector."""
         cached_weight = getattr(layer, "_cubic_operator_weight", None)
         if cached_weight is not None:
             return cached_weight
+        if getattr(layer, "cubic_weight_is_expanded_a16", False):
+            return layer.weight_packed
+        if getattr(layer, "cubic_weight_packed_is_carrier", False):
+            scale = layer.weight_scale.repeat_interleave(
+                self.scheme.group_out, dim=0
+            ).repeat_interleave(self.scheme.group_size, dim=1)
+            weight = (
+                layer.weight_packed.float()
+                * scale[:, : layer.input_size_per_partition]
+                * (1.0 / 127.0)
+            ).to(layer.params_dtype)
+            layer._cubic_operator_weight = weight
+            return weight
+        scale = layer.weight_scale
+        a = layer.weight_a
+        b = layer.weight_b
+        if self.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
+            scale, a, b = decode_cubic_compact_metadata(
+                layer.weight_scale,
+                layer.weight_ab,
+                layer.weight_scale_global,
+                layer.weight_a_global,
+                layer.weight_b_global,
+                layer.output_partition_sizes,
+                self.scheme.group_out,
+            )
         weight = dequantize_cubic(
             layer.weight_packed,
-            layer.weight_scale,
-            layer.weight_a,
-            layer.weight_b,
+            scale,
+            a,
+            b,
             total_bits=self.scheme.num_bits,
             group_size=self.scheme.group_size,
             group_out=self.scheme.group_out,
@@ -820,38 +1359,237 @@ class CubicLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         from vllm.model_executor.layers.quantization.cubic_kernels import (
             cubic_linear,
+            cubic_linear_compact,
             cubic_linear_dynamic_a8,
+            cubic_linear_dynamic_a8_compact,
             cubic_linear_dynamic_a8_precomputed,
         )
 
-        if self.dynamic_a8:
-            carrier = getattr(layer, "weight_carrier", None)
-            if carrier is not None:
-                if torch.compiler.is_compiling():
-                    output = torch.ops.vllm.cubic_linear_dynamic_a8_precomputed(
-                        x,
-                        carrier,
-                        layer.weight_scale,
-                        layer.weight_a,
-                        layer.weight_b,
-                        self.scheme.num_bits,
-                        self.scheme.group_size,
-                        self.scheme.group_out,
-                        layer.input_size_per_partition,
+        if (
+            not envs.VLLM_BATCH_INVARIANT
+            and hasattr(layer, "cubic_exact_marlin_weight")
+        ):
+            from vllm.model_executor.layers.quantization.cubic_policy import (
+                cubic_linear_token_bucket,
+            )
+
+            tokens = x.numel() // x.shape[-1]
+            bucket = cubic_linear_token_bucket(tokens)
+            if bucket in layer.cubic_exact_marlin_token_buckets:
+                prepared = CubicExactMarlinWeight(
+                    weight=layer.cubic_exact_marlin_weight,
+                    levels=layer.cubic_exact_marlin_levels,
+                    workspace=layer.cubic_exact_marlin_workspace,
+                )
+                output = apply_cubic_exact_marlin_weight(
+                    x,
+                    prepared,
+                    output_size=layer.output_size_per_partition,
+                    input_size=layer.input_size_per_partition,
+                )
+                return output if bias is None else output + bias
+
+        if getattr(layer, "cubic_weight_is_expanded_a16", False):
+            packed = getattr(layer, "cubic_a16_packed_weight", None)
+            if packed is not None:
+                from vllm.model_executor.layers.quantization.cubic_kernels import (
+                    cubic_linear_token_bucket,
+                )
+
+                tokens = x.numel() // x.shape[-1]
+                bucket = cubic_linear_token_bucket(tokens)
+                if bucket in layer.cubic_a16_online_buckets:
+                    if self.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
+                        output = cubic_linear_compact(
+                            x,
+                            packed,
+                            layer.weight_scale,
+                            layer.weight_ab,
+                            layer.weight_scale_global,
+                            layer.weight_a_global,
+                            layer.weight_b_global,
+                            layer.weight_global_index,
+                            num_bits=self.scheme.num_bits,
+                            group_size=self.scheme.group_size,
+                            group_out=self.scheme.group_out,
+                            input_size=layer.input_size_per_partition,
+                        )
+                    else:
+                        output = cubic_linear(
+                            x,
+                            packed,
+                            layer.weight_scale,
+                            layer.weight_a,
+                            layer.weight_b,
+                            num_bits=self.scheme.num_bits,
+                            group_size=self.scheme.group_size,
+                            group_out=self.scheme.group_out,
+                            input_size=layer.input_size_per_partition,
+                        )
+                    return output if bias is None else output + bias
+            if envs.VLLM_BATCH_INVARIANT:
+                from vllm.model_executor.layers.batch_invariant import (
+                    linear_batch_invariant,
+                )
+
+                return linear_batch_invariant(x, layer.weight_packed, bias)
+            return torch.nn.functional.linear(x, layer.weight_packed, bias)
+
+        if getattr(layer, "cubic_weight_packed_is_marlin", False):
+            from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+                apply_gptq_marlin_linear,
+            )
+            from vllm.scalar_type import scalar_types
+
+            if layer.cubic_marlin_dynamic_a8 != self.dynamic_a8:
+                raise RuntimeError(
+                    "Cubic Marlin activation mode differs from the loaded method."
+                )
+
+            output = apply_gptq_marlin_linear(
+                x,
+                layer.weight_packed,
+                layer.cubic_marlin_scales,
+                layer.cubic_marlin_empty_int,
+                layer.cubic_marlin_empty_int,
+                layer.cubic_marlin_empty_int,
+                layer.cubic_marlin_workspace,
+                scalar_types.int8 if self.dynamic_a8 else scalar_types.uint8b128,
+                layer.output_size_per_partition,
+                layer.input_size_per_partition,
+                True,
+                input_global_scale=layer.cubic_marlin_input_global_scale,
+                input_dtype=torch.int8 if self.dynamic_a8 else None,
+            )
+            return output if bias is None else output + bias
+
+        carrier = (
+            layer.weight_packed
+            if getattr(layer, "cubic_weight_packed_is_carrier", False)
+            else getattr(layer, "weight_carrier", None)
+        )
+        if self.dynamic_a8 and carrier is not None:
+            unused_curve = (
+                layer.weight_ab
+                if self.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT
+                else layer.weight_a
+            )
+            if torch.compiler.is_compiling():
+                output = torch.ops.vllm.cubic_linear_dynamic_a8_precomputed(
+                    x,
+                    carrier,
+                    layer.weight_scale,
+                    unused_curve,
+                    unused_curve,
+                    self.scheme.num_bits,
+                    self.scheme.group_size,
+                    self.scheme.group_out,
+                    layer.input_size_per_partition,
+                )
+            else:
+                output = cubic_linear_dynamic_a8_precomputed(
+                    x,
+                    carrier,
+                    layer.weight_scale,
+                    unused_curve,
+                    unused_curve,
+                    num_bits=self.scheme.num_bits,
+                    group_size=self.scheme.group_size,
+                    group_out=self.scheme.group_out,
+                    input_size=layer.input_size_per_partition,
+                )
+            return output if bias is None else output + bias
+
+        if self.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
+            if getattr(layer, "cubic_metadata_is_expanded", False):
+                expanded_args = (
+                    x,
+                    layer.weight_packed,
+                    layer.cubic_weight_scale_expanded,
+                    layer.cubic_weight_a_expanded,
+                    layer.cubic_weight_b_expanded,
+                    self.scheme.num_bits,
+                    self.scheme.group_size,
+                    self.scheme.group_out,
+                    layer.input_size_per_partition,
+                )
+                if self.dynamic_a8:
+                    if torch.compiler.is_compiling():
+                        expanded_op = (
+                            torch.ops.vllm.cubic_linear_dynamic_a8_expanded_metadata
+                        )
+                        output = expanded_op(*expanded_args)
+                    else:
+                        output = cubic_linear_dynamic_a8_compact(
+                            *expanded_args[:2],
+                            *expanded_args[2:5],
+                            layer.weight_a_global,
+                            layer.weight_b_global,
+                            layer.weight_global_index,
+                            num_bits=expanded_args[5],
+                            group_size=expanded_args[6],
+                            group_out=expanded_args[7],
+                            input_size=expanded_args[8],
+                            _expanded_metadata=True,
+                        )
+                elif torch.compiler.is_compiling():
+                    output = torch.ops.vllm.cubic_linear_expanded_metadata(
+                        *expanded_args
                     )
                 else:
-                    output = cubic_linear_dynamic_a8_precomputed(
-                        x,
-                        carrier,
-                        layer.weight_scale,
-                        layer.weight_a,
-                        layer.weight_b,
-                        num_bits=self.scheme.num_bits,
-                        group_size=self.scheme.group_size,
-                        group_out=self.scheme.group_out,
-                        input_size=layer.input_size_per_partition,
+                    output = cubic_linear_compact(
+                        *expanded_args[:2],
+                        *expanded_args[2:5],
+                        layer.weight_a_global,
+                        layer.weight_b_global,
+                        layer.weight_global_index,
+                        num_bits=expanded_args[5],
+                        group_size=expanded_args[6],
+                        group_out=expanded_args[7],
+                        input_size=expanded_args[8],
+                        _expanded_metadata=True,
                     )
                 return output if bias is None else output + bias
+            compact_args = (
+                x,
+                layer.weight_packed,
+                layer.weight_scale,
+                layer.weight_ab,
+                layer.weight_scale_global,
+                layer.weight_a_global,
+                layer.weight_b_global,
+                layer.weight_global_index,
+                self.scheme.num_bits,
+                self.scheme.group_size,
+                self.scheme.group_out,
+                layer.input_size_per_partition,
+            )
+            if self.dynamic_a8:
+                if torch.compiler.is_compiling():
+                    output = torch.ops.vllm.cubic_linear_dynamic_a8_compact(
+                        *compact_args
+                    )
+                else:
+                    output = cubic_linear_dynamic_a8_compact(
+                        *compact_args[:8],
+                        num_bits=compact_args[8],
+                        group_size=compact_args[9],
+                        group_out=compact_args[10],
+                        input_size=compact_args[11],
+                    )
+            elif torch.compiler.is_compiling():
+                output = torch.ops.vllm.cubic_linear_compact(*compact_args)
+            else:
+                output = cubic_linear_compact(
+                    *compact_args[:8],
+                    num_bits=compact_args[8],
+                    group_size=compact_args[9],
+                    group_out=compact_args[10],
+                    input_size=compact_args[11],
+                )
+            return output if bias is None else output + bias
+
+        if self.dynamic_a8:
             if torch.compiler.is_compiling():
                 output = torch.ops.vllm.cubic_linear_dynamic_a8(
                     x,
