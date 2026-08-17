@@ -30,7 +30,6 @@ Do not open one-off PRs for tiny edits (single typo, isolated style change, one 
     - Why this is not duplicating an existing PR.
     - Test commands run and results.
     - Model evaluation results when the change affects output, accuracy, or serving.
-    - Clear statement that AI assistance was used.
 
 ### Fail-closed behavior
 
@@ -134,17 +133,6 @@ Use [Google-style docstrings](https://google.github.io/styleguide/pyguide.html#3
 - Match existing code style
 - Minimize use of comments. Eliminate comments which are redundant, preferring legible and self-documenting code. When used, keep docstrings and comments brief and direct.
 - Assume the reader is familiar with vLLM.
-
-### Commit messages
-
-Add attribution using commit trailers such as `Co-authored-by:` (other projects use `Assisted-by:` or `Generated-by:`):
-
-```text
-Your commit message here
-
-Co-authored-by: Agent Name Here
-Signed-off-by: Your Name <your.email@example.com>
-```
 
 ---
 
