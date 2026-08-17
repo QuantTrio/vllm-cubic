@@ -17,11 +17,15 @@ from vllm.utils.torch_utils import is_torch_equal_or_newer
 LOW_M_BATCH_INVARIANT_LIMIT = 8
 
 
-def use_low_m_batch_invariant(tensor: torch.Tensor) -> bool:
+def has_low_m_rows(tensor: torch.Tensor) -> bool:
     if tensor.dim() < 2 or tensor.shape[-1] == 0:
         return False
     num_rows = tensor.numel() // tensor.shape[-1]
-    return 0 < num_rows <= LOW_M_BATCH_INVARIANT_LIMIT and tensor.dtype in (
+    return 0 < num_rows <= LOW_M_BATCH_INVARIANT_LIMIT
+
+
+def use_low_m_batch_invariant(tensor: torch.Tensor) -> bool:
+    return has_low_m_rows(tensor) and tensor.dtype in (
         torch.float16,
         torch.bfloat16,
     )
@@ -193,19 +197,6 @@ def matmul_persistent(
             "num_warps": 8,
         },
     }
-    if M <= LOW_M_BATCH_INVARIANT_LIMIT and dtype in (
-        torch.bfloat16,
-        torch.float16,
-    ):
-        configs[dtype].update(
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 64,
-                "num_stages": 3,
-                "num_warps": 8,
-            }
-        )
     matmul_kernel_persistent[grid](
         a,
         b,
@@ -935,17 +926,7 @@ def rms_norm_batch_invariant(
 
 
 def linear_batch_invariant(input, weight, bias=None):
-    input_2d = input.reshape(-1, input.shape[-1])
-    if use_low_m_batch_invariant(input_2d):
-        if input_2d.shape[0] == 1:
-            output_2d = torch.mm(input_2d, weight.t())
-        else:
-            output_2d = torch.cat(
-                [torch.mm(row, weight.t()) for row in input_2d.split(1)], dim=0
-            )
-        output = output_2d.reshape(*input.shape[:-1], weight.shape[0])
-    else:
-        output = matmul_batch_invariant(input, weight.t())
+    output = matmul_batch_invariant(input, weight.t())
 
     if bias is not None:
         output = output + bias
@@ -954,7 +935,22 @@ def linear_batch_invariant(input, weight, bias=None):
 
 _batch_invariant_MODE = False
 _batch_invariant_LIB = None
-_fp16_block_size_n = 256
+_fp16_block_size_n = 128
+
+
+def _configure_batch_stable_blas() -> None:
+    if not current_platform.is_cuda():
+        return
+    reduced_precision_val = (
+        (False, False) if is_torch_equal_or_newer("2.10.0") else False
+    )
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = (
+        reduced_precision_val
+    )
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
+        reduced_precision_val
+    )
+    torch.backends.cuda.preferred_blas_library(backend="cublaslt")
 
 
 def enable_batch_invariant_mode():
@@ -1005,17 +1001,7 @@ def enable_batch_invariant_mode():
     )
     torch.bmm = bmm_batch_invariant
 
-    reduced_precision_val = (
-        (False, False) if is_torch_equal_or_newer("2.10.0") else False
-    )
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = (
-        reduced_precision_val
-    )
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
-        reduced_precision_val
-    )
-    if current_platform.is_cuda():
-        torch.backends.cuda.preferred_blas_library(backend="cublaslt")
+    _configure_batch_stable_blas()
 
 
 def override_envs_for_invariance():

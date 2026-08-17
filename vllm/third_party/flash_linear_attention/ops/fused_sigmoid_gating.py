@@ -183,6 +183,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
+        # Match successive single-token decode calls: the recurrent state is
+        # persisted in the cache dtype between accepted tokens.
+        b_h = b_h.to(ht.dtype.element_ty).to(tl.float32)
+
         # Update pointers for next timestep
         p_q += H * K
         p_k += H * K

@@ -271,6 +271,34 @@ def test_top_k_per_row(
     ), "CUDA top_k_per_row_prefill results don't match torch.topk"
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_top_k_per_row_prefill_breaks_ties_by_token_index() -> None:
+    logits = torch.zeros((1, 576), dtype=torch.float32, device="cuda")
+    row_starts = torch.zeros(1, dtype=torch.int32, device="cuda")
+    row_ends = torch.full((1,), 576, dtype=torch.int32, device="cuda")
+    expected = torch.arange(512, dtype=torch.int32, device="cuda")
+
+    for _ in range(10):
+        indices = torch.empty((1, 512), dtype=torch.int32, device="cuda")
+        torch.ops._C.top_k_per_row_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            1,
+            logits.stride(0),
+            logits.stride(1),
+            512,
+        )
+        torch.testing.assert_close(
+            indices[0].sort().values,
+            expected,
+            rtol=0,
+            atol=0,
+        )
+
+
 def _run_top_k_per_row_decode_test(
     top_k: int,
     batch_size: int,

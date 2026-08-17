@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from math import prod
 from typing import TYPE_CHECKING
@@ -126,6 +126,9 @@ class KVCacheSpec:
 
     # number of tokens in a block
     block_size: int
+    # Some stateful cache layouts cannot resume exactly at the deepest cached
+    # boundary. The coordinator replays at least this many preceding tokens.
+    prefix_cache_replay_tokens: int = field(default=0, kw_only=True)
 
     @property
     def page_size_bytes(self) -> int:
@@ -319,6 +322,9 @@ class FullAttentionSpec(AttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            prefix_cache_replay_tokens=max(
+                spec.prefix_cache_replay_tokens for spec in specs
+            ),
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
@@ -334,6 +340,8 @@ class FullAttentionSpec(AttentionSpec):
         )
         for spec in specs:
             for f in fields(AttentionSpec):
+                if f.name == "prefix_cache_replay_tokens":
+                    continue
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."
@@ -470,6 +478,9 @@ class MLAAttentionSpec(FullAttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            prefix_cache_replay_tokens=max(
+                spec.prefix_cache_replay_tokens for spec in specs
+            ),
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
@@ -486,6 +497,8 @@ class MLAAttentionSpec(FullAttentionSpec):
         )
         for spec in specs:
             for f in fields(AttentionSpec):
+                if f.name == "prefix_cache_replay_tokens":
+                    continue
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."
@@ -526,6 +539,7 @@ class RSWASpec(FullAttentionSpec):
         base = FullAttentionSpec.merge(specs)  # type: ignore[arg-type]
         return cls(
             block_size=base.block_size,
+            prefix_cache_replay_tokens=base.prefix_cache_replay_tokens,
             num_kv_heads=base.num_kv_heads,
             head_size=base.head_size,
             head_size_v=base.head_size_v,
@@ -710,6 +724,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
         return cls(
             block_size=specs[0].block_size,
+            prefix_cache_replay_tokens=max(
+                spec.prefix_cache_replay_tokens for spec in specs
+            ),
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
@@ -832,6 +849,9 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            prefix_cache_replay_tokens=max(
+                spec.prefix_cache_replay_tokens for spec in specs
+            ),
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
@@ -846,6 +866,8 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         )
         for spec in specs:
             for f in fields(AttentionSpec):
+                if f.name == "prefix_cache_replay_tokens":
+                    continue
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."

@@ -5,6 +5,7 @@
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
@@ -13,7 +14,6 @@ from vllm.distributed import (
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.batch_invariant import (
     linear_batch_invariant,
-    use_low_m_batch_invariant,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
@@ -108,7 +108,8 @@ class LogitsProcessor(PluggableLayer):
         """Project hidden states through the lm_head, honoring head_dtype."""
         if (
             isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod)
-            and use_low_m_batch_invariant(hidden_states)
+            and envs.VLLM_BATCH_INVARIANT
+            and hidden_states.is_cuda
         ):
             return linear_batch_invariant(
                 hidden_states, lm_head.weight, embedding_bias

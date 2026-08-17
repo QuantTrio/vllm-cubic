@@ -39,6 +39,12 @@ if not current_platform.is_cuda():
         allow_module_level=True,
     )
 
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    _stable_argsort_topk,
+    _stable_topk_per_row_decode,
+    _stable_topk_per_row_prefill,
+    _stable_topk_rows_per_chunk,
+)
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseTRTLLMBackend,
@@ -1248,6 +1254,107 @@ def test_split_indexer_prefill_chunks_single_request_overflow():
     # req1: M=5, N=50 -> 250 elems fits budget
     expected.append((slice(1, 2), slice(0, 5)))
     assert out == expected
+
+
+def test_stable_topk_per_row_prefill_breaks_ties_by_source_index():
+    logits = torch.tensor(
+        [[9.0, 4.0, 4.0, 4.0, 1.0], [8.0, 8.0, 7.0, 0.0, 0.0]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    row_starts = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    row_ends = torch.tensor([5, 4], dtype=torch.int32, device="cuda")
+    indices = torch.empty((2, 3), dtype=torch.int32, device="cuda")
+
+    _stable_topk_per_row_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        topk_tokens=3,
+    )
+
+    torch.testing.assert_close(
+        indices,
+        torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.int32, device="cuda"),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_stable_argsort_topk_chunks_without_changing_results():
+    values = torch.tensor(
+        [
+            [4.0, 4.0, 9.0, 1.0, 4.0],
+            [8.0, 8.0, 7.0, 0.0, 0.0],
+            [3.0, 2.0, 3.0, 3.0, 1.0],
+        ],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    expected = torch.argsort(values, dim=1, descending=True, stable=True)[:, :3]
+
+    actual = _stable_argsort_topk(values, 3, output_budget_bytes=40)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_stable_prefill_pipeline_chunks_without_changing_results():
+    num_rows, num_columns, topk_tokens = 10, 65536, 32
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    logits = torch.randint(
+        0,
+        16,
+        (num_rows, num_columns),
+        generator=generator,
+        dtype=torch.int32,
+        device="cuda",
+    ).float()
+    row_starts = torch.arange(num_rows, dtype=torch.int32, device="cuda")
+    row_ends = torch.full(
+        (num_rows,), num_columns, dtype=torch.int32, device="cuda"
+    )
+    actual = torch.empty(
+        (num_rows, topk_tokens), dtype=torch.int32, device="cuda"
+    )
+    assert _stable_topk_rows_per_chunk(num_columns) < num_rows
+
+    _stable_topk_per_row_prefill(
+        logits, row_starts, row_ends, actual, topk_tokens
+    )
+
+    columns = torch.arange(num_columns, device="cuda")
+    valid = (columns >= row_starts[:, None]) & (columns < row_ends[:, None])
+    masked = logits.masked_fill(~valid, -torch.inf)
+    expected = torch.argsort(
+        masked, dim=1, descending=True, stable=True
+    )[:, :topk_tokens]
+    expected -= row_starts[:, None]
+    torch.testing.assert_close(actual, expected.to(torch.int32), rtol=0, atol=0)
+
+
+def test_stable_topk_per_row_decode_breaks_ties_by_source_index():
+    logits = torch.tensor(
+        [[9.0, 4.0, 4.0, 4.0, 1.0], [8.0, 8.0, 7.0, 0.0, 0.0]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    seq_lens = torch.tensor([[5], [4]], dtype=torch.int32, device="cuda")
+    indices = torch.empty((2, 3), dtype=torch.int32, device="cuda")
+
+    _stable_topk_per_row_decode(
+        logits,
+        seq_lens,
+        indices,
+        topk_tokens=3,
+    )
+
+    torch.testing.assert_close(
+        indices,
+        torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.int32, device="cuda"),
+        rtol=0,
+        atol=0,
+    )
 
 
 # 384 is not a power of two, so it counts via the tiled atomic accumulation

@@ -12,6 +12,7 @@ import torch
 from utils import skip_unsupported
 
 from vllm.model_executor.layers.batch_invariant import (
+    linear_batch_invariant,
     matmul_batch_invariant,
     use_low_m_batch_invariant,
 )
@@ -113,3 +114,18 @@ def test_matmul_batch_invariance(dtype):
     batch_output_a = batch_output[3]
 
     assert torch.equal(standard_output[0], batch_output_a)
+
+
+@skip_unsupported
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_linear_batch_invariance_crosses_mtp_row_boundary(dtype):
+    """Linear must not change arithmetic when MTP expands beyond eight rows."""
+    device = torch.device(DEVICE_TYPE)
+    torch.manual_seed(43)
+    rows = torch.rand((16, 512), dtype=dtype, device=device)
+    weight = torch.rand((1024, 512), dtype=dtype, device=device)
+
+    single = linear_batch_invariant(rows[:1], weight)
+    batch = linear_batch_invariant(rows, weight)
+
+    torch.testing.assert_close(single, batch[:1], rtol=0, atol=0)

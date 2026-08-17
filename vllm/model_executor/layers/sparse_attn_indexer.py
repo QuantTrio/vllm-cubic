@@ -292,6 +292,98 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+_STABLE_TOPK_WORKSPACE_BUDGET_BYTES = 8 * 1024 * 1024
+
+
+def _stable_argsort_topk(
+    values: torch.Tensor,
+    topk_tokens: int,
+    output_budget_bytes: int = _STABLE_TOPK_WORKSPACE_BUDGET_BYTES,
+) -> torch.Tensor:
+    """Return stable descending top-k indices with bounded sort output memory."""
+    if values.ndim != 2:
+        raise ValueError("stable top-k expects a two-dimensional tensor")
+    if output_budget_bytes <= 0:
+        raise ValueError("stable top-k output budget must be positive")
+
+    num_rows, num_columns = values.shape
+    selected = torch.empty(
+        (num_rows, min(topk_tokens, num_columns)),
+        dtype=torch.int64,
+        device=values.device,
+    )
+    index_bytes_per_row = max(1, num_columns * torch.int64.itemsize)
+    rows_per_chunk = max(1, output_budget_bytes // index_bytes_per_row)
+    for row_start in range(0, num_rows, rows_per_chunk):
+        row_end = min(row_start + rows_per_chunk, num_rows)
+        selected[row_start:row_end].copy_(
+            torch.argsort(
+                values[row_start:row_end],
+                dim=1,
+                descending=True,
+                stable=True,
+            )[:, :topk_tokens]
+        )
+    return selected
+
+
+def _stable_topk_rows_per_chunk(num_columns: int) -> int:
+    bytes_per_element = torch.int64.itemsize + torch.float32.itemsize + 4
+    return max(
+        1,
+        _STABLE_TOPK_WORKSPACE_BUDGET_BYTES
+        // max(1, num_columns * bytes_per_element),
+    )
+
+
+def _stable_topk_per_row_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    columns = torch.arange(logits.shape[1], device=logits.device)
+    output_columns = torch.arange(topk_tokens, device=logits.device)
+    rows_per_chunk = _stable_topk_rows_per_chunk(logits.shape[1])
+    for chunk_start in range(0, logits.shape[0], rows_per_chunk):
+        chunk_end = min(chunk_start + rows_per_chunk, logits.shape[0])
+        starts = row_starts[chunk_start:chunk_end]
+        ends = row_ends[chunk_start:chunk_end]
+        valid = (columns >= starts[:, None]) & (columns < ends[:, None])
+        masked = logits[chunk_start:chunk_end].masked_fill(~valid, -torch.inf)
+        absolute_indices = _stable_argsort_topk(masked, topk_tokens)
+        local_indices = absolute_indices - starts[:, None]
+        row_lengths = ends - starts
+        local_indices.masked_fill_(output_columns >= row_lengths[:, None], -1)
+        topk_indices[chunk_start:chunk_end].copy_(
+            local_indices.to(topk_indices.dtype)
+        )
+
+
+def _stable_topk_per_row_decode(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    row_lengths = seq_lens.reshape(-1)[: logits.shape[0]]
+    columns = torch.arange(logits.shape[1], device=logits.device)
+    output_columns = torch.arange(topk_tokens, device=logits.device)
+    rows_per_chunk = _stable_topk_rows_per_chunk(logits.shape[1])
+    for chunk_start in range(0, logits.shape[0], rows_per_chunk):
+        chunk_end = min(chunk_start + rows_per_chunk, logits.shape[0])
+        lengths = row_lengths[chunk_start:chunk_end]
+        masked = logits[chunk_start:chunk_end].masked_fill(
+            columns >= lengths[:, None], -torch.inf
+        )
+        indices = _stable_argsort_topk(masked, topk_tokens)
+        indices.masked_fill_(output_columns >= lengths[:, None], -1)
+        topk_indices[chunk_start:chunk_end].copy_(
+            indices.to(topk_indices.dtype)
+        )
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -516,6 +608,14 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     topk_tokens,
                 )
+                if envs.VLLM_BATCH_INVARIANT:
+                    _stable_topk_per_row_prefill(
+                        logits,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_indices,
+                        topk_tokens,
+                    )
 
             _merge_dcp_topk_global(
                 logits,
@@ -661,6 +761,13 @@ def sparse_attn_indexer(
                 num_rows,
                 logits.stride(0),
                 logits.stride(1),
+                topk_tokens,
+            )
+        if envs.VLLM_BATCH_INVARIANT:
+            _stable_topk_per_row_decode(
+                logits,
+                seq_lens,
+                topk_indices,
                 topk_tokens,
             )
 

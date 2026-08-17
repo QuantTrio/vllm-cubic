@@ -196,6 +196,69 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize("itype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("batch", [3, 8])
+def test_spec_varlen_update_matches_per_sequence_exactly(batch, itype):
+    """Speculative varlen convolution must not depend on peer sequences."""
+    set_random_seed(17)
+    device = DEVICE
+    tokens, dim, width = 2, 512, 4
+    total_tokens = batch * tokens
+    state_len = width - 1 + tokens - 1
+    x = torch.randn(total_tokens, dim, device=device, dtype=itype)
+    weight = torch.randn(dim, width, device=device, dtype=itype)
+    bias = torch.randn(dim, device=device, dtype=itype)
+    query_start_loc = torch.arange(
+        0, total_tokens + 1, tokens, device=device, dtype=torch.int32
+    )
+    state_indices = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
+    num_accepted_tokens = torch.ones(batch, device=device, dtype=torch.int32)
+    initial = torch.randn(
+        batch + 1, dim, state_len, device=device, dtype=itype
+    )
+    packed_state = initial.clone()
+    packed_output = causal_conv1d_update(
+        x.clone(),
+        packed_state,
+        weight,
+        bias,
+        activation="silu",
+        conv_state_indices=state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        query_start_loc=query_start_loc,
+        max_query_len=tokens,
+    )
+
+    reference_outputs = []
+    reference_states = []
+    for sequence in range(batch):
+        start = sequence * tokens
+        end = start + tokens
+        state = torch.cat([initial[:1], initial[sequence + 1 : sequence + 2]])
+        output = causal_conv1d_update(
+            x[start:end].clone(),
+            state,
+            weight,
+            bias,
+            activation="silu",
+            conv_state_indices=torch.ones(1, device=device, dtype=torch.int32),
+            num_accepted_tokens=torch.ones(1, device=device, dtype=torch.int32),
+            query_start_loc=torch.tensor(
+                [0, tokens], device=device, dtype=torch.int32
+            ),
+            max_query_len=tokens,
+        )
+        reference_outputs.append(output)
+        reference_states.append(state[1])
+
+    torch.testing.assert_close(
+        packed_output, torch.cat(reference_outputs), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        packed_state[state_indices], torch.stack(reference_states), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])

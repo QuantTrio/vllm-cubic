@@ -94,6 +94,7 @@ def split_indexer_prefill_chunks(
     chunks: list[tuple[slice, slice]] = []
     n = len(seq_lens_cpu)
     max_logits_elems = max_logits_bytes // 4
+
     end = 0
 
     while end < n:

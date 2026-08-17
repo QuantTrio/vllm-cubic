@@ -9,6 +9,9 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.logger import init_logger
+from vllm.model_executor.layers.batch_invariant import (
+    log_softmax as batch_invariant_log_softmax,
+)
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.triton_utils import HAS_TRITON
 
@@ -16,6 +19,12 @@ if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
 
 logger = init_logger(__name__)
+
+
+def _compute_processed_logprobs(logits: torch.Tensor) -> torch.Tensor:
+    if logits.is_cuda:
+        return batch_invariant_log_softmax(logits.float(), dim=-1)
+    return logits.log_softmax(dim=-1, dtype=torch.float32)
 
 
 def _skip_aiter_sampler_on_gfx1250() -> bool:
@@ -145,7 +154,7 @@ class TopKTopPSampler(nn.Module):
         if self.logprobs_mode == "processed_logits":
             logits_to_return = logits
         elif self.logprobs_mode == "processed_logprobs":
-            logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
+            logits_to_return = _compute_processed_logprobs(logits)
         probs = logits.softmax(dim=-1, dtype=torch.float32)
         return (
             random_sample(probs, generators, self.use_fp64_gumbel),
@@ -198,7 +207,7 @@ class TopKTopPSampler(nn.Module):
         if self.logprobs_mode == "processed_logits":
             logits_to_return = logits
         elif self.logprobs_mode == "processed_logprobs":
-            logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
+            logits_to_return = _compute_processed_logprobs(logits)
 
         if len(generators) != logits.shape[0] and not self.use_fp64_gumbel:
             return compiled_random_sample(logits), logits_to_return

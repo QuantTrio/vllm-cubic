@@ -90,6 +90,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         uses_fp8_ds_mla_layout = self.cache_config.cache_dtype == "fp8_ds_mla"
         return SlidingWindowMLASpec(
             block_size=self.block_size,
+            prefix_cache_replay_tokens=self.window_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
