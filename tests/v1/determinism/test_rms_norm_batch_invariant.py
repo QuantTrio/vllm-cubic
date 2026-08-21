@@ -9,7 +9,9 @@ from utils import skip_if_not_cuda, skip_unsupported
 from vllm.model_executor.layers.batch_invariant import (
     rms_norm_batch_invariant,
 )
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNormGated
 from vllm.platforms import current_platform
+from vllm.v1.sample.sampler import Sampler
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -190,6 +192,54 @@ def _assert_rows_bit_identical(small, large, msg):
         assert torch.equal(small.view(torch.uint8), large.view(torch.uint8)), msg
     else:
         torch.testing.assert_close(small, large, rtol=0.0, atol=0.0, msg=msg)
+
+
+@skip_if_not_cuda
+@pytest.mark.parametrize("group_size", [None, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_rms_norm_gated_low_m_is_batch_invariant(group_size, dtype):
+    """The shared first row must not depend on an M=1 versus M=2 launch."""
+    device = torch.device(DEVICE_TYPE)
+    hidden_size = 512
+    torch.manual_seed(0)
+    row = torch.randn(1, hidden_size, dtype=dtype, device=device)
+    extra = torch.randn(1, hidden_size, dtype=dtype, device=device)
+    z_row = torch.randn_like(row)
+    z_extra = torch.randn_like(extra)
+    weight = torch.randn(hidden_size, dtype=dtype, device=device)
+
+    single = RMSNormGated.forward_static(
+        row,
+        z_row,
+        weight,
+        1e-5,
+        dtype,
+        group_size=group_size,
+    )
+    batch = RMSNormGated.forward_static(
+        torch.cat((row, extra)),
+        torch.cat((z_row, z_extra)),
+        weight,
+        1e-5,
+        dtype,
+        group_size=group_size,
+    )
+
+    torch.testing.assert_close(single, batch[:1], rtol=0.0, atol=0.0)
+
+
+@skip_if_not_cuda
+def test_sampler_logprobs_are_batch_invariant_across_low_m_boundary():
+    """Logprob normalization must not change after MTP expands past M=8."""
+    device = torch.device(DEVICE_TYPE)
+    torch.manual_seed(0)
+    row = torch.randn(1, 32768, dtype=torch.float32, device=device)
+    extra = torch.randn(15, 32768, dtype=torch.float32, device=device)
+
+    single = Sampler.compute_logprobs(row)
+    batch = Sampler.compute_logprobs(torch.cat((row, extra)))
+
+    torch.testing.assert_close(single, batch[:1], rtol=0.0, atol=0.0)
 
 
 @skip_if_not_cuda
@@ -561,6 +611,23 @@ def test_fused_rms_norm_batch_invariance(dtype):
 
     assert torch.equal(out_single[0], out_batch[4])
     assert torch.equal(residual_single[0], residual_batch[4])
+
+
+@skip_unsupported
+def test_gemma_rms_norm_cuda_prefill_is_batch_invariant(default_vllm_config):
+    """Gemma RMSNorm keeps prefill rows invariant beyond the decode cutoff."""
+    device = torch.device(DEVICE_TYPE)
+    torch.manual_seed(44)
+    hidden_size = 5120
+    layer = GemmaRMSNorm(hidden_size).to(device=device, dtype=torch.bfloat16)
+    row = torch.randn(1, hidden_size, dtype=torch.bfloat16, device=device)
+    batch = torch.randn(63, hidden_size, dtype=torch.bfloat16, device=device)
+    batch[31] = row[0]
+
+    out_single = layer.forward_cuda(row)
+    out_batch = layer.forward_cuda(batch)
+
+    assert torch.equal(out_single[0], out_batch[31])
 
 
 if __name__ == "__main__":

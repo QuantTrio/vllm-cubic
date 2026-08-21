@@ -505,9 +505,12 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
            i += kNumThreadsPerBlock) {
         int outIndex = 0;
         auto logit = smemFinal.items.logits[i];
+        auto index = smemFinal.items.indices[i];
         for (int j = 0; j < smemFinalDstIdx[0]; j++) {
           auto otherLogit = smemFinal.items.logits[j];
-          if (logit < otherLogit || (logit == otherLogit && i < j)) {
+          auto otherIndex = smemFinal.items.indices[j];
+          if (logit < otherLogit ||
+              (logit == otherLogit && index > otherIndex)) {
             outIndex++;
           }
         }

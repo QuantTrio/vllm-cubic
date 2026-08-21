@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib
 from collections.abc import Callable
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -1297,6 +1298,16 @@ def test_merge_kv_cache_spec():
     assert merged_layer_spec.head_size == 64
     assert merged_layer_spec.dtype == torch.float32
     assert merged_layer_spec.sliding_window is None
+
+    replay_specs = [
+        new_kv_cache_spec(num_kv_heads=32),
+        replace(
+            new_kv_cache_spec(num_kv_heads=32),
+            prefix_cache_replay_tokens=16,
+        ),
+    ]
+    merged_replay_spec = replay_specs[0].merge(replay_specs)
+    assert merged_replay_spec.prefix_cache_replay_tokens == 16
 
     different_layer_specs = [
         new_kv_cache_spec(num_kv_heads=32),

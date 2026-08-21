@@ -40,7 +40,10 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
     triton_reshape_and_cache_flash_per_token_head_quant,
 )
-from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+from vllm.v1.attention.ops.triton_unified_attention import (
+    SEGMENTED_DECODE_MAX_QUERY_LEN,
+    unified_attention,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
@@ -155,7 +158,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
             (
-                self.seq_threshold_3D,
+                self.seq_threshold_3D * SEGMENTED_DECODE_MAX_QUERY_LEN,
                 self.num_heads_q,
                 self.num_par_softmax_segments,
                 headdim_padded,
@@ -164,12 +167,20 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             device=device,
         )
         self.softmax_segm_max = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (
+                self.seq_threshold_3D * SEGMENTED_DECODE_MAX_QUERY_LEN,
+                self.num_heads_q,
+                self.num_par_softmax_segments,
+            ),
             dtype=torch.float32,
             device=device,
         )
         self.softmax_segm_expsum = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (
+                self.seq_threshold_3D * SEGMENTED_DECODE_MAX_QUERY_LEN,
+                self.num_heads_q,
+                self.num_par_softmax_segments,
+            ),
             dtype=torch.float32,
             device=device,
         )

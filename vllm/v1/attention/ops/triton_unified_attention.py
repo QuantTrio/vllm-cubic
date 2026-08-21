@@ -13,9 +13,6 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import (
-    LOW_M_BATCH_INVARIANT_LIMIT,
-)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_attention_helpers import (
@@ -32,6 +29,8 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     store_segm_reduce_scalars,
 )
 from vllm.v1.kv_cache_interface import KVQuantMode
+
+SEGMENTED_DECODE_MAX_QUERY_LEN = 2
 
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
@@ -1047,8 +1046,7 @@ def unified_attention(
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or q.shape[0] <= LOW_M_BATCH_INVARIANT_LIMIT
+        or max_seqlen_q > SEGMENTED_DECODE_MAX_QUERY_LEN
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )

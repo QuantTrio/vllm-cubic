@@ -133,6 +133,24 @@ QUANT_CONFIGS = [
         "thread_m_blocks": [1, 2, 3, 4],
         "group_blocks": [-1, 2, 4, 8],
     },
+    # Signed INT8 weights/activations with FP16 scales and BF16 output
+    {
+        "a_type": ["kS8"],
+        "b_type": "kS8",
+        "c_type": ["kBFloat16"],
+        "s_type": "kFloat16",
+        "thread_configs": THREAD_CONFIGS,
+        "thread_m_blocks": [1, 2, 3, 4],
+        "group_blocks": [2, 4, 8],
+    },
+    # Signed INT8 weights with INT8 activation
+    {
+        "a_type": ["kS8"],
+        "b_type": "kS8",
+        "thread_configs": THREAD_CONFIGS,
+        "thread_m_blocks": [1, 2, 3, 4],
+        "group_blocks": [-1, 2, 4, 8],
+    },
     # GPTQ-INT4 with FP8 activation
     {
         "a_type": ["kFE4M3fn"],
@@ -306,6 +324,53 @@ def generate_new_kernels():
             "  STD_TORCH_CHECK(false, "
             '"marlin kernel with fp8 activation is not built.");'
         )
+
+    if SUPPORT_SM80:
+        cubic_templates = []
+        cubic_configs = [
+            (threads, 1, thread_n_blocks, thread_k_blocks, True)
+            for threads, thread_n_blocks, thread_k_blocks in (
+                (256, 8, 8),
+                (128, 8, 4),
+                (128, 4, 8),
+            )
+        ]
+        for thread_m_blocks in (1, 2, 3, 4):
+            thread_configs = (
+                ((256, 8, 8), (128, 8, 4), (128, 4, 8))
+                if thread_m_blocks == 1
+                else ((256, 16, 4), (128, 8, 4), (128, 4, 8))
+            )
+            cubic_configs.extend(
+                (
+                    threads,
+                    thread_m_blocks,
+                    thread_n_blocks,
+                    thread_k_blocks,
+                    False,
+                )
+                for threads, thread_n_blocks, thread_k_blocks in thread_configs
+            )
+        for (
+            threads,
+            thread_m_blocks,
+            thread_n_blocks,
+            thread_k_blocks,
+            m_block_size_8,
+        ) in cubic_configs:
+            cubic_templates.append(
+                "template __global__ void Marlin<"
+                "vllm::kBFloat16.id(), vllm::kU4B8.id(), "
+                "vllm::kBFloat16.id(), vllm::kBFloat16.id(), "
+                f"{threads}, {thread_m_blocks}, {thread_n_blocks}, "
+                f"{thread_k_blocks}, {str(m_block_size_8).lower()}, "
+                "4, 2, false, true>( MARLIN_KERNEL_PARAMS );"
+            )
+        cubic_content = FILE_HEAD + "\n\n"
+        cubic_content += "\n\n".join(cubic_templates) + "\n\n}\n"
+        cubic_filename = "sm80_kernel_cubic_bfloat16_u4b8_bfloat16.cu"
+        with open(os.path.join(os.path.dirname(__file__), cubic_filename), "w") as f:
+            f.write(cubic_content)
 
     with open(os.path.join(os.path.dirname(__file__), "kernel_selector.h"), "w") as f:
         f.write(kernel_selector_str)

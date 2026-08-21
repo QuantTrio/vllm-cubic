@@ -88,6 +88,74 @@ def ref_paged_attn(
     return torch.cat(outputs, dim=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_triton_segmented_decode_supports_two_query_tokens() -> None:
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(20260820)
+    query_len, kv_len = 2, 2048
+    num_query_heads, num_kv_heads, head_size, block_size = 6, 1, 256, 16
+    num_blocks = (kv_len + block_size - 1) // block_size
+    query = torch.randn(
+        query_len, num_query_heads, head_size, dtype=torch.bfloat16
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=torch.bfloat16
+    )
+    value_cache = torch.randn_like(key_cache)
+    output = torch.empty_like(query)
+    query_lens = torch.tensor([0, query_len], dtype=torch.int32)
+    kv_lens = torch.tensor([kv_len], dtype=torch.int32)
+    block_tables = torch.arange(num_blocks, dtype=torch.int32).reshape(1, -1)
+    num_segments = 16
+    segment_output = torch.empty(
+        query_len,
+        num_query_heads,
+        num_segments,
+        head_size,
+        dtype=torch.float32,
+    )
+    segment_max = torch.empty(
+        query_len, num_query_heads, num_segments, dtype=torch.float32
+    )
+    segment_sum = torch.empty_like(segment_max)
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=query_len,
+        max_seqlen_k=kv_len,
+        softmax_scale=head_size**-0.5,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=8,
+        num_par_softmax_segments=num_segments,
+        softmax_segm_output=segment_output,
+        softmax_segm_max=segment_max,
+        softmax_segm_expsum=segment_sum,
+        kv_quant_mode=KVQuantMode.NONE,
+    )
+    expected = ref_paged_attn(
+        query=query.clone(),
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[query_len],
+        kv_lens=[kv_len],
+        block_tables=block_tables,
+        scale=head_size**-0.5,
+    )
+    torch.testing.assert_close(output, expected, atol=1.5e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )

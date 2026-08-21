@@ -12,6 +12,7 @@ from vllm import envs, ir
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import (
+    mean_dim,
     rms_norm_batch_invariant,
     use_low_m_batch_invariant,
 )
@@ -80,7 +81,7 @@ class RMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
-        if envs.VLLM_BATCH_INVARIANT or use_low_m_batch_invariant(x):
+        if envs.VLLM_BATCH_INVARIANT:
             assert self.variance_size_override is None, (
                 "Batch invariance is not supported for variance_size_override"
             )
@@ -114,7 +115,7 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if envs.VLLM_BATCH_INVARIANT or use_low_m_batch_invariant(x):
+        if envs.VLLM_BATCH_INVARIANT:
             assert self.variance_size_override is None, (
                 "Batch invariance is not supported for variance_size_override"
             )
@@ -171,7 +172,7 @@ class GemmaRMSNorm(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
         weight = self.weight.float() + 1.0
-        if use_low_m_batch_invariant(x):
+        if x.is_cuda or use_low_m_batch_invariant(x):
             return rms_norm_batch_invariant(
                 x,
                 weight,
@@ -187,14 +188,12 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if use_low_m_batch_invariant(x):
-            return rms_norm_batch_invariant(
-                x,
-                self.weight.float() + 1.0,
-                self.variance_epsilon,
-                residual=residual,
-            )
-        return self.forward_native(x, residual)
+        return rms_norm_batch_invariant(
+            x,
+            self.weight.float() + 1.0,
+            self.variance_epsilon,
+            residual=residual,
+        )
 
 
 # --8<-- [start:rms_norm_gated]
@@ -270,6 +269,7 @@ class RMSNormGated(CustomOp):
         If *z* is not None and *norm_before_gate* is False:
             ``out = rms_norm(x * act(z))``
         """
+        use_invariant_reduction = x.is_cuda or use_low_m_batch_invariant(x)
         x = x.float()
         weight = weight.float()
         if z is not None:
@@ -282,14 +282,24 @@ class RMSNormGated(CustomOp):
             x = x * act_fn(z)
 
         if group_size is None:
-            variance = x.pow(2).mean(dim=-1, keepdim=True)
+            x_squared = x.pow(2)
+            variance = (
+                mean_dim(x_squared, dim=-1, keepdim=True)
+                if use_invariant_reduction
+                else x_squared.mean(dim=-1, keepdim=True)
+            )
             x_normed = x * torch.rsqrt(variance + epsilon)
             out = x_normed * weight
         else:
             from einops import rearrange
 
             x_group = rearrange(x, "... (g d) -> ... g d", d=group_size)
-            variance = x_group.pow(2).mean(dim=-1, keepdim=True)
+            x_squared = x_group.pow(2)
+            variance = (
+                mean_dim(x_squared, dim=-1, keepdim=True)
+                if use_invariant_reduction
+                else x_squared.mean(dim=-1, keepdim=True)
+            )
             x_normed = x_group * torch.rsqrt(variance + epsilon)
             out = rearrange(x_normed, "... g d -> ... (g d)") * weight
 
@@ -302,6 +312,8 @@ class RMSNormGated(CustomOp):
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
+        if x.is_cuda:
+            return self.forward_cuda(x, z)
         return self.forward_static(
             x,
             z,

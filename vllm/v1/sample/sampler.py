@@ -6,6 +6,9 @@ import torch
 import torch.nn as nn
 
 from vllm.config.model import LogprobsMode
+from vllm.model_executor.layers.batch_invariant import (
+    log_softmax as batch_invariant_log_softmax,
+)
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -303,6 +306,8 @@ class Sampler(nn.Module):
 
     @staticmethod
     def compute_logprobs(logits: torch.Tensor) -> torch.Tensor:
+        if logits.is_cuda:
+            return batch_invariant_log_softmax(logits.float(), dim=-1)
         return logits.log_softmax(dim=-1, dtype=torch.float32)
 
     @staticmethod

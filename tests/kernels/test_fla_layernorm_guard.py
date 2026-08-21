@@ -10,6 +10,7 @@ from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
     layer_norm_fwd,
     layernorm_fn,
     rms_norm_ref,
+    rmsnorm_fn,
 )
 from vllm.utils.torch_utils import set_random_seed
 
@@ -443,6 +444,51 @@ def test_rmsnorm_gated_forward_native_dtype(
         upcast=True,
     )
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Need CUDA device")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_rmsnorm_gated_is_exact_across_batch_shapes(dtype: torch.dtype) -> None:
+    """A row must use the same floating-point graph for every batch size."""
+    device = torch.device("cuda")
+    set_random_seed(42)
+    hidden_size = 128
+    small_rows = 48
+    large_rows = 336
+    offset = 96
+    x = torch.randn(small_rows, hidden_size, device=device, dtype=dtype)
+    z = torch.randn_like(x)
+    weight = torch.randn(hidden_size, device=device, dtype=dtype)
+    large_x = torch.randn(large_rows, hidden_size, device=device, dtype=dtype)
+    large_z = torch.randn_like(large_x)
+    large_x[offset : offset + small_rows] = x
+    large_z[offset : offset + small_rows] = z
+
+    small = rmsnorm_fn(
+        x,
+        weight,
+        None,
+        z=z,
+        eps=1e-6,
+        norm_before_gate=True,
+        activation="silu",
+    )
+    large = rmsnorm_fn(
+        large_x,
+        weight,
+        None,
+        z=large_z,
+        eps=1e-6,
+        norm_before_gate=True,
+        activation="silu",
+    )
+
+    torch.testing.assert_close(
+        small,
+        large[offset : offset + small_rows],
+        rtol=0,
+        atol=0,
+    )
 
 
 if __name__ == "__main__":

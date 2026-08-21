@@ -19,8 +19,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import cdiv, next_power_of_2
-from vllm.utils.platform_utils import num_compute_units
+from vllm.utils.math_utils import cdiv
 
 from .utils import input_guard
 
@@ -168,11 +167,9 @@ def layer_norm_fwd_kernel(
     tl.store(Y_base, y, mask=mask)
 
 
-def calc_rows_per_block(M: int, device: torch.device) -> int:
-    sm_count = num_compute_units(device.index)
-    rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
-    rows_per_block = min(rows_per_block, 4)
-    return rows_per_block
+def calc_rows_per_block(_M: int, _device: torch.device) -> int:
+    # Keep each row's floating-point graph independent of the launch batch.
+    return 1
 
 
 def layer_norm_fwd(

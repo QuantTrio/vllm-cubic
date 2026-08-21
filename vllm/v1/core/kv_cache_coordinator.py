@@ -715,7 +715,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
-        hit_length = max_cache_hit_length
+        replay_tokens = max(
+            group.kv_cache_spec.prefix_cache_replay_tokens
+            for group in self.kv_cache_config.kv_cache_groups
+        )
+        hit_length = max(0, max_cache_hit_length - replay_tokens)
         longest_hit_length = 0
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
         hit_length_by_group: list[int] = [0] * num_groups
@@ -838,6 +842,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
         hit_lengths: list[int] = [0] * num_groups
 
+        replay_tokens = max(
+            group.kv_cache_spec.prefix_cache_replay_tokens
+            for group in self.kv_cache_config.kv_cache_groups
+        )
+        max_cache_hit_length = max(0, max_cache_hit_length - replay_tokens)
         for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
             blocks, group_hit = manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,

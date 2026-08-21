@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.int8_utils import (
+    per_token_group_quant_int8,
     per_token_quant_int8,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
@@ -134,17 +135,21 @@ def _check_marlin_supported(
     if quant_type not in supported_types:
         return (
             False,
-            f"Marlin does not support weight_bits = {quant_type}. "
-            f"Only types = {supported_types} "
-            f"are supported (for group_size = {group_size}, "
-            f"device_capability = {device_capability}, zp = {has_zp}).",
+            (
+                f"Marlin does not support weight_bits = {quant_type}. "
+                f"Only types = {supported_types} "
+                f"are supported (for group_size = {group_size}, "
+                f"device_capability = {device_capability}, zp = {has_zp})."
+            ),
         )
     if group_size is None or group_size not in MARLIN_SUPPORTED_GROUP_SIZES:
         return (
             False,
-            f"Marlin does not support group_size = {group_size}. "
-            f"Only group_sizes = {MARLIN_SUPPORTED_GROUP_SIZES} "
-            "are supported.",
+            (
+                f"Marlin does not support group_size = {group_size}. "
+                f"Only group_sizes = {MARLIN_SUPPORTED_GROUP_SIZES} "
+                "are supported."
+            ),
         )
 
     return True, None
@@ -488,8 +493,9 @@ def marlin_permute_bias(s: torch.Tensor) -> torch.Tensor:
 
 
 def marlin_act_int8_process_scales(s: torch.Tensor):
-    a_scales_scale_factor = 1 / 4096 * s.max().float()
-    s = s / s.max() * 4096
+    scale_max = s.abs().max().float().clamp_min(torch.finfo(torch.float32).tiny)
+    a_scales_scale_factor = scale_max / 4096
+    s = s / scale_max * 4096
     s = s.round().to(torch.int16).view(s.dtype)
     return s, a_scales_scale_factor
 
@@ -685,9 +691,15 @@ def get_marlin_input_dtype(prefix: str | None = None):
         return
 
 
-def marlin_quant_input(x: torch.Tensor, quant_dtype: torch.dtype):
+def marlin_quant_input(
+    x: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_size: int | None = None,
+):
     x = x.reshape(-1, x.shape[-1])
     if quant_dtype == torch.int8:
+        if group_size is not None and group_size < x.shape[-1]:
+            return per_token_group_quant_int8(x.contiguous(), group_size)
         return per_token_quant_int8(x)
     elif quant_dtype == torch.float8_e4m3fn:
         return get__quant_fp8_method()(x)
@@ -711,6 +723,7 @@ def apply_gptq_marlin_linear(
     bias: torch.Tensor | None = None,
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
     input_dtype: torch.dtype | None = None,
+    input_group_size: int | None = None,
 ) -> torch.Tensor:
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (output_size_per_partition,)
@@ -728,11 +741,16 @@ def apply_gptq_marlin_linear(
 
     a_scales = None
     if input_dtype == torch.int8:
-        assert wtype == scalar_types.uint4b8, (
-            "W8A8-INT8 is not supported by marlin kernel."
+        assert wtype in (
+            scalar_types.int8,
+            scalar_types.uint4b8,
+            scalar_types.uint8b128,
+        ), "INT8 activation requires a Marlin integer carrier weight."
+        reshaped_x, a_scales = marlin_quant_input(
+            reshaped_x, input_dtype, input_group_size
         )
-        reshaped_x, a_scales = marlin_quant_input(reshaped_x, input_dtype)
-        a_scales = a_scales * input_global_scale
+        if input_global_scale is not None:
+            a_scales = a_scales * input_global_scale
     elif input_dtype == torch.float8_e4m3fn:
         assert wtype == scalar_types.uint4b8, (
             "INT8 weight + FP8 activation is not supported."
@@ -740,9 +758,17 @@ def apply_gptq_marlin_linear(
 
         reshaped_x, a_scales = marlin_quant_input(reshaped_x, input_dtype)
 
+    output_buffer = None
+    if input_dtype is not None:
+        output_buffer = torch.empty(
+            (reshaped_x.shape[0], padded_n),
+            dtype=input.dtype,
+            device=input.device,
+        )
+
     output = ops.marlin_gemm(
         reshaped_x,
-        None,
+        output_buffer,
         weight,
         bias,
         weight_scale,
