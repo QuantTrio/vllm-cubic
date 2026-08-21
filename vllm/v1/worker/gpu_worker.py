@@ -445,13 +445,19 @@ class Worker(WorkerBase):
                 cubic_kernel_warmup,
             )
 
-            cubic_kernel_warmup(
-                self.model_runner.get_model(),
-                max_tokens=self.scheduler_config.max_num_batched_tokens,
-                capture_sizes=tuple(
-                    self.vllm_config.compilation_config.cudagraph_capture_sizes or ()
-                ),
-            )
+            warmup_models = [self.model_runner.get_model()]
+            draft_model = self.model_runner.get_draft_model()
+            if draft_model is not None and draft_model is not warmup_models[0]:
+                warmup_models.append(draft_model)
+            for model in warmup_models:
+                cubic_kernel_warmup(
+                    model,
+                    max_tokens=self.scheduler_config.max_num_batched_tokens,
+                    capture_sizes=tuple(
+                        self.vllm_config.compilation_config.cudagraph_capture_sizes
+                        or ()
+                    ),
+                )
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(

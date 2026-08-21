@@ -7,6 +7,8 @@ import vllm.model_executor.kernels.mhc  # noqa: F401
 from vllm.model_executor.kernels.mhc.tilelang import (
     _tilelang_hc_prenorm_gemm,
     _torch_hc_prenorm_gemm,
+    mhc_pre_broadcast_tilelang,
+    mhc_pre_tilelang,
 )
 from vllm.model_executor.layers.mhc import HAS_TILELANG_MHC
 from vllm.platforms import current_platform
@@ -282,6 +284,124 @@ def test_mhc_fused_post_pre(num_tokens, hidden_size, hc_mult):
     torch.testing.assert_close(post_mix, post_mix_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(res_mix, res_mix_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(x, layer_input_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not HAS_TILELANG_MHC,
+    reason="TileLang MHC support required",
+)
+def test_mhc_fused_post_pre_is_exact_across_batch_shapes():
+    torch.set_default_device(DEVICE)
+    set_random_seed(91)
+    tokens, hidden_size, hc_mult = 32, 4096, 4
+    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+    x = torch.randn((tokens, hidden_size), dtype=torch.bfloat16)
+    residual = torch.randn(
+        (tokens, hc_mult, hidden_size), dtype=torch.bfloat16
+    )
+    post_layer_mix = torch.randn((tokens, hc_mult, 1), dtype=torch.float32)
+    comb_res_mix = torch.randn(
+        (tokens, hc_mult, hc_mult), dtype=torch.float32
+    )
+    fn = torch.randn(
+        (hc_mult3, hc_mult * hidden_size), dtype=torch.float32
+    ) * 1e-4
+    hc_scale = torch.randn((3,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float32) * 0.1
+    args = (
+        fn,
+        hc_scale,
+        hc_base,
+        1e-6,
+        1e-6,
+        1e-6,
+        1.0,
+        20,
+    )
+
+    solo = torch.ops.vllm.mhc_fused_post_pre_tilelang(
+        x[:1], residual[:1], post_layer_mix[:1], comb_res_mix[:1], *args
+    )
+    batched = torch.ops.vllm.mhc_fused_post_pre_tilelang(
+        x, residual, post_layer_mix, comb_res_mix, *args
+    )
+    for solo_tensor, batched_tensor in zip(solo, batched):
+        torch.testing.assert_close(
+            batched_tensor[:1], solo_tensor, rtol=0, atol=0
+        )
+
+
+@pytest.mark.skipif(
+    not HAS_TILELANG_MHC,
+    reason="TileLang MHC support required",
+)
+@pytest.mark.parametrize("broadcast", (False, True))
+def test_mhc_pre_is_exact_across_batch_shapes(broadcast: bool):
+    torch.set_default_device(DEVICE)
+    set_random_seed(92)
+    tokens, hidden_size, hc_mult = 32, 4096, 4
+    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+    fn = torch.randn(
+        (hc_mult3, hc_mult * hidden_size), dtype=torch.float32
+    ) * 1e-4
+    hc_scale = torch.randn((3,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float32) * 0.1
+    common = (hc_scale, hc_base, 1e-6, 1e-6, 1e-6, 1.0, 20)
+    if broadcast:
+        residual = torch.randn((tokens, hidden_size), dtype=torch.bfloat16)
+        norm_weight = torch.randn(hidden_size, dtype=torch.bfloat16)
+        fn_broadcast = torch.randn(
+            (hc_mult3, hidden_size), dtype=torch.float32
+        ) * 1e-4
+
+        def run(value):
+            return mhc_pre_broadcast_tilelang(
+                value,
+                fn,
+                *common,
+                norm_weight=norm_weight,
+                fn_broadcast=fn_broadcast,
+            )
+
+    else:
+        residual = torch.randn(
+            (tokens, hc_mult, hidden_size), dtype=torch.bfloat16
+        )
+
+        def run(value):
+            return mhc_pre_tilelang(value, fn, *common)
+
+    solo = run(residual[:1])
+    batched = run(residual)
+    for solo_tensor, batched_tensor in zip(solo, batched):
+        torch.testing.assert_close(
+            batched_tensor[:1], solo_tensor, rtol=0, atol=0
+        )
+
+
+@pytest.mark.skipif(
+    not HAS_TILELANG_MHC,
+    reason="TileLang MHC support required",
+)
+def test_hc_head_is_exact_across_batch_shapes():
+    torch.set_default_device(DEVICE)
+    set_random_seed(93)
+    tokens, hidden_size, hc_mult = 32, 4096, 4
+    residual = torch.randn(
+        (tokens, hc_mult, hidden_size), dtype=torch.bfloat16
+    )
+    fn = torch.randn(
+        (hc_mult, hc_mult * hidden_size), dtype=torch.float32
+    ) * 1e-4
+    hc_scale = torch.randn((1,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult,), dtype=torch.float32) * 0.1
+    args = (fn, hc_scale, hc_base, 1e-6, 1e-6)
+
+    solo = torch.ops.vllm.hc_head_fused_kernel_tilelang(
+        residual[:1], *args
+    )
+    batched = torch.ops.vllm.hc_head_fused_kernel_tilelang(residual, *args)
+    torch.testing.assert_close(batched[:1], solo, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(

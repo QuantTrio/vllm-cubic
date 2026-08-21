@@ -5534,11 +5534,23 @@ class GPUModelRunner(
             and cudagraph_mode != CUDAGraphMode.NONE
             and not self.parallel_config.use_ubatching
         ):
-            self.model = BreakableCUDAGraphWrapper(self.model, self.vllm_config)
             drafter = getattr(self, "drafter", None)
-            if drafter is not None and hasattr(drafter, "model"):
+            if (
+                drafter is not None
+                and hasattr(drafter, "model")
+                and getattr(drafter.model, "do_not_compile", False)
+            ):
+                self.model = CUDAGraphWrapper(
+                    self.model,
+                    self.vllm_config,
+                    runtime_mode=CUDAGraphMode.FULL,
+                )
                 drafter.model = BreakableCUDAGraphWrapper(
                     drafter.model, self.vllm_config
+                )
+            else:
+                self.model = BreakableCUDAGraphWrapper(
+                    self.model, self.vllm_config
                 )
         elif (
             cudagraph_mode.has_full_cudagraphs()
@@ -5547,6 +5559,15 @@ class GPUModelRunner(
             self.model = CUDAGraphWrapper(
                 self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
             )
+            drafter = getattr(self, "drafter", None)
+            if (
+                drafter is not None
+                and hasattr(drafter, "model")
+                and getattr(drafter.model, "do_not_compile", False)
+            ):
+                drafter.model = BreakableCUDAGraphWrapper(
+                    drafter.model, self.vllm_config
+                )
         elif self.parallel_config.use_ubatching:
             if cudagraph_mode.has_full_cudagraphs():
                 self.model = UBatchWrapper(

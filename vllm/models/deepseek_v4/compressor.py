@@ -195,6 +195,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
+            prefix_cache_replay_tokens=self.sliding_window,
             num_kv_heads=1,
             head_size=self.state_dim,
             dtype=self.dtype,

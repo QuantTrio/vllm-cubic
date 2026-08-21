@@ -1296,7 +1296,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
             )
-
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None

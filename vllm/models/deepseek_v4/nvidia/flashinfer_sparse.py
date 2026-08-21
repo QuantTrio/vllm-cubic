@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+from vllm import envs
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
@@ -855,12 +856,13 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 )
             extra_kv_paged = self._as_sparse_cache(compressed_k_cache)
 
-        num_chunks = (
-            num_prefills + self.PREFILL_CHUNK_SIZE - 1
-        ) // self.PREFILL_CHUNK_SIZE
+        requests_per_chunk = (
+            1 if envs.VLLM_BATCH_INVARIANT else self.PREFILL_CHUNK_SIZE
+        )
+        num_chunks = (num_prefills + requests_per_chunk - 1) // requests_per_chunk
         for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
-            chunk_end = min(chunk_start + self.PREFILL_CHUNK_SIZE, num_prefills)
+            chunk_start = chunk_idx * requests_per_chunk
+            chunk_end = min(chunk_start + requests_per_chunk, num_prefills)
             query_start = (
                 query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
             )

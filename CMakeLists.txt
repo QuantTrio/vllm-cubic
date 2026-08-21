@@ -654,7 +654,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       endif()
 
       if (MARLIN_ARCHS)
-        file(GLOB MARLIN_TEMPLATE_KERNEL_SRC "csrc/libtorch_stable/quantization/marlin/sm80_kernel_*_float16.cu")
+        file(GLOB MARLIN_TEMPLATE_KERNEL_SRC CONFIGURE_DEPENDS
+          "csrc/libtorch_stable/quantization/marlin/sm80_kernel_*_float16.cu")
         set_gencode_flags_for_srcs(
           SRCS "${MARLIN_TEMPLATE_KERNEL_SRC}"
           CUDA_ARCHS "${MARLIN_ARCHS}")
@@ -664,7 +665,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
         endif()
         list(APPEND VLLM_STABLE_EXT_SRC ${MARLIN_TEMPLATE_KERNEL_SRC})
 
-        file(GLOB MARLIN_TEMPLATE_BF16_KERNEL_SRC "csrc/libtorch_stable/quantization/marlin/sm80_kernel_*_bfloat16.cu")
+        file(GLOB MARLIN_TEMPLATE_BF16_KERNEL_SRC CONFIGURE_DEPENDS
+          "csrc/libtorch_stable/quantization/marlin/sm80_kernel_*_bfloat16.cu")
         set_gencode_flags_for_srcs(
           SRCS "${MARLIN_TEMPLATE_BF16_KERNEL_SRC}"
           CUDA_ARCHS "${MARLIN_BF16_ARCHS}")

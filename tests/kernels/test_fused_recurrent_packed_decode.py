@@ -173,3 +173,165 @@ def test_packed_decode_matches_spec_update_exactly(dtype: torch.dtype) -> None:
 
     torch.testing.assert_close(packed_output, spec_output, rtol=0, atol=0)
     torch.testing.assert_close(packed_state, spec_state, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_spec_update_matches_successive_decode_steps_exactly(
+    dtype: torch.dtype,
+) -> None:
+    """Multi-token verification preserves cache-dtype recurrence boundaries."""
+    torch.manual_seed(7)
+    batch, tokens, num_heads, num_value_heads = 1, 2, 4, 8
+    key_dim = value_dim = 128
+    device = torch.device("cuda")
+    q = torch.randn(
+        batch, tokens, num_heads, key_dim, device=device, dtype=dtype
+    )
+    k = torch.randn_like(q)
+    v = torch.randn(
+        batch, tokens, num_value_heads, value_dim, device=device, dtype=dtype
+    )
+    a = torch.randn(batch * tokens, num_value_heads, device=device, dtype=dtype)
+    b = torch.randn_like(a)
+    A_log = torch.randn(num_value_heads, device=device, dtype=dtype)
+    dt_bias = torch.randn_like(A_log)
+    initial = torch.randn(
+        batch,
+        num_value_heads,
+        value_dim,
+        key_dim,
+        device=device,
+        dtype=dtype,
+    )
+
+    multi_output, multi_states = fused_sigmoid_gating_delta_rule_update(
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        initial_state=initial,
+        inplace_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    sequential_state = initial
+    sequential_outputs = []
+    for index in range(tokens):
+        output, sequential_state = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            a=a[index : index + 1],
+            b=b[index : index + 1],
+            dt_bias=dt_bias,
+            q=q[:, index : index + 1],
+            k=k[:, index : index + 1],
+            v=v[:, index : index + 1],
+            initial_state=sequential_state,
+            inplace_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        sequential_outputs.append(output)
+    sequential_output = torch.cat(sequential_outputs, dim=1)
+
+    torch.testing.assert_close(multi_output, sequential_output, rtol=0, atol=0)
+    torch.testing.assert_close(multi_states[-1:], sequential_state, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("batch", [3, 8])
+def test_varlen_spec_update_matches_per_sequence_exactly(
+    dtype: torch.dtype, batch: int
+) -> None:
+    """Packed multi-sequence verification must preserve sequence isolation."""
+    torch.manual_seed(11)
+    tokens, num_heads, num_value_heads = 2, 4, 8
+    key_dim = value_dim = 128
+    device = torch.device("cuda")
+    total_tokens = batch * tokens
+
+    q = torch.randn(
+        1, total_tokens, num_heads, key_dim, device=device, dtype=dtype
+    )
+    k = torch.randn_like(q)
+    v = torch.randn(
+        1,
+        total_tokens,
+        num_value_heads,
+        value_dim,
+        device=device,
+        dtype=dtype,
+    )
+    a = torch.randn(total_tokens, num_value_heads, device=device, dtype=dtype)
+    b = torch.randn_like(a)
+    A_log = torch.randn(num_value_heads, device=device, dtype=dtype)
+    dt_bias = torch.randn_like(A_log)
+    cu_seqlens = torch.arange(
+        0, total_tokens + 1, tokens, device=device, dtype=torch.int32
+    )
+    state_indices = torch.arange(
+        1, total_tokens + 1, device=device, dtype=torch.int32
+    ).view(batch, tokens)
+    num_accepted_tokens = torch.ones(batch, device=device, dtype=torch.int32)
+    initial = torch.randn(
+        total_tokens + 1,
+        num_value_heads,
+        value_dim,
+        key_dim,
+        device=device,
+        dtype=dtype,
+    )
+    packed_state = initial.clone()
+
+    packed_output, _ = fused_sigmoid_gating_delta_rule_update(
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        initial_state=packed_state,
+        inplace_final_state=True,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    reference_outputs = []
+    reference_states = []
+    for sequence in range(batch):
+        start = sequence * tokens
+        end = start + tokens
+        state_index = state_indices[sequence, 0]
+        output, states = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            a=a[start:end],
+            b=b[start:end],
+            dt_bias=dt_bias,
+            q=q[:, start:end],
+            k=k[:, start:end],
+            v=v[:, start:end],
+            initial_state=initial[state_index : state_index + 1],
+            inplace_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        reference_outputs.append(output)
+        reference_states.append(states)
+    reference_output = torch.cat(reference_outputs, dim=1)
+    reference_states = torch.cat(reference_states, dim=0)
+
+    torch.testing.assert_close(packed_output, reference_output, rtol=0, atol=0)
+    for sequence in range(batch):
+        for token in range(tokens):
+            state_index = state_indices[sequence, token]
+            torch.testing.assert_close(
+                packed_state[state_index],
+                reference_states[sequence * tokens + token],
+                rtol=0,
+                atol=0,
+            )

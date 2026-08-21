@@ -2905,6 +2905,69 @@ def test_eagle_grouped_swa_siblings_use_same_cache_mask():
     assert num_computed_tokens == 8 * block_size
 
 
+def test_hybrid_prefix_hit_replays_stateful_cache_suffix():
+    """A cache spec's replay contract limits the joint hybrid hit boundary."""
+    hash_block_size = 8
+    full_block_size = 32
+    replay_tokens = 16
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=full_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["stateful_swa"],
+                SlidingWindowSpec(
+                    block_size=hash_block_size,
+                    prefix_cache_replay_tokens=replay_tokens,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=replay_tokens,
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=False,
+    )
+
+    token_ids = list(range(9 * hash_block_size))
+    producer = make_request("producer", token_ids, hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    assert num_computed == 0
+    assert (
+        manager.allocate_slots(
+            producer,
+            len(token_ids),
+            num_computed,
+            computed_blocks,
+        )
+        is not None
+    )
+    producer.num_computed_tokens = len(token_ids)
+    manager.free(producer)
+
+    consumer = make_request(
+        "consumer", token_ids + [len(token_ids)], hash_block_size, sha256
+    )
+    _, num_computed, _ = manager.get_computed_blocks(consumer)
+
+    assert num_computed == full_block_size
+
+
 def test_different_block_size():
     block_size = 16
     # full attention and sliding window attention layers have the same page size:

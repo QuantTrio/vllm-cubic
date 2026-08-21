@@ -23,6 +23,7 @@ from vllm.model_executor.layers.mamba.abstract import (
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
+    get_spec_sequence_mask,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -66,6 +67,26 @@ class GDNBuildTestCase:
 
 
 GDN_BUILD_TEST_CASES = {
+    "zero_draft_without_active_spec_is_regular_decode": GDNBuildTestCase(
+        seq_lens=[40],
+        query_lens=[1],
+        num_decode_draft_tokens=[0],
+        num_speculative_tokens=3,
+        expected_num_decodes=1,
+        expected_num_prefills=0,
+        expected_num_prefill_tokens=0,
+        expected_num_spec_decodes=0,
+    ),
+    "zero_draft_stays_on_regular_path_in_active_spec_batch": GDNBuildTestCase(
+        seq_lens=[40, 43],
+        query_lens=[1, 4],
+        num_decode_draft_tokens=[0, 3],
+        num_speculative_tokens=3,
+        expected_num_decodes=0,
+        expected_num_prefills=1,
+        expected_num_prefill_tokens=1,
+        expected_num_spec_decodes=1,
+    ),
     # A one-token request with no computed context is a prefill, not a decode.
     "single_token_fresh_prefill": GDNBuildTestCase(
         seq_lens=[1],
@@ -169,6 +190,20 @@ GDN_BUILD_TEST_CASES = {
         expected_num_spec_decodes=1,
     ),
 }
+
+
+@pytest.mark.parametrize(
+    ("draft_counts", "expected"),
+    [
+        ([-1, 0, -1], [False, False, False]),
+        ([-1, 0, 3], [False, False, True]),
+    ],
+)
+def test_spec_sequence_mask_matches_batch_protocol(
+    draft_counts: list[int], expected: list[bool]
+) -> None:
+    mask = get_spec_sequence_mask(torch.tensor(draft_counts, dtype=torch.int32))
+    assert mask.tolist() == expected
 
 
 def _create_gdn_builder(
@@ -281,3 +316,17 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+def test_full_cudagraph_preserves_noncontiguous_spec_rows():
+    """Graph padding must retain request-aligned holes in the spec mask."""
+    builder = _create_gdn_builder(num_speculative_tokens=3, full_cuda_graph=True)
+    batch = BatchSpec(
+        seq_lens=[80, 0, 96, 0],
+        query_lens=[4, 0, 4, 0],
+    )
+    meta = _build(builder, batch, num_decode_draft_tokens=[3, -1, 3, -1])
+
+    assert meta.num_spec_decodes == 2
+    assert meta.spec_sequence_masks is not None
+    assert meta.spec_sequence_masks.tolist() == [True, False, True, False]

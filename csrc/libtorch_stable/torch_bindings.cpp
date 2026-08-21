@@ -163,6 +163,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "g_idx_or_none, Tensor? perm_or_none, Tensor workspace, int b_type_id, "
       "SymInt size_m, SymInt size_n, SymInt size_k, bool is_k_full, "
       "bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) -> Tensor");
+  ops.def(
+      "cubic_marlin_gemm(Tensor a, Tensor b_q_weight, Tensor cubic_levels, "
+      "Tensor workspace, SymInt size_m, SymInt size_n, SymInt size_k) -> "
+      "Tensor");
   // conditionally compiled so impl registrations are in source file
 
   // gptq_marlin repack from GPTQ.
